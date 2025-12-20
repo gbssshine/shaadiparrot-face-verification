@@ -1,21 +1,17 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uvicorn
+import os
 
 app = FastAPI()
 
 
-# ---------- MODELS ----------
-
-class FaceVerificationRequest(BaseModel):
+class VerifyFaceRequest(BaseModel):
     user_id: str
     image_url: str
 
 
-# ---------- ROUTES ----------
-
 @app.get("/")
-def health_check():
+def health():
     return {
         "status": "ok",
         "service": "shaadiparrot-face-verification"
@@ -23,27 +19,12 @@ def health_check():
 
 
 @app.post("/verify-face")
-def verify_face(data: FaceVerificationRequest):
-    """
-    Here later you will:
-    - download image
-    - run face detection / matching
-    - return result
-    """
-
-    # TEMP mock logic
-    if not data.image_url:
-        raise HTTPException(status_code=400, detail="image_url is required")
+def verify_face(data: VerifyFaceRequest):
+    # ⛔️ пока без реального face recognition
+    # тут будет логика позже
 
     return {
-        "verified": True,
+        "status": "verified",
         "user_id": data.user_id,
-        "confidence": 0.97,
-        "message": "Face verified successfully"
+        "image_url": data.image_url
     }
-
-
-# ---------- ENTRYPOINT ----------
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
