@@ -4,11 +4,12 @@ import logging
 import os
 import requests
 import re
-from typing import Optional, List, Literal, Dict, Any
+import time
+from typing import Optional, List, Literal, Dict, Any, Tuple
 
 from google.cloud import vision
 
-# ✅ for verifying Firebase idToken from MAUI
+# ✅ verify Firebase idToken from MAUI
 import firebase_admin
 from firebase_admin import auth
 
@@ -32,9 +33,35 @@ DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_MODEL = (os.getenv("DEEPSEEK_MODEL") or "deepseek-chat").strip()
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# ===== Firebase Admin init (for token verify) =====
+# ===== Firebase Admin init =====
 if not firebase_admin._apps:
     firebase_admin.initialize_app()
+
+# =========================
+# SIMPLE IN-MEMORY CACHES
+# =========================
+# uid -> (expires_at_epoch, profile_summary_text)
+_profile_summary_cache: Dict[str, Tuple[float, str]] = {}
+
+PROFILE_CACHE_TTL_SEC = 600  # 10 min
+
+
+def _cache_get_profile_summary(uid: str) -> str:
+    item = _profile_summary_cache.get(uid)
+    if not item:
+        return ""
+    exp, txt = item
+    if time.time() > exp:
+        try:
+            del _profile_summary_cache[uid]
+        except Exception:
+            pass
+        return ""
+    return txt
+
+
+def _cache_set_profile_summary(uid: str, txt: str):
+    _profile_summary_cache[uid] = (time.time() + PROFILE_CACHE_TTL_SEC, txt)
 
 
 # =========================
@@ -42,7 +69,7 @@ if not firebase_admin._apps:
 # =========================
 class VerifyFaceRequest(BaseModel):
     user_id: str
-    image_url: HttpUrl  # Firebase Storage signed URL
+    image_url: HttpUrl
 
 
 # =========================
@@ -59,8 +86,8 @@ class ChatTurn(BaseModel):
 class AiChatRequest(BaseModel):
     text: str
     locale: Optional[str] = "en"
-    mode: Optional[str] = "shaadi_parrot"  # future: "fates", "profile", "matches"
-    history: Optional[List[ChatTurn]] = None  # last messages from client
+    mode: Optional[str] = "shaadi_parrot"
+    history: Optional[List[ChatTurn]] = None
 
 
 class AiChatResponse(BaseModel):
@@ -71,10 +98,6 @@ class AiChatResponse(BaseModel):
 
 @app.on_event("startup")
 def startup_event():
-    """
-    Cloud Run best-practice:
-    heavy init only here.
-    """
     global vision_client, firestore_client
 
     try:
@@ -151,9 +174,6 @@ def _face_area_proxy(face: vision.FaceAnnotation) -> float:
     return face_area
 
 
-# =========================
-# Endpoint: Face Verification
-# =========================
 @app.post("/verify-face")
 def verify_face(data: VerifyFaceRequest):
     if vision_client is None:
@@ -175,22 +195,10 @@ def verify_face(data: VerifyFaceRequest):
     face_count = len(faces)
 
     if face_count == 0:
-        return {
-            "status": "rejected",
-            "reason": "no_face_detected",
-            "user_id": data.user_id,
-            "image_url": str(data.image_url),
-            "faces": 0,
-        }
+        return {"status": "rejected", "reason": "no_face_detected", "user_id": data.user_id, "faces": 0}
 
     if face_count > 1:
-        return {
-            "status": "rejected",
-            "reason": "multiple_faces_detected",
-            "user_id": data.user_id,
-            "image_url": str(data.image_url),
-            "faces": face_count,
-        }
+        return {"status": "rejected", "reason": "multiple_faces_detected", "user_id": data.user_id, "faces": face_count}
 
     face = faces[0]
     det_conf = float(getattr(face, "detection_confidence", 0.0) or 0.0)
@@ -198,46 +206,19 @@ def verify_face(data: VerifyFaceRequest):
     area_proxy = _face_area_proxy(face)
 
     if det_conf < 0.65:
-        return {
-            "status": "rejected",
-            "reason": "low_detection_confidence",
-            "user_id": data.user_id,
-            "image_url": str(data.image_url),
-            "faces": 1,
-            "detection_confidence": det_conf,
-        }
+        return {"status": "rejected", "reason": "low_detection_confidence", "faces": 1, "detection_confidence": det_conf}
 
     if lm_conf < 0.30:
-        return {
-            "status": "rejected",
-            "reason": "low_landmark_confidence",
-            "user_id": data.user_id,
-            "image_url": str(data.image_url),
-            "faces": 1,
-            "landmarking_confidence": lm_conf,
-        }
+        return {"status": "rejected", "reason": "low_landmark_confidence", "faces": 1, "landmarking_confidence": lm_conf}
 
     if area_proxy <= 0.0:
-        return {
-            "status": "rejected",
-            "reason": "face_too_small_or_far",
-            "user_id": data.user_id,
-            "image_url": str(data.image_url),
-            "faces": 1,
-        }
+        return {"status": "rejected", "reason": "face_too_small_or_far", "faces": 1}
 
-    return {
-        "status": "verified",
-        "user_id": data.user_id,
-        "image_url": str(data.image_url),
-        "faces": 1,
-        "detection_confidence": det_conf,
-        "landmarking_confidence": lm_conf,
-    }
+    return {"status": "verified", "faces": 1, "detection_confidence": det_conf, "landmarking_confidence": lm_conf}
 
 
 # =========================
-# Helpers: AI Chat
+# Helpers: Auth
 # =========================
 def _extract_bearer_token(authorization: Optional[str]) -> str:
     if not authorization:
@@ -270,79 +251,52 @@ def _normalize_text(s: str) -> str:
     return s
 
 
+# =========================
+# Topic gate
+# =========================
 def _is_allowed_topic(user_text: str) -> bool:
-    """
-    Ты просил: отвечать ТОЛЬКО по определенным темам.
-    Разрешаем: профили/био/фото, матчи/переписка, daily fates/астро-пояснения, как работает приложение.
-    """
     t = (user_text or "").lower()
-
     allowed_keywords = [
         "bio", "profile", "photos", "photo", "pictures", "rewrite", "about me",
         "match", "matches", "message", "reply", "text her", "text him", "chat",
         "fate", "daily", "astrology", "kundli", "compatibility",
         "shaadi", "parrot", "app", "how it works", "premium", "subscription",
     ]
-
     return any(k in t for k in allowed_keywords)
 
 
 def _build_system_prompt(locale: str) -> str:
+    # ✅ shorter system prompt = fewer tokens
     return (
-        "You are Shaadi Parrot, a friendly assistant inside a dating + fates app.\n"
-        "RULES:\n"
-        "1) Only discuss: profile improvements (bio/photos), matches & messaging advice, Daily Fates meaning, and app usage.\n"
-        "2) If user asks about anything outside these topics, politely refuse and redirect back to allowed topics.\n"
-        "3) Be concise, practical, and supportive. Use light parrot vibe (1-2 emojis max).\n"
-        "4) Do NOT give medical/legal/illegal instructions.\n"
-        f"LANGUAGE: reply in {locale or 'en'}.\n"
+        "You are Shaadi Parrot inside a dating+fates app.\n"
+        "Only help with: profile/bio/photos, matches & messaging, Daily Fates meaning, app usage.\n"
+        "If off-topic: refuse briefly and redirect.\n"
+        "Be concise and practical. 1 emoji max.\n"
+        f"Reply in {locale or 'en'}.\n"
     )
 
 
+# =========================
+# Profile -> compact summary
+# =========================
 def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Мы НЕ знаем точно все поля (и ты сам сказал), поэтому:
-    - берём док целиком
-    - удаляем очевидно лишнее/опасное (гео/внутренние штуки)
-    - ограничиваем размер
-    """
     if not raw:
         return {}
 
-    deny_prefixes = [
-        "geo",          # geoCapturedAtUtc, geoSource, geoLat/Lng etc.
-        "location",     # если у тебя вдруг есть точные координаты
-        "lat", "lng",   # всякое подобное
-        "idtoken", "refreshtoken", "token",
-        "__",           # технические
-    ]
-
-    deny_exact = {
-        "updatedAt",
-        "createdAtIso",
-        "geoCapturedAtUtc",
-        "geoSource",
-        "deviceId",
-        "pushToken",
-    }
+    deny_prefixes = ["geo", "lat", "lng", "location", "idtoken", "refreshtoken", "token", "__"]
+    deny_exact = {"updatedAt", "createdAtIso", "geoCapturedAtUtc", "geoSource", "deviceId", "pushToken"}
 
     clean: Dict[str, Any] = {}
     for k, v in raw.items():
         key = (k or "").strip()
         if not key:
             continue
-
         lk = key.lower()
 
         if lk in (x.lower() for x in deny_exact):
             continue
 
-        blocked = False
-        for p in deny_prefixes:
-            if lk.startswith(p):
-                blocked = True
-                break
-        if blocked:
+        if any(lk.startswith(p) for p in deny_prefixes):
             continue
 
         clean[key] = v
@@ -350,109 +304,109 @@ def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
-def _flatten_value(v: Any, max_len: int = 300) -> str:
-    """
-    Приводим разные типы (строки/списки/словарь) в короткий текст.
-    """
+def _flatten_value(v: Any, max_len: int = 140) -> str:
     if v is None:
         return ""
-
     if isinstance(v, bool):
         return "true" if v else "false"
-
     if isinstance(v, (int, float)):
         return str(v)
-
     if isinstance(v, str):
         s = v.strip()
-        if len(s) > max_len:
-            s = s[:max_len] + "…"
-        return s
-
+        return (s[:max_len] + "…") if len(s) > max_len else s
     if isinstance(v, list):
         parts = []
-        for item in v[:20]:
-            s = _flatten_value(item, max_len=80)
+        for item in v[:12]:
+            s = _flatten_value(item, max_len=40)
             if s:
                 parts.append(s)
         out = ", ".join(parts)
-        if len(v) > 20:
+        if len(v) > 12:
             out += "…"
-        if len(out) > max_len:
-            out = out[:max_len] + "…"
-        return out
-
+        return (out[:max_len] + "…") if len(out) > max_len else out
     if isinstance(v, dict):
-        # показываем только ключевые пары, чтобы не раздувать
+        # не раздуваемся
         parts = []
         for i, (kk, vv) in enumerate(v.items()):
-            if i >= 12:
+            if i >= 8:
                 parts.append("…")
                 break
-            s = _flatten_value(vv, max_len=80)
+            s = _flatten_value(vv, max_len=40)
             if s:
-                parts.append(f"{kk}: {s}")
+                parts.append(f"{kk}:{s}")
         out = "; ".join(parts)
-        if len(out) > max_len:
-            out = out[:max_len] + "…"
-        return out
+        return (out[:max_len] + "…") if len(out) > max_len else out
 
     s = str(v).strip()
-    if len(s) > max_len:
-        s = s[:max_len] + "…"
-    return s
+    return (s[:max_len] + "…") if len(s) > max_len else s
 
 
-def _profile_context_text(profile_doc: Dict[str, Any]) -> str:
+def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
     """
-    Превращаем документ профиля в "контекст" для ИИ.
+    ✅ Супер-компактный summary = мало токенов.
+    Тут только то, что реально помогает переписке/био/советам.
     """
     if not profile_doc:
         return ""
 
-    # приоритетный порядок (то, что чаще нужно попугаю)
     preferred_keys = [
-        "firstName", "lastName",
-        "gender",
+        "firstName", "lastName", "gender",
         "seekerType", "lookingFor", "seeking",
-        "age", "birthDate",
-        "cityName", "countryName", "countryIso2",
-        "community",
+        "birthDate", "age",
+        "cityName", "countryName", "community",
         "bio", "aboutMe",
-        "interests",
+        "interests", "languages",
         "drinking", "smoking", "workout", "diet",
-        "height", "education", "jobTitle", "occupation",
-        "relationshipGoal", "intent",
-        "languages",
+        "education", "jobTitle", "occupation",
+        "relationshipGoal", "relationshipIntent", "intent",
     ]
 
-    used = set()
-    lines: List[str] = []
-    lines.append("USER PROFILE CONTEXT (private, for personalization):")
-
+    parts: List[str] = []
     for k in preferred_keys:
         if k in profile_doc:
             val = _flatten_value(profile_doc.get(k))
             if val:
-                lines.append(f"- {k}: {val}")
-            used.add(k)
+                parts.append(f"{k}={val}")
 
-    # добавим ещё несколько полей из дока (если есть), но ограниченно
-    extra_count = 0
-    for k, v in profile_doc.items():
-        if k in used:
-            continue
-        if extra_count >= 25:
+        if len(parts) >= 18:
             break
-        val = _flatten_value(v)
-        if not val:
-            continue
-        lines.append(f"- {k}: {val}")
-        extra_count += 1
 
-    return "\n".join(lines)
+    if not parts:
+        return ""
+
+    # одна строка, коротко
+    return "USER_PROFILE: " + " | ".join(parts)
 
 
+async def _load_user_profile_summary(uid: str) -> str:
+    """
+    Берем profiles/{uid}, чистим, делаем summary и кладем в кэш.
+    """
+    cached = _cache_get_profile_summary(uid)
+    if cached:
+        return cached
+
+    if firestore_client is None:
+        return ""
+
+    try:
+        snap = firestore_client.collection("profiles").document(uid).get()
+        if not snap.exists:
+            return ""
+        raw = snap.to_dict() or {}
+        safe = _safe_profile_dict(raw)
+        summary = _profile_summary_text(safe)
+        if summary:
+            _cache_set_profile_summary(uid, summary)
+        return summary
+    except Exception:
+        logger.exception("Failed to load profiles/{uid}")
+        return ""
+
+
+# =========================
+# DeepSeek call
+# =========================
 async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     if not DEEPSEEK_API_KEY:
         raise HTTPException(status_code=500, detail="DEEPSEEK_API_KEY is not set in Cloud Run env vars")
@@ -461,7 +415,7 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 450,
+        "max_tokens": 280,  # ✅ меньше output токенов
     }
 
     headers = {
@@ -497,38 +451,17 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
         return "I couldn't parse the reply. Try again."
 
 
-async def _load_user_profile(uid: str) -> Dict[str, Any]:
-    """
-    Читаем profiles/{uid} из Firestore (Admin SDK).
-    """
-    if firestore_client is None:
-        return {}
-
-    try:
-        doc_ref = firestore_client.collection("profiles").document(uid)
-        snap = doc_ref.get()
-        if not snap.exists:
-            return {}
-        raw = snap.to_dict() or {}
-        return _safe_profile_dict(raw)
-    except Exception:
-        logger.exception("Failed to load profiles/{uid}")
-        return {}
-
-
 # =========================
 # Endpoint: AI Chat
 # =========================
 @app.post("/ai/chat", response_model=AiChatResponse)
 async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
-    # ✅ verify Firebase user
     uid = _verify_firebase_token_or_401(authorization)
 
     user_text = _normalize_text(body.text)
     if not user_text:
         return AiChatResponse(reply_text="Ask me something 🙂")
 
-    # ✅ topic gate
     if not _is_allowed_topic(user_text):
         return AiChatResponse(
             reply_text=(
@@ -546,20 +479,18 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
     locale = (body.locale or "en").strip() or "en"
     system_prompt = _build_system_prompt(locale)
 
-    # ✅ load profile and build context
-    profile_doc = await _load_user_profile(uid)
-    profile_ctx = _profile_context_text(profile_doc)
+    # ✅ profile summary (cached)
+    profile_summary = await _load_user_profile_summary(uid)
 
-    # build messages for DeepSeek
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
-    # ✅ Add profile context right after system prompt (as "system" too)
-    if profile_ctx:
-        messages.append({"role": "system", "content": profile_ctx})
+    # ✅ Add short profile summary (NOT the whole doc)
+    if profile_summary:
+        messages.append({"role": "system", "content": profile_summary})
 
-    # include small history (optional)
+    # ✅ include small history (already reduced on client, but keep guard here too)
     if body.history:
-        turns = body.history[-10:]
+        turns = body.history[-6:]  # ✅ server guard
         for t in turns:
             role = t.role
             txt = _normalize_text(t.text)
@@ -567,11 +498,14 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
                 continue
             if role not in ["user", "assistant"]:
                 continue
+            # extra trim for safety
+            if len(txt) > 320:
+                txt = txt[:320] + "…"
             messages.append({"role": role, "content": txt})
 
     messages.append({"role": "user", "content": user_text})
 
     reply = await _call_deepseek(messages)
 
-    logger.info(f"[ai_chat] uid={uid} len={len(user_text)} profile_fields={len(profile_doc) if profile_doc else 0}")
+    logger.info(f"[ai_chat] uid={uid} user_len={len(user_text)} has_profile={bool(profile_summary)}")
     return AiChatResponse(reply_text=reply, blocked=False)
