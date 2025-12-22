@@ -266,45 +266,82 @@ def _normalize_text(s: str) -> str:
 
 
 # =========================
-# TOPIC GATE
+# TOPIC ROUTER (human-friendly)
 # =========================
-def _is_allowed_topic(user_text: str) -> bool:
+# Instead of hard-blocking based on a few keywords, we:
+# 1) Detect if message is clearly off-topic (recipes, coding help, etc.)
+# 2) Otherwise, treat most vague dating messages as allowed and guide user.
+
+_OFFTOPIC_BLOCK_PATTERNS = [
+    # cooking/recipes
+    r"\b(recipe|cook|cooking|pancake|pancakes|omelet|cake|bake|ingredients)\b",
+    # programming / hacking / malware
+    r"\b(hack|ddos|phish|malware|exploit|crack|keylogger)\b",
+    r"\b(code|python|c\+\+|java|javascript|sql|api|compile|bug fix|debug)\b",
+    # politics/news
+    r"\b(election|president|politics|war|propaganda)\b",
+    # drugs / illegal
+    r"\b(heroin|cocaine|meth|weed|drug deal|how to buy)\b",
+]
+
+_ALLOWED_HINTS_PATTERNS = [
+    # dating/relationships in natural language
+    r"\b(girl|girls|guy|guys|dating|date|relationship|love|crush|romance)\b",
+    r"\b(text|message|dm|reply|respond|pickup line|what should i say|what to say)\b",
+    r"\b(ghost(ed|ing)|ignored|left on read|seen)\b",
+    r"\b(match|matches|tinder|bumble|hinge)\b",
+    # profile/bio
+    r"\b(bio|profile|about me|photos?|pictures?)\b",
+    # astrology/fates
+    r"\b(astrology|vedic|kundli|horoscope|zodiac|nakshatra|moon sign|sun sign|compatib)\b",
+    # app usage
+    r"\b(app|shaadi|parrot|premium|subscription|how it works)\b",
+]
+
+
+def _looks_offtopic(user_text: str) -> bool:
     t = (user_text or "").lower()
+    for pat in _OFFTOPIC_BLOCK_PATTERNS:
+        if re.search(pat, t, re.IGNORECASE):
+            return True
+    return False
 
-    allowed_keywords = [
-        # profile / bio / photos
-        "bio", "profile", "photos", "photo", "pictures", "rewrite", "about me",
 
-        # matches / messaging / relationship advice
-        "match", "matches", "message", "reply", "text her", "text him", "chat",
-        "dating", "relationship", "love", "girlfriend", "boyfriend", "crush",
-        "what should i say", "what to say", "how to respond",
+def _looks_allowed(user_text: str) -> bool:
+    t = (user_text or "").lower()
+    for pat in _ALLOWED_HINTS_PATTERNS:
+        if re.search(pat, t, re.IGNORECASE):
+            return True
+    return False
 
-        # fates / astrology (vedic)
-        "fate", "daily", "compatibility",
-        "astrology", "vedic", "kundli", "horoscope", "zodiac", "sign",
-        "birth date", "birthdate", "birth time", "nakshatra", "moon", "sun",
-        "ascendant", "rising", "chart", "planets", "houses",
 
-        # app
-        "shaadi", "parrot", "app", "how it works", "premium", "subscription",
-    ]
-    return any(k in t for k in allowed_keywords)
+def _build_soft_redirect(locale: str) -> str:
+    # Not "blocked" vibe. Redirect gently.
+    return (
+        "I’m Shaadi Parrot 🦜\n"
+        "I can help with love, dating, texting, your profile/bio/photos, and Vedic astrology.\n\n"
+        "Try one of these:\n"
+        "• “What should I text her next?”\n"
+        "• “Rewrite my bio based on my profile”\n"
+        "• “Explain my Daily Fate”\n"
+        "• “What’s my Moon sign / Nakshatra?”"
+    )
 
 
 # =========================
 # SYSTEM PROMPT (PERSONA)
 # =========================
 def _build_system_prompt(locale: str) -> str:
-    # High-signal, short prompt to save tokens
+    # Keep short and strong.
     return (
         "You are Shaadi Parrot — a cheerful Indian astrologer + dating coach inside a dating & Daily Fates app.\n"
-        "Persona: friendly, playful, confident, helpful. 1 emoji max.\n"
-        "You help with: profile/bio/photo tips; relationship advice; what to text/reply; Vedic astrology & compatibility.\n"
+        "Your mission: be a guide to love, relationships, and understanding.\n"
+        "You help with: profile/bio/photos; relationship advice; what to text/reply; Vedic astrology, compatibility, Daily Fates; app usage.\n"
+        "Style: warm, playful, confident, practical. Keep replies concise. Max 1 emoji.\n"
+        "If user is vague ('help me with girls'): ask 1 clarifying question and offer 2-3 options.\n"
         "You may receive USER_PROFILE and ASTRO_COMPUTED. Use them automatically.\n"
-        "If missing data for exact chart (birth place/timezone): be honest and ask only what is missing.\n"
-        "Rules: Only discuss profile/bio/photos, matches & texting, relationship advice, Daily Fates, astrology, app usage.\n"
-        "If off-topic: refuse briefly and redirect.\n"
+        "If exact chart requires birthplace/timezone: say it clearly and give the best approximate answer.\n"
+        "Do NOT help with cooking/recipes, coding, politics, hacking, drugs, or illegal activity.\n"
         f"Reply in {locale or 'en'}.\n"
     )
 
@@ -377,13 +414,13 @@ def _flatten_value(v: Any, max_len: int = 140) -> str:
 def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
     """
     Ultra-compact summary for LLM context (token-friendly).
-    Includes a compact "keys available" list for you to understand what exists.
+    Also includes keys list so Parrot can describe the profile if asked.
     """
     if not profile_doc:
         return ""
 
     preferred_keys = [
-        "firstName", "lastName", "gender",
+        "firstName", "lastName", "name", "gender",
         "seekerType", "lookingFor", "seeking", "orientation", "lookingForGender",
         "birthDate", "birthTime", "age",
         "cityName", "countryName", "stateName", "community", "religion",
@@ -407,15 +444,15 @@ def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
         if len(parts) >= 22:
             break
 
+    # keys list (bounded)
     extra_keys = [k for k in profile_doc.keys() if k not in used]
-    extra_keys = extra_keys[:40]
+    extra_keys = extra_keys[:30]
 
     out = ""
     if parts:
         out += "USER_PROFILE: " + " | ".join(parts)
     if extra_keys:
         out += "\nPROFILE_KEYS_AVAILABLE: " + ", ".join(extra_keys)
-
     return out.strip()
 
 
@@ -459,6 +496,7 @@ _NAKSHATRAS = [
     "Mula","Purva Ashadha","Uttara Ashadha","Shravana","Dhanishta","Shatabhisha","Purva Bhadrapada","Uttara Bhadrapada","Revati"
 ]
 
+
 def _parse_birth_date(profile: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
     raw = profile.get("birthDate")
     if isinstance(raw, str):
@@ -470,6 +508,7 @@ def _parse_birth_date(profile: Dict[str, Any]) -> Optional[Tuple[int, int, int]]
             return None
         return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     return None
+
 
 def _parse_birth_time(profile: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     raw = profile.get("birthTime")
@@ -486,10 +525,12 @@ def _parse_birth_time(profile: Dict[str, Any]) -> Optional[Tuple[int, int]]:
         return (hh, mm)
     return None
 
+
 def _sign_from_sidereal_longitude(lon_deg: float) -> str:
     idx = int((lon_deg % 360.0) / 30.0)
     idx = max(0, min(11, idx))
     return _ZODIAC[idx]
+
 
 def _nakshatra_from_sidereal_longitude(lon_deg: float) -> str:
     seg = 360.0 / 27.0  # 13.3333...
@@ -497,22 +538,19 @@ def _nakshatra_from_sidereal_longitude(lon_deg: float) -> str:
     idx = max(0, min(26, idx))
     return _NAKSHATRAS[idx]
 
+
 def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
-    """
-    Swiss Ephemeris sidereal longitude:
-    - use FLG_SIDEREAL with Lahiri mode already set on startup.
-    """
     flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
     res, _ = swe.calc_ut(jd_ut, planet, flags)
-    lon = float(res[0])  # ecliptic longitude
+    lon = float(res[0])
     return lon % 360.0
+
 
 def _compute_astro(profile: Dict[str, Any]) -> str:
     """
-    Returns compact ASTRO_COMPUTED string.
-    - Sidereal Lahiri for Sun/Moon.
-    - Without birthplace+timezone: Ascendant/houses cannot be exact.
-    - Without timezone: even Moon/Nakshatra can shift near boundaries.
+    Compact ASTRO_COMPUTED string for the LLM.
+    Uses sidereal Lahiri for Sun/Moon + Nakshatra.
+    Without birthplace+timezone: Ascendant/houses cannot be exact.
     """
     bd = _parse_birth_date(profile)
     if not bd:
@@ -521,15 +559,17 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
     y, mo, d = bd
     bt = _parse_birth_time(profile)
 
-    # We don't have timezone/place yet => assume UTC.
-    # If time missing => use 12:00 UTC to reduce day-boundary errors.
+    # No timezone/place yet => assume UTC.
+    # If time missing => use 12:00 UTC to reduce boundary errors.
     if bt:
         hh, mm = bt
         hour = hh + (mm / 60.0)
         time_mode = "birthTime_provided_timezone_unknown"
+        note = "Exact ascendant/houses need birthPlace + timezone."
     else:
         hour = 12.0
         time_mode = "date_only"
+        note = "Moon/Nakshatra accuracy improves with birthTime + birthPlace/timezone."
 
     jd_ut = swe.julday(y, mo, d, hour)
 
@@ -541,12 +581,8 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
         moon_sign = _sign_from_sidereal_longitude(moon_lon)
         nak = _nakshatra_from_sidereal_longitude(moon_lon)
 
-        note = "Exact ascendant/houses need birthPlace + timezone."
-        if time_mode == "date_only":
-            note = "Moon/Nakshatra accuracy improves with birthTime + birthPlace/timezone."
-
         return (
-            f"ASTRO_COMPUTED (Vedic sidereal Lahiri): "
+            "ASTRO_COMPUTED (Vedic sidereal Lahiri): "
             f"SunSign={sun_sign}; MoonSign={moon_sign}; Nakshatra={nak}; "
             f"TimeMode={time_mode}. {note}"
         )
@@ -566,7 +602,7 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 320,
+        "max_tokens": 340,
     }
 
     headers = {
@@ -624,29 +660,32 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
     if not user_text:
         return AiChatResponse(reply_text="Ask me something 🙂")
 
-    if not _is_allowed_topic(user_text):
+    locale = (body.locale or "en").strip() or "en"
+
+    # Hard off-topic block (recipes, coding, politics, hacking, drugs)
+    if _looks_offtopic(user_text):
         return AiChatResponse(
-            reply_text=(
-                "I can help only with:\n"
-                "• improving your profile/bio/photos\n"
-                "• match & messaging advice\n"
-                "• relationship advice (what to text)\n"
-                "• Daily Fates + Vedic astrology\n"
-                "• how the app works 🦜\n\n"
-                "Ask me about one of these."
-            ),
-            blocked=True,
-            reason="topic_not_allowed",
+            reply_text=_build_soft_redirect(locale),
+            blocked=False,
+            reason="off_topic_redirect",
         )
 
-    locale = (body.locale or "en").strip() or "en"
+    # If message doesn't look allowed, we still don't hard-block:
+    # we gently steer them into the love/astrology/app world.
+    if not _looks_allowed(user_text):
+        return AiChatResponse(
+            reply_text=_build_soft_redirect(locale),
+            blocked=False,
+            reason="needs_redirect",
+        )
+
     system_prompt = _build_system_prompt(locale)
 
     # Load profile ONCE per request
     profile = await _load_user_profile(uid)
 
-    # Compact cached summary (token-friendly)
-    profile_summary = _profile_summary_text(profile)
+    # Cached compact summary (token-friendly)
+    profile_summary = await _load_user_profile_summary(uid)
 
     # Astro computed (sidereal Lahiri)
     astro_computed = _compute_astro(profile)
