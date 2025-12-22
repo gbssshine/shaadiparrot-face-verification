@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import time
+import uuid
+import hashlib
 from typing import Optional, List, Literal, Dict, Any, Tuple
 
 import requests
@@ -155,10 +157,15 @@ def _is_allowed_topic(user_text: str) -> bool:
     allowed_keywords = [
         # relationships / texting
         "dating", "relationship", "love", "crush", "girlfriend", "boyfriend",
-        "girls", "guys", "her", "him", "she", "he",
+        "girls", "guys", "girl", "guy", "her", "him", "she", "he",
         "message", "reply", "text", "what should i say", "how to respond",
         "help me with girls", "help me with guys", "pick up", "flirt",
         "date idea", "first date", "apology", "breakup", "jealous",
+
+        # ✅ sexuality/orientation/confusion (IMPORTANT)
+        "men", "women", "man", "woman", "sexuality", "orientation",
+        "straight", "gay", "lesbian", "bisexual", "bi", "queer",
+        "confused", "attracted",
 
         # profile help
         "profile", "bio", "about me", "photos", "photo", "pictures", "rewrite",
@@ -177,7 +184,6 @@ def _is_allowed_topic(user_text: str) -> bool:
 
 # =========================
 # SYSTEM PROMPT (PERSONA)
-# - IMPORTANT: no markdown **, no code fences
 # =========================
 def _build_system_prompt(locale: str) -> str:
     lang = (locale or "en").strip() or "en"
@@ -283,14 +289,11 @@ def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
     ]
 
     parts: List[str] = []
-    used = set()
-
     for k in preferred_keys:
         if k in profile_doc:
             val = _flatten_value(profile_doc.get(k))
             if val:
                 parts.append(f"{k}={val}")
-                used.add(k)
         if len(parts) >= 22:
             break
 
@@ -545,8 +548,11 @@ def _chat_msgs_col_ref(uid: str):
     return firestore_client.collection("parrotChats").document(uid).collection("messages")
 
 def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
-
+    # ISO8601 UTC with milliseconds
+    t = time.time()
+    sec = int(t)
+    ms = int((t - sec) * 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(sec)) + f".{ms:03d}Z"
 
 def _load_chat_state(uid: str) -> Dict[str, Any]:
     ref = _chat_doc_ref(uid)
@@ -561,7 +567,6 @@ def _load_chat_state(uid: str) -> Dict[str, Any]:
         logger.exception("Failed to load parrotChats/{uid}")
         return {}
 
-
 def _save_chat_state(uid: str, patch: Dict[str, Any]) -> None:
     ref = _chat_doc_ref(uid)
     if ref is None:
@@ -571,13 +576,13 @@ def _save_chat_state(uid: str, patch: Dict[str, Any]) -> None:
     except Exception:
         logger.exception("Failed to save parrotChats/{uid}")
 
-
 def _save_chat_message(uid: str, role: str, text: str, created_at_iso: str) -> None:
     col = _chat_msgs_col_ref(uid)
     if col is None:
         return
     try:
-        msg_id = f"{int(time.time() * 1000)}_{role}"
+        # ✅ unique id (no overwrites even in same ms)
+        msg_id = f"{int(time.time() * 1000)}_{role}_{uuid.uuid4().hex}"
         col.document(msg_id).set({
             "role": role,
             "text": text,
@@ -585,7 +590,6 @@ def _save_chat_message(uid: str, role: str, text: str, created_at_iso: str) -> N
         })
     except Exception:
         logger.exception("Failed to save chat message")
-
 
 def _load_chat_history(uid: str, limit: int = 24) -> List[Dict[str, str]]:
     """
@@ -622,7 +626,6 @@ def _load_chat_history(uid: str, limit: int = 24) -> List[Dict[str, str]]:
         logger.exception("Failed to load chat history")
         return []
 
-
 def _memory_text_from_state(state: Dict[str, Any]) -> str:
     mem = state.get("memory") if isinstance(state.get("memory"), dict) else {}
     if not mem:
@@ -636,18 +639,14 @@ def _memory_text_from_state(state: Dict[str, Any]) -> str:
         return ""
     return "PARROT_MEMORY: " + " | ".join(bits)
 
-
 def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_text: str) -> Dict[str, Any]:
-    """
-    Cheap deterministic memory extractor (no extra LLM cost).
-    Saves partner birth date, names, etc.
-    """
     mem = state.get("memory") if isinstance(state.get("memory"), dict) else {}
     t = (user_text or "").strip()
 
-    # Partner birth date patterns
-    # Examples: "she was born at 28 november", "born on 28 November", "her birthday is 28/11"
-    m = re.search(r"\b(?:born|birthday)\b.*?\b(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\b", t, re.IGNORECASE)
+    m = re.search(
+        r"\b(?:born|birthday)\b.*?\b(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\b",
+        t, re.IGNORECASE
+    )
     if m:
         day = m.group(1)
         mon = m.group(2)
@@ -660,23 +659,30 @@ def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_te
         yr = m2.group(3) or ""
         mem["partnerBirthDate"] = f"{d}/{mo}" + (f"/{yr}" if yr else "")
 
-    # Quick zodiac mentions
-    mz = re.search(r"\b(i'?m|i am)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
+    mz = re.search(
+        r"\b(i'?m|i am)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b",
+        t, re.IGNORECASE
+    )
     if mz:
         mem["userZodiac"] = mz.group(2).title()
 
-    mz2 = re.search(r"\b(she'?s|she is|he'?s|he is)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
+    mz2 = re.search(
+        r"\b(she'?s|she is|he'?s|he is)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b",
+        t, re.IGNORECASE
+    )
     if mz2:
         mem["partnerZodiac"] = mz2.group(2).title()
 
-    # Topic hint
-    if "text" in t.lower() or "message" in t.lower() or "reply" in t.lower():
+    tl = t.lower()
+    if "text" in tl or "message" in tl or "reply" in tl:
         mem["lastTopic"] = "texting"
-    elif "compat" in t.lower() or "match" in t.lower() or "kundli" in t.lower():
+    elif "compat" in tl or "match" in tl or "kundli" in tl:
         mem["lastTopic"] = "compatibility"
-    elif "profile" in t.lower() or "bio" in t.lower() or "photos" in t.lower():
+    elif "profile" in tl or "bio" in tl or "photos" in tl:
         mem["lastTopic"] = "profile"
-    elif "relationship" in t.lower() or "girls" in t.lower() or "love" in t.lower():
+    elif "orientation" in tl or "sexuality" in tl or "confused" in tl or "men" in tl or "women" in tl:
+        mem["lastTopic"] = "orientation"
+    elif "relationship" in tl or "girls" in tl or "love" in tl or "dating" in tl:
         mem["lastTopic"] = "relationships"
 
     state["memory"] = mem
@@ -747,6 +753,28 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
 
 
 # =========================
+# OFF-TOPIC VARIANTS (NO SAME REPLY)
+# =========================
+_OFFTOPIC_VARIANTS = [
+    "I’m Shaadi Parrot 🦜✨\nI’m built for love, texting and Vedic astrology.\n• Tell me what happened with them 💛\n• Paste the message — I’ll write your reply 💬\n• Or share birth dates for compatibility 🔮",
+    "Oops 😅 I can’t help with that topic.\nBut I can help you with:\n• dating & relationships 💛\n• what to text/reply 💬\n• profile/bio/photos 📝\n• Vedic compatibility 🔮\nTell me what’s going on 🙂",
+    "That’s outside my nest 🦜\nI’m your dating + astrology guide.\nGive me one of these:\n• your situation\n• last messages\n• birth dates\n• profile/bio",
+    "Not my zone 🙈\nI’m focused on love + Vedic insights.\nSend:\n• who you like (and what happened)\n• your last chat lines\n• or your birth date(s) 🔮",
+    "I can’t answer that one 😇\nBut I can help with love and compatibility.\nTell me:\n• who you’re thinking about\n• what you want (serious / casual)\n• and I’ll guide you 🦜",
+    "Hmm, I’m not the right parrot for that topic 🦜\nLet’s do something useful:\n• I’ll write your message\n• improve your profile\n• or check Vedic match 🔮"
+]
+
+def _stable_pick(uid: str, user_text: str, n: int) -> int:
+    # Stable-ish: changes between different prompts, but doesn't feel random per refresh
+    h = hashlib.sha256((uid + "|" + (user_text or "")).encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % max(1, n)
+
+def _offtopic_reply(uid: str, user_text: str) -> str:
+    idx = _stable_pick(uid, user_text, len(_OFFTOPIC_VARIANTS))
+    return _OFFTOPIC_VARIANTS[idx]
+
+
+# =========================
 # AI CHAT ENDPOINT (WITH MEMORY)
 # =========================
 @app.post("/ai/chat", response_model=AiChatResponse)
@@ -759,15 +787,7 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
 
     if not _is_allowed_topic(user_text):
         return AiChatResponse(
-            reply_text=(
-                "I’m Shaadi Parrot 🦜\n"
-                "I can help with:\n"
-                "• love, dating, relationships\n"
-                "• what to text/reply (I’ll write the message)\n"
-                "• profile/bio/photos improvements\n"
-                "• Vedic astrology & compatibility\n\n"
-                "Ask me about one of these 🙂"
-            ),
+            reply_text=_offtopic_reply(uid, user_text),
             blocked=True,
             reason="topic_not_allowed",
         )
@@ -812,10 +832,8 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
 
     # Prefer persisted history (source of truth), then client
     combined = persisted_history[-16:]  # keep token budget
-    if client_history:
-        # add last few client turns only if persisted is empty or short
-        if len(combined) < 8:
-            combined = (combined + client_history)[-16:]
+    if client_history and len(combined) < 8:
+        combined = (combined + client_history)[-16:]
 
     for m in combined:
         if m.get("role") in ["user", "assistant"] and m.get("content"):
