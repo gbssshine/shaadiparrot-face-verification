@@ -9,12 +9,16 @@ from typing import Optional, List, Literal, Dict, Any, Tuple
 
 from google.cloud import vision
 
-# ✅ verify Firebase idToken from MAUI
+# Firebase Admin (verify idToken)
 import firebase_admin
 from firebase_admin import auth
 
-# ✅ Firestore Admin client (Cloud Run service account)
+# Firestore Admin client (Cloud Run service account)
 from google.cloud import firestore
+
+# Swiss Ephemeris (Vedic sidereal)
+import swisseph as swe
+
 
 app = FastAPI(title="ShaadiParrot Cloud Run")
 
@@ -42,7 +46,6 @@ if not firebase_admin._apps:
 # =========================
 # uid -> (expires_at_epoch, profile_summary_text)
 _profile_summary_cache: Dict[str, Tuple[float, str]] = {}
-
 PROFILE_CACHE_TTL_SEC = 600  # 10 min
 
 
@@ -65,16 +68,13 @@ def _cache_set_profile_summary(uid: str, txt: str):
 
 
 # =========================
-# FACE VERIFICATION MODELS
+# MODELS
 # =========================
 class VerifyFaceRequest(BaseModel):
     user_id: str
     image_url: HttpUrl
 
 
-# =========================
-# AI CHAT MODELS
-# =========================
 Role = Literal["user", "assistant"]
 
 
@@ -96,9 +96,23 @@ class AiChatResponse(BaseModel):
     reason: Optional[str] = None
 
 
+# =========================
+# STARTUP
+# =========================
 @app.on_event("startup")
 def startup_event():
+    """
+    Cloud Run best-practice: heavy init only here.
+    Also: set Swiss Ephemeris sidereal mode once (Vedic Lahiri).
+    """
     global vision_client, firestore_client
+
+    # Swiss Ephemeris: Vedic (Sidereal) Lahiri
+    try:
+        swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
+        logger.info("Swiss Ephemeris sidereal mode set: Lahiri")
+    except Exception:
+        logger.exception("Failed to set Swiss Ephemeris sidereal mode")
 
     try:
         vision_client = vision.ImageAnnotatorClient()
@@ -124,11 +138,12 @@ def health():
         "firestore_ready": firestore_client is not None,
         "deepseek_ready": bool(DEEPSEEK_API_KEY),
         "deepseek_model": DEEPSEEK_MODEL,
+        "sidereal": "Lahiri",
     }
 
 
 # =========================
-# Helpers: Face Verification
+# FACE VERIFICATION
 # =========================
 def _download_image_bytes(url: str, max_mb: int = 10) -> bytes:
     headers = {"User-Agent": "shaadiparrot-face-verification/1.0"}
@@ -166,12 +181,11 @@ def _face_area_proxy(face: vision.FaceAnnotation) -> float:
     min_y, max_y = min(ys), max(ys)
     w = max(0, max_x - min_x)
     h = max(0, max_y - min_y)
-    face_area = float(w * h)
 
     if w < 80 or h < 80:
         return 0.0
 
-    return face_area
+    return float(w * h)
 
 
 @app.post("/verify-face")
@@ -218,7 +232,7 @@ def verify_face(data: VerifyFaceRequest):
 
 
 # =========================
-# Helpers: Auth
+# AUTH HELPERS
 # =========================
 def _extract_bearer_token(authorization: Optional[str]) -> str:
     if not authorization:
@@ -252,39 +266,62 @@ def _normalize_text(s: str) -> str:
 
 
 # =========================
-# Topic gate
+# TOPIC GATE
 # =========================
 def _is_allowed_topic(user_text: str) -> bool:
     t = (user_text or "").lower()
+
     allowed_keywords = [
+        # profile / bio / photos
         "bio", "profile", "photos", "photo", "pictures", "rewrite", "about me",
+
+        # matches / messaging / relationship advice
         "match", "matches", "message", "reply", "text her", "text him", "chat",
-        "fate", "daily", "astrology", "kundli", "compatibility",
+        "dating", "relationship", "love", "girlfriend", "boyfriend", "crush",
+        "what should i say", "what to say", "how to respond",
+
+        # fates / astrology (vedic)
+        "fate", "daily", "compatibility",
+        "astrology", "vedic", "kundli", "horoscope", "zodiac", "sign",
+        "birth date", "birthdate", "birth time", "nakshatra", "moon", "sun",
+        "ascendant", "rising", "chart", "planets", "houses",
+
+        # app
         "shaadi", "parrot", "app", "how it works", "premium", "subscription",
     ]
     return any(k in t for k in allowed_keywords)
 
 
+# =========================
+# SYSTEM PROMPT (PERSONA)
+# =========================
 def _build_system_prompt(locale: str) -> str:
-    # ✅ shorter system prompt = fewer tokens
+    # High-signal, short prompt to save tokens
     return (
-        "You are Shaadi Parrot inside a dating+fates app.\n"
-        "Only help with: profile/bio/photos, matches & messaging, Daily Fates meaning, app usage.\n"
+        "You are Shaadi Parrot — a cheerful Indian astrologer + dating coach inside a dating & Daily Fates app.\n"
+        "Persona: friendly, playful, confident, helpful. 1 emoji max.\n"
+        "You help with: profile/bio/photo tips; relationship advice; what to text/reply; Vedic astrology & compatibility.\n"
+        "You may receive USER_PROFILE and ASTRO_COMPUTED. Use them automatically.\n"
+        "If missing data for exact chart (birth place/timezone): be honest and ask only what is missing.\n"
+        "Rules: Only discuss profile/bio/photos, matches & texting, relationship advice, Daily Fates, astrology, app usage.\n"
         "If off-topic: refuse briefly and redirect.\n"
-        "Be concise and practical. 1 emoji max.\n"
         f"Reply in {locale or 'en'}.\n"
     )
 
 
 # =========================
-# Profile -> compact summary
+# PROFILE SANITIZE + SUMMARY
 # =========================
 def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove sensitive/irrelevant fields (exact geo, tokens, internal fields).
+    Keep user-facing profile fields for personalization.
+    """
     if not raw:
         return {}
 
     deny_prefixes = ["geo", "lat", "lng", "location", "idtoken", "refreshtoken", "token", "__"]
-    deny_exact = {"updatedAt", "createdAtIso", "geoCapturedAtUtc", "geoSource", "deviceId", "pushToken"}
+    deny_exact = {"updatedAt", "deviceId", "pushToken"}
 
     clean: Dict[str, Any] = {}
     for k, v in raw.items():
@@ -292,13 +329,10 @@ def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         if not key:
             continue
         lk = key.lower()
-
         if lk in (x.lower() for x in deny_exact):
             continue
-
         if any(lk.startswith(p) for p in deny_prefixes):
             continue
-
         clean[key] = v
 
     return clean
@@ -325,7 +359,6 @@ def _flatten_value(v: Any, max_len: int = 140) -> str:
             out += "…"
         return (out[:max_len] + "…") if len(out) > max_len else out
     if isinstance(v, dict):
-        # не раздуваемся
         parts = []
         for i, (kk, vv) in enumerate(v.items()):
             if i >= 8:
@@ -343,69 +376,187 @@ def _flatten_value(v: Any, max_len: int = 140) -> str:
 
 def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
     """
-    ✅ Супер-компактный summary = мало токенов.
-    Тут только то, что реально помогает переписке/био/советам.
+    Ultra-compact summary for LLM context (token-friendly).
+    Includes a compact "keys available" list for you to understand what exists.
     """
     if not profile_doc:
         return ""
 
     preferred_keys = [
         "firstName", "lastName", "gender",
-        "seekerType", "lookingFor", "seeking",
-        "birthDate", "age",
-        "cityName", "countryName", "community",
+        "seekerType", "lookingFor", "seeking", "orientation", "lookingForGender",
+        "birthDate", "birthTime", "age",
+        "cityName", "countryName", "stateName", "community", "religion",
+        "relationshipIntent", "relationshipGoal", "intent",
         "bio", "aboutMe",
-        "interests", "languages",
-        "drinking", "smoking", "workout", "diet",
+        "interests", "languages", "tags",
+        "drinking", "smoking", "workout", "diet", "pets", "social",
         "education", "jobTitle", "occupation",
-        "relationshipGoal", "relationshipIntent", "intent",
+        "height", "heightDisplayText",
     ]
 
     parts: List[str] = []
+    used = set()
+
     for k in preferred_keys:
         if k in profile_doc:
             val = _flatten_value(profile_doc.get(k))
             if val:
                 parts.append(f"{k}={val}")
-
-        if len(parts) >= 18:
+                used.add(k)
+        if len(parts) >= 22:
             break
 
-    if not parts:
-        return ""
+    extra_keys = [k for k in profile_doc.keys() if k not in used]
+    extra_keys = extra_keys[:40]
 
-    # одна строка, коротко
-    return "USER_PROFILE: " + " | ".join(parts)
+    out = ""
+    if parts:
+        out += "USER_PROFILE: " + " | ".join(parts)
+    if extra_keys:
+        out += "\nPROFILE_KEYS_AVAILABLE: " + ", ".join(extra_keys)
+
+    return out.strip()
+
+
+async def _load_user_profile(uid: str) -> Dict[str, Any]:
+    if firestore_client is None:
+        return {}
+    try:
+        snap = firestore_client.collection("profiles").document(uid).get()
+        if not snap.exists:
+            return {}
+        raw = snap.to_dict() or {}
+        return _safe_profile_dict(raw)
+    except Exception:
+        logger.exception("Failed to load profiles/{uid}")
+        return {}
 
 
 async def _load_user_profile_summary(uid: str) -> str:
-    """
-    Берем profiles/{uid}, чистим, делаем summary и кладем в кэш.
-    """
     cached = _cache_get_profile_summary(uid)
     if cached:
         return cached
 
-    if firestore_client is None:
+    profile = await _load_user_profile(uid)
+    summary = _profile_summary_text(profile)
+    if summary:
+        _cache_set_profile_summary(uid, summary)
+    return summary
+
+
+# =========================
+# ASTROLOGY (VEDIC SIDEREAL LAHIRI)
+# =========================
+_ZODIAC = [
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+]
+
+_NAKSHATRAS = [
+    "Ashwini","Bharani","Krittika","Rohini","Mrigashirsha","Ardra","Punarvasu","Pushya","Ashlesha",
+    "Magha","Purva Phalguni","Uttara Phalguni","Hasta","Chitra","Swati","Vishakha","Anuradha","Jyeshtha",
+    "Mula","Purva Ashadha","Uttara Ashadha","Shravana","Dhanishta","Shatabhisha","Purva Bhadrapada","Uttara Bhadrapada","Revati"
+]
+
+def _parse_birth_date(profile: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
+    raw = profile.get("birthDate")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*$", s)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+def _parse_birth_time(profile: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    raw = profile.get("birthTime")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        m = re.match(r"^\s*(\d{1,2}):(\d{2})", s)
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+            return None
+        return (hh, mm)
+    return None
+
+def _sign_from_sidereal_longitude(lon_deg: float) -> str:
+    idx = int((lon_deg % 360.0) / 30.0)
+    idx = max(0, min(11, idx))
+    return _ZODIAC[idx]
+
+def _nakshatra_from_sidereal_longitude(lon_deg: float) -> str:
+    seg = 360.0 / 27.0  # 13.3333...
+    idx = int((lon_deg % 360.0) / seg)
+    idx = max(0, min(26, idx))
+    return _NAKSHATRAS[idx]
+
+def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
+    """
+    Swiss Ephemeris sidereal longitude:
+    - use FLG_SIDEREAL with Lahiri mode already set on startup.
+    """
+    flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
+    res, _ = swe.calc_ut(jd_ut, planet, flags)
+    lon = float(res[0])  # ecliptic longitude
+    return lon % 360.0
+
+def _compute_astro(profile: Dict[str, Any]) -> str:
+    """
+    Returns compact ASTRO_COMPUTED string.
+    - Sidereal Lahiri for Sun/Moon.
+    - Without birthplace+timezone: Ascendant/houses cannot be exact.
+    - Without timezone: even Moon/Nakshatra can shift near boundaries.
+    """
+    bd = _parse_birth_date(profile)
+    if not bd:
         return ""
 
+    y, mo, d = bd
+    bt = _parse_birth_time(profile)
+
+    # We don't have timezone/place yet => assume UTC.
+    # If time missing => use 12:00 UTC to reduce day-boundary errors.
+    if bt:
+        hh, mm = bt
+        hour = hh + (mm / 60.0)
+        time_mode = "birthTime_provided_timezone_unknown"
+    else:
+        hour = 12.0
+        time_mode = "date_only"
+
+    jd_ut = swe.julday(y, mo, d, hour)
+
     try:
-        snap = firestore_client.collection("profiles").document(uid).get()
-        if not snap.exists:
-            return ""
-        raw = snap.to_dict() or {}
-        safe = _safe_profile_dict(raw)
-        summary = _profile_summary_text(safe)
-        if summary:
-            _cache_set_profile_summary(uid, summary)
-        return summary
+        sun_lon = _calc_sidereal_lon_ut(jd_ut, swe.SUN)
+        moon_lon = _calc_sidereal_lon_ut(jd_ut, swe.MOON)
+
+        sun_sign = _sign_from_sidereal_longitude(sun_lon)
+        moon_sign = _sign_from_sidereal_longitude(moon_lon)
+        nak = _nakshatra_from_sidereal_longitude(moon_lon)
+
+        note = "Exact ascendant/houses need birthPlace + timezone."
+        if time_mode == "date_only":
+            note = "Moon/Nakshatra accuracy improves with birthTime + birthPlace/timezone."
+
+        return (
+            f"ASTRO_COMPUTED (Vedic sidereal Lahiri): "
+            f"SunSign={sun_sign}; MoonSign={moon_sign}; Nakshatra={nak}; "
+            f"TimeMode={time_mode}. {note}"
+        )
     except Exception:
-        logger.exception("Failed to load profiles/{uid}")
+        logger.exception("Astro compute failed")
         return ""
 
 
 # =========================
-# DeepSeek call
+# DEEPSEEK CALL
 # =========================
 async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     if not DEEPSEEK_API_KEY:
@@ -415,7 +566,7 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 280,  # ✅ меньше output токенов
+        "max_tokens": 320,
     }
 
     headers = {
@@ -452,7 +603,18 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
 
 
 # =========================
-# Endpoint: AI Chat
+# DEBUG: PROFILE DUMP (SANITIZED)
+# =========================
+@app.get("/debug/profile")
+async def debug_profile(authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    profile = await _load_user_profile(uid)
+    keys = sorted(list(profile.keys()))
+    return {"uid": uid, "fields_count": len(keys), "keys": keys, "sample": profile}
+
+
+# =========================
+# AI CHAT ENDPOINT
 # =========================
 @app.post("/ai/chat", response_model=AiChatResponse)
 async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
@@ -468,7 +630,8 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
                 "I can help only with:\n"
                 "• improving your profile/bio/photos\n"
                 "• match & messaging advice\n"
-                "• Daily Fates meaning\n"
+                "• relationship advice (what to text)\n"
+                "• Daily Fates + Vedic astrology\n"
                 "• how the app works 🦜\n\n"
                 "Ask me about one of these."
             ),
@@ -479,18 +642,26 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
     locale = (body.locale or "en").strip() or "en"
     system_prompt = _build_system_prompt(locale)
 
-    # ✅ profile summary (cached)
-    profile_summary = await _load_user_profile_summary(uid)
+    # Load profile ONCE per request
+    profile = await _load_user_profile(uid)
+
+    # Compact cached summary (token-friendly)
+    profile_summary = _profile_summary_text(profile)
+
+    # Astro computed (sidereal Lahiri)
+    astro_computed = _compute_astro(profile)
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
-    # ✅ Add short profile summary (NOT the whole doc)
     if profile_summary:
         messages.append({"role": "system", "content": profile_summary})
 
-    # ✅ include small history (already reduced on client, but keep guard here too)
+    if astro_computed:
+        messages.append({"role": "system", "content": astro_computed})
+
+    # Short history guard
     if body.history:
-        turns = body.history[-6:]  # ✅ server guard
+        turns = body.history[-6:]
         for t in turns:
             role = t.role
             txt = _normalize_text(t.text)
@@ -498,7 +669,6 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
                 continue
             if role not in ["user", "assistant"]:
                 continue
-            # extra trim for safety
             if len(txt) > 320:
                 txt = txt[:320] + "…"
             messages.append({"role": role, "content": txt})
@@ -507,5 +677,8 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
 
     reply = await _call_deepseek(messages)
 
-    logger.info(f"[ai_chat] uid={uid} user_len={len(user_text)} has_profile={bool(profile_summary)}")
+    logger.info(
+        f"[ai_chat] uid={uid} user_len={len(user_text)} profile_fields={len(profile) if profile else 0} "
+        f"astro={'yes' if bool(astro_computed) else 'no'}"
+    )
     return AiChatResponse(reply_text=reply, blocked=False)
