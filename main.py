@@ -158,12 +158,12 @@ def _stable_pick(variants: List[str], key: str) -> str:
 
 
 # =========================
-# TOPIC GATE (RELAXED FOR HOROSCOPE)
+# TOPIC GATE (SOFT)
+# - Block only obvious cooking/recipes. Everything else is allowed.
 # =========================
 def _is_allowed_topic(user_text: str) -> bool:
     t = (user_text or "").lower()
 
-    # Block obvious cooking/recipes
     blocked_keywords = [
         "recipe", "cook", "cooking", "pancake", "omelet", "baking", "cake",
         "how to fry", "ingredients", "gram", "ml", "kefir", "flour", "sugar",
@@ -173,48 +173,49 @@ def _is_allowed_topic(user_text: str) -> bool:
     if any(k in t for k in blocked_keywords):
         return False
 
-    # IMPORTANT: horoscope must always be allowed
-    horoscope_keywords = ["horoscope", "horoskop", "гороскоп", "vedic", "astrology", "kundli", "nakshatra", "rashi"]
-    if any(k in t for k in horoscope_keywords):
-        return True
-
-    allowed_keywords = [
-        # relationships / texting
-        "dating", "relationship", "love", "crush", "girlfriend", "boyfriend",
-        "girls", "guys", "her", "him", "she", "he",
-        "message", "reply", "text", "what should i say", "how to respond",
-        "pick up", "flirt", "date idea", "first date", "apology", "breakup", "jealous",
-
-        # profile help
-        "profile", "bio", "about me", "photos", "photo", "pictures", "rewrite",
-        "describe my profile", "improve my profile",
-
-        # astrology / fates
-        "zodiac", "sign", "birth date", "birthdate", "born",
-        "compatibility", "match", "fate", "daily fates", "planets",
-
-        # app context
-        "shaadi", "parrot", "app", "premium", "subscription",
-    ]
-    return any(k in t for k in allowed_keywords)
+    return True
 
 
 def _topic_block_reply(user_text: str, locale: str) -> str:
+    # If blocked (recipes), gently redirect without being rude.
     variants_en = [
-        "That’s outside my nest 🦜\nBut I can help with:\n• love, dating, relationships\n• what to text/reply (I’ll write it)\n• profile/bio glow-up\n• Vedic astrology & compatibility\nPick one 🙂",
-        "Not my specialty 😅\nI’m your dating + Vedic astrology parrot.\nTell me about:\n• your situation\n• what message you want to send\n• your birth date/sign\n• or your profile/bio",
-        "I can’t help with that one.\nBut I can be amazing at love + astrology + texting.\nWhat do you want to improve today? 🦜✨",
+        "I can’t help with recipes 🦜\nBut I can help with:\n• daily horoscope (Vedic)\n• love, dating, relationships\n• what to text/reply (I’ll write it)\n• profile/bio glow-up\nAsk me one of those 🙂",
+        "Not a cooking parrot 😅\nBut I’m great at:\n• Vedic astrology & Daily Fates\n• relationships + dating\n• writing messages\n• improving your profile\nWhat do you want today? 🦜",
     ]
-
     variants_ru = [
-        "Это вне моего гнезда 🦜\nНо я могу:\n• любовь/свидания/отношения\n• сообщения (напишу текст)\n• улучшение профиля/био\n• ведическая астрология/совместимость\nВыбирай 🙂",
-        "С этим не помогу 😅\nЗато я твой попугай по свиданиям и ведической астрологии.\nРасскажи ситуацию или скинь дату рождения/знак 🦜",
-        "Не мой запрос.\nНо я топ по любви, сообщениям и астрологии.\nЧто хочешь разобрать? 🦜✨",
+        "С рецептами не помогу 🦜\nНо я могу:\n• гороскоп (ведический)\n• любовь/свидания/отношения\n• сообщения (напишу текст)\n• улучшение профиля/био\nСпроси что-то из этого 🙂",
+        "Я не кулинарный попугай 😅\nЗато я топ в:\n• ведической астрологии и Daily Fates\n• отношениях и свиданиях\n• сообщениях\n• улучшении профиля\nЧто разбираем? 🦜",
     ]
-
     lang = (locale or "en").strip().lower()
     pool = variants_ru if lang.startswith("ru") else variants_en
     return _stable_pick(pool, user_text)
+
+
+# =========================
+# INTENT HINTS (cheap, deterministic)
+# - We add a tiny hint to the model to interpret vague requests correctly.
+# =========================
+def _infer_intent_hint(user_text: str, locale: str) -> str:
+    t = (user_text or "").lower()
+
+    # Forecast / today / vibe style questions should be treated as horoscope/daily fate automatically.
+    forecast_words = [
+        "forecast", "today", "my day", "how will my day", "what about today", "daily", "vibe",
+        "гороскоп", "сегодня", "прогноз", "как пройдет день", "мой день", "вайб"
+    ]
+    if any(w in t for w in forecast_words):
+        return (
+            "INTENT_HINT: The user is asking for a Daily Fate / daily horoscope. "
+            "Answer as a Vedic-style daily horoscope and personalize using USER_PROFILE + ASTRO_COMPUTED."
+        )
+
+    # If user asks about interests/profile, it is still in-scope: personalize.
+    if "interest" in t or "interests" in t or "profile" in t or "bio" in t or "about me" in t or "анкет" in t:
+        return (
+            "INTENT_HINT: Use USER_PROFILE (interests/lifestyle) to personalize your answer."
+        )
+
+    return ""
 
 
 # =========================
@@ -227,16 +228,16 @@ def _build_system_prompt(locale: str) -> str:
         "Your goal: make the user feel seen and understood using their profile data, while staying practical and warm.\n"
         "\n"
         "IMPORTANT BEHAVIOR:\n"
-        "1) Always be personable. If USER_PROFILE includes firstName, greet them by name.\n"
-        "2) If USER_PROFILE includes birthDate, mention it briefly (e.g., 'born on YYYY-MM-DD') so it feels personal.\n"
+        "1) Be personable. If USER_PROFILE includes firstName, greet them by name.\n"
+        "2) If USER_PROFILE includes birthDate, reference it briefly to make it feel personal (do not over-repeat).\n"
         "3) If ASTRO_COMPUTED exists, use Indian/Vedic framing:\n"
-        "   - Say: 'Rashi (Moon sign)' and 'Sun sign (Surya)' and 'Nakshatra'.\n"
-        "   - Mention: 'sidereal Lahiri' only if user asks 'how do you know'.\n"
-        "4) Daily horoscope must feel specific:\n"
-        "   - Use at least 2 personalized anchors from: name, birthDate, city/country, interests, lifestyle (workout, smoking, drinking), relationshipIntent.\n"
-        "   - If interests include gym/fitness and horoscope mentions energy/discipline, tie it directly to training.\n"
-        "5) Do NOT be strict or dismissive. If user asks for 'horoscope today', ALWAYS answer with a daily horoscope.\n"
-        "6) Avoid random 'magic' tips (colors, lucky numbers) unless the user explicitly asks.\n"
+        "   - Use terms: Rashi (Moon sign), Surya (Sun sign), Nakshatra.\n"
+        "   - Do NOT mention 'sidereal Lahiri' unless the user asks how you know.\n"
+        "4) If user asks for today's horoscope / daily forecast (even vaguely), ALWAYS answer as a Daily Fate.\n"
+        "5) Personalize using at least 2 anchors when available: name, interests, lifestyle (workout/smoking/drinking), relationshipIntent, city/country.\n"
+        "   Example: if interests include gym/fitness, tie energy/discipline tips to training.\n"
+        "6) Never be strict or dismissive. Do NOT say 'outside my nest' unless the user asks for cooking/recipes.\n"
+        "7) Keep it practical and uplifting. Avoid random 'lucky colors/numbers' unless user asks.\n"
         "\n"
         "WHAT YOU CAN DO:\n"
         "• daily horoscope (uplifting + practical)\n"
@@ -254,7 +255,7 @@ def _build_system_prompt(locale: str) -> str:
         "\n"
         "ACCURACY RULES:\n"
         "- If birth place + timezone are missing: do NOT claim Ascendant/houses.\n"
-        "- If ASTRO_COMPUTED is missing: ask ONE question (Sun sign or birthDate) and still give a gentle general horoscope.\n"
+        "- If ASTRO_COMPUTED is missing: ask ONE question (Sun sign or birthDate) BUT still give a gentle general daily horoscope.\n"
         "\n"
         f"Reply in {lang}.\n"
     )
@@ -322,7 +323,6 @@ def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
     if not profile_doc:
         return ""
 
-    # include more user-centric keys, especially interests/lifestyle
     preferred_keys = [
         "firstName", "lastName", "gender",
         "birthDate", "birthTime", "age",
@@ -570,25 +570,49 @@ def verify_face(data: VerifyFaceRequest):
 
 # =========================
 # PERSISTENT CHAT STORAGE (Firestore)
+# - Supports thread_id without breaking existing "default" history.
 # =========================
-def _chat_doc_ref(uid: str):
-    if firestore_client is None:
-        return None
-    return firestore_client.collection("parrotChats").document(uid)
+def _safe_thread_id(thread_id: str) -> str:
+    tid = (thread_id or "default").strip()
+    if not tid:
+        tid = "default"
+    if tid == "default":
+        return "default"
+    # Make thread doc id safe and short
+    h = hashlib.sha256(tid.encode("utf-8")).hexdigest()[:16]
+    return f"t_{h}"
 
-def _chat_msgs_col_ref(uid: str):
+
+def _chat_doc_id(uid: str, thread_id: str) -> str:
+    tid = _safe_thread_id(thread_id)
+    # keep backward compatibility for default
+    if tid == "default":
+        return uid
+    return f"{uid}__{tid}"
+
+
+def _chat_doc_ref(uid: str, thread_id: str):
     if firestore_client is None:
         return None
-    return firestore_client.collection("parrotChats").document(uid).collection("messages")
+    return firestore_client.collection("parrotChats").document(_chat_doc_id(uid, thread_id))
+
+
+def _chat_msgs_col_ref(uid: str, thread_id: str):
+    if firestore_client is None:
+        return None
+    return _chat_doc_ref(uid, thread_id).collection("messages")
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
-def _load_chat_state(uid: str) -> Dict[str, Any]:
-    ref = _chat_doc_ref(uid)
+
+def _load_chat_state(uid: str, thread_id: str) -> Dict[str, Any]:
+    ref = _chat_doc_ref(uid, thread_id)
     if ref is None:
         return {}
     try:
@@ -597,40 +621,79 @@ def _load_chat_state(uid: str) -> Dict[str, Any]:
             return {}
         return snap.to_dict() or {}
     except Exception:
-        logger.exception("Failed to load parrotChats/{uid}")
+        logger.exception("Failed to load parrotChats state")
         return {}
 
-def _save_chat_state(uid: str, patch: Dict[str, Any]) -> None:
-    ref = _chat_doc_ref(uid)
+
+def _save_chat_state(uid: str, thread_id: str, patch: Dict[str, Any]) -> None:
+    ref = _chat_doc_ref(uid, thread_id)
     if ref is None:
         return
     try:
         ref.set(patch, merge=True)
     except Exception:
-        logger.exception("Failed to save parrotChats/{uid}")
+        logger.exception("Failed to save parrotChats state")
 
-def _save_chat_message(uid: str, role: str, text: str, created_at_iso: str, created_at_ms: int) -> None:
-    col = _chat_msgs_col_ref(uid)
-    if col is None:
+
+def _save_chat_message_batch(
+    uid: str,
+    thread_id: str,
+    user_text: str,
+    assistant_text: str,
+    created_at_iso: str,
+    created_at_ms: int,
+) -> None:
+    """
+    Writes user+assistant messages in ONE batch commit.
+    This helps prevent "second message appears only after restart" issues when the UI refetches quickly.
+    """
+    col = _chat_msgs_col_ref(uid, thread_id)
+    docref = _chat_doc_ref(uid, thread_id)
+    if col is None or docref is None or firestore_client is None:
         return
-    try:
-        msg_hash = hashlib.md5((text or "").encode("utf-8")).hexdigest()[:8]
-        msg_id = f"{created_at_ms}_{role}_{msg_hash}"
-        col.document(msg_id).set({
-            "role": role,
-            "text": text,
-            "createdAtIso": created_at_iso,
-            "createdAtMs": created_at_ms
-        })
-    except Exception:
-        logger.exception("Failed to save chat message")
 
-def _load_chat_history(uid: str, limit: int = 24) -> List[Dict[str, str]]:
-    col = _chat_msgs_col_ref(uid)
+    try:
+        batch = firestore_client.batch()
+
+        user_hash = hashlib.md5((user_text or "").encode("utf-8")).hexdigest()[:8]
+        asst_hash = hashlib.md5((assistant_text or "").encode("utf-8")).hexdigest()[:8]
+
+        user_id = f"{created_at_ms}_user_{user_hash}"
+        asst_id = f"{created_at_ms + 2}_assistant_{asst_hash}"
+
+        batch.set(col.document(user_id), {
+            "role": "user",
+            "text": user_text,
+            "createdAtIso": created_at_iso,
+            "createdAtMs": created_at_ms,
+        })
+
+        batch.set(col.document(asst_id), {
+            "role": "assistant",
+            "text": assistant_text,
+            "createdAtIso": created_at_iso,
+            "createdAtMs": created_at_ms + 2,
+        })
+
+        # also touch parent doc for "updatedAtMs" so lists can refresh fast
+        batch.set(docref, {
+            "uid": uid,
+            "threadId": (thread_id or "default"),
+            "updatedAtIso": created_at_iso,
+            "updatedAtMs": created_at_ms,
+        }, merge=True)
+
+        batch.commit()
+    except Exception:
+        logger.exception("Failed to batch save chat messages")
+
+
+def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[str, str]]:
+    col = _chat_msgs_col_ref(uid, thread_id)
     if col is None:
         return []
 
-    state = _load_chat_state(uid)
+    state = _load_chat_state(uid, thread_id)
     cleared_ms = state.get("clearedAtMs")
     try:
         cleared_ms = int(cleared_ms) if cleared_ms is not None else 0
@@ -718,6 +781,8 @@ def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_te
         mem["lastTopic"] = "relationships"
     elif "horoscope" in tl or "horoskop" in tl or "гороскоп" in tl or "vedic" in tl or "astrology" in tl:
         mem["lastTopic"] = "astrology"
+    elif "forecast" in tl or "today" in tl or "прогноз" in tl or "сегодня" in tl:
+        mem["lastTopic"] = "astrology"
 
     state["memory"] = mem
     return state
@@ -731,7 +796,7 @@ def ai_history(thread_id: str = "default", limit: int = 24, authorization: Optio
     uid = _verify_firebase_token_or_401(authorization)
     limit = max(1, min(80, int(limit)))
 
-    rows = _load_chat_history(uid, limit=limit)
+    rows = _load_chat_history(uid, thread_id, limit=limit)
     msgs: List[ChatTurn] = []
     for r in rows:
         role = r.get("role") or ""
@@ -747,7 +812,14 @@ def ai_reset(thread_id: str = "default", authorization: Optional[str] = Header(d
     uid = _verify_firebase_token_or_401(authorization)
     now_iso = _now_iso()
     now_ms = _now_ms()
-    _save_chat_state(uid, {"uid": uid, "clearedAtIso": now_iso, "clearedAtMs": now_ms, "updatedAtIso": now_iso})
+    _save_chat_state(uid, thread_id, {
+        "uid": uid,
+        "threadId": (thread_id or "default"),
+        "clearedAtIso": now_iso,
+        "clearedAtMs": now_ms,
+        "updatedAtIso": now_iso,
+        "updatedAtMs": now_ms,
+    })
     return ResetResponse(thread_id=(thread_id or "default"), ok=True)
 
 
@@ -756,7 +828,7 @@ def ai_reset(thread_id: str = "default", authorization: Optional[str] = Header(d
 def parrot_history(limit: int = 24, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
     limit = max(1, min(80, int(limit)))
-    items = _load_chat_history(uid, limit=limit)
+    items = _load_chat_history(uid, "default", limit=limit)
     return {"uid": uid, "count": len(items), "items": items}
 
 
@@ -765,7 +837,14 @@ def parrot_reset(authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
     now_iso = _now_iso()
     now_ms = _now_ms()
-    _save_chat_state(uid, {"uid": uid, "clearedAtIso": now_iso, "clearedAtMs": now_ms, "updatedAtIso": now_iso})
+    _save_chat_state(uid, "default", {
+        "uid": uid,
+        "threadId": "default",
+        "clearedAtIso": now_iso,
+        "clearedAtMs": now_ms,
+        "updatedAtIso": now_iso,
+        "updatedAtMs": now_ms,
+    })
     return {"status": "ok", "uid": uid, "clearedAtIso": now_iso}
 
 
@@ -824,30 +903,35 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
     uid = _verify_firebase_token_or_401(authorization)
 
     user_text = _normalize_text(body.text)
-    if not user_text:
-        return AiChatResponse(reply_text="Ask me something 🦜", thread_id=(body.thread_id or "default"))
-
+    thread_id = (body.thread_id or "default").strip() or "default"
     locale = (body.locale or "en").strip() or "en"
+
+    if not user_text:
+        return AiChatResponse(reply_text="Ask me something 🦜", thread_id=thread_id)
 
     if not _is_allowed_topic(user_text):
         return AiChatResponse(
             reply_text=_topic_block_reply(user_text, locale),
             blocked=True,
             reason="topic_not_allowed",
-            thread_id=(body.thread_id or "default"),
+            thread_id=thread_id,
         )
 
     system_prompt = _build_system_prompt(locale)
 
+    # Load user profile (for personalization)
     profile = await _load_user_profile(uid)
     profile_summary = _profile_summary_text(profile)
 
+    # Astro computed (vedic sidereal)
     astro_computed = _compute_astro(profile)
 
-    state = _load_chat_state(uid)
+    # Load persistent chat memory + last messages
+    state = _load_chat_state(uid, thread_id)
     memory_text = _memory_text_from_state(state)
-    persisted_history = _load_chat_history(uid, limit=30)
+    persisted_history = _load_chat_history(uid, thread_id, limit=30)
 
+    # Optional: merge client history
     client_history: List[Dict[str, str]] = []
     if body.history:
         for t in body.history[-10:]:
@@ -858,6 +942,9 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
                     txt = txt[:360] + "…"
                 client_history.append({"role": role, "content": txt})
 
+    intent_hint = _infer_intent_hint(user_text, locale)
+
+    # Build final LLM messages
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
     if profile_summary:
@@ -869,6 +956,9 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
     if memory_text:
         messages.append({"role": "system", "content": memory_text})
 
+    if intent_hint:
+        messages.append({"role": "system", "content": intent_hint})
+
     combined = persisted_history[-16:]
     if client_history and len(combined) < 8:
         combined = (combined + client_history)[-16:]
@@ -877,23 +967,30 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
         if m.get("role") in ["user", "assistant"] and m.get("content"):
             messages.append({"role": m["role"], "content": m["content"]})
 
+    # Current user message
     messages.append({"role": "user", "content": user_text})
 
     reply = await _call_deepseek(messages)
 
+    # Persist messages (batch commit to reduce "missing until restart" effects)
     now_iso = _now_iso()
     now_ms = _now_ms()
+    _save_chat_message_batch(uid, thread_id, user_text, reply, now_iso, now_ms)
 
-    # Save user then assistant with ms separation for stable ordering
-    _save_chat_message(uid, "user", user_text, now_iso, now_ms)
-    _save_chat_message(uid, "assistant", reply, now_iso, now_ms + 2)
-
+    # Update memory/state
     state = _update_memory_from_text(state, user_text, reply)
-    _save_chat_state(uid, {"uid": uid, "updatedAtIso": now_iso, "memory": state.get("memory", {})})
+    _save_chat_state(uid, thread_id, {
+        "uid": uid,
+        "threadId": thread_id,
+        "updatedAtIso": now_iso,
+        "updatedAtMs": now_ms,
+        "memory": state.get("memory", {}),
+    })
 
     logger.info(
-        f"[ai_chat] uid={uid} user_len={len(user_text)} profile_fields={len(profile) if profile else 0} "
-        f"persisted_hist={len(persisted_history)} astro={'yes' if bool(astro_computed) else 'no'}"
+        f"[ai_chat] uid={uid} thread={thread_id} user_len={len(user_text)} "
+        f"profile_fields={len(profile) if profile else 0} persisted_hist={len(persisted_history)} "
+        f"astro={'yes' if bool(astro_computed) else 'no'}"
     )
 
-    return AiChatResponse(reply_text=reply, blocked=False, thread_id=(body.thread_id or "default"))
+    return AiChatResponse(reply_text=reply, blocked=False, thread_id=thread_id)
