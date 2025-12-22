@@ -5,6 +5,7 @@ import os
 import requests
 import re
 import time
+from datetime import datetime, timezone
 from typing import Optional, List, Literal, Dict, Any, Tuple
 
 from google.cloud import vision
@@ -42,11 +43,26 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app()
 
 # =========================
-# SIMPLE IN-MEMORY CACHES
+# CONFIG
 # =========================
-# uid -> (expires_at_epoch, profile_summary_text)
-_profile_summary_cache: Dict[str, Tuple[float, str]] = {}
+CHAT_SUBCOLLECTION = "parrotChats"     # users/{uid}/parrotChats/{threadId}
+DEFAULT_THREAD_ID = "default"
+
+# how many turns we keep in memory
+MAX_STORED_TURNS = 40  # 40 turns = 20 user+assistant pairs
+# how many turns we send to LLM (token-friendly)
+MAX_LLM_TURNS = 12     # last 12 turns is usually enough
+
 PROFILE_CACHE_TTL_SEC = 600  # 10 min
+_profile_summary_cache: Dict[str, Tuple[float, str]] = {}
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso():
+    return _utc_now().isoformat()
 
 
 def _cache_get_profile_summary(uid: str) -> str:
@@ -87,13 +103,25 @@ class AiChatRequest(BaseModel):
     text: str
     locale: Optional[str] = "en"
     mode: Optional[str] = "shaadi_parrot"
-    history: Optional[List[ChatTurn]] = None
+    thread_id: Optional[str] = DEFAULT_THREAD_ID
+    history: Optional[List[ChatTurn]] = None  # client can still send, but server will persist
 
 
 class AiChatResponse(BaseModel):
     reply_text: str
     blocked: bool = False
     reason: Optional[str] = None
+    thread_id: Optional[str] = DEFAULT_THREAD_ID
+
+
+class HistoryResponse(BaseModel):
+    thread_id: str
+    messages: List[ChatTurn]
+
+
+class ResetResponse(BaseModel):
+    thread_id: str
+    ok: bool = True
 
 
 # =========================
@@ -101,13 +129,8 @@ class AiChatResponse(BaseModel):
 # =========================
 @app.on_event("startup")
 def startup_event():
-    """
-    Cloud Run best-practice: heavy init only here.
-    Also: set Swiss Ephemeris sidereal mode once (Vedic Lahiri).
-    """
     global vision_client, firestore_client
 
-    # Swiss Ephemeris: Vedic (Sidereal) Lahiri
     try:
         swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
         logger.info("Swiss Ephemeris sidereal mode set: Lahiri")
@@ -268,63 +291,45 @@ def _normalize_text(s: str) -> str:
 # =========================
 # TOPIC ROUTER (human-friendly)
 # =========================
-# Instead of hard-blocking based on a few keywords, we:
-# 1) Detect if message is clearly off-topic (recipes, coding help, etc.)
-# 2) Otherwise, treat most vague dating messages as allowed and guide user.
-
 _OFFTOPIC_BLOCK_PATTERNS = [
-    # cooking/recipes
     r"\b(recipe|cook|cooking|pancake|pancakes|omelet|cake|bake|ingredients)\b",
-    # programming / hacking / malware
     r"\b(hack|ddos|phish|malware|exploit|crack|keylogger)\b",
     r"\b(code|python|c\+\+|java|javascript|sql|api|compile|bug fix|debug)\b",
-    # politics/news
     r"\b(election|president|politics|war|propaganda)\b",
-    # drugs / illegal
     r"\b(heroin|cocaine|meth|weed|drug deal|how to buy)\b",
 ]
 
 _ALLOWED_HINTS_PATTERNS = [
-    # dating/relationships in natural language
     r"\b(girl|girls|guy|guys|dating|date|relationship|love|crush|romance)\b",
-    r"\b(text|message|dm|reply|respond|pickup line|what should i say|what to say)\b",
+    r"\b(text|message|dm|reply|respond|what should i say|what to say|how to respond)\b",
     r"\b(ghost(ed|ing)|ignored|left on read|seen)\b",
     r"\b(match|matches|tinder|bumble|hinge)\b",
-    # profile/bio
     r"\b(bio|profile|about me|photos?|pictures?)\b",
-    # astrology/fates
     r"\b(astrology|vedic|kundli|horoscope|zodiac|nakshatra|moon sign|sun sign|compatib)\b",
-    # app usage
     r"\b(app|shaadi|parrot|premium|subscription|how it works)\b",
 ]
 
 
 def _looks_offtopic(user_text: str) -> bool:
     t = (user_text or "").lower()
-    for pat in _OFFTOPIC_BLOCK_PATTERNS:
-        if re.search(pat, t, re.IGNORECASE):
-            return True
-    return False
+    return any(re.search(pat, t, re.IGNORECASE) for pat in _OFFTOPIC_BLOCK_PATTERNS)
 
 
 def _looks_allowed(user_text: str) -> bool:
     t = (user_text or "").lower()
-    for pat in _ALLOWED_HINTS_PATTERNS:
-        if re.search(pat, t, re.IGNORECASE):
-            return True
-    return False
+    return any(re.search(pat, t, re.IGNORECASE) for pat in _ALLOWED_HINTS_PATTERNS)
 
 
 def _build_soft_redirect(locale: str) -> str:
-    # Not "blocked" vibe. Redirect gently.
+    # nicer + still focused + allows emojis
     return (
-        "I’m Shaadi Parrot 🦜\n"
-        "I can help with love, dating, texting, your profile/bio/photos, and Vedic astrology.\n\n"
+        "I’m Shaadi Parrot 🦜✨\n"
+        "I’m your guide to love, texting, profiles, and Vedic astrology.\n\n"
         "Try one of these:\n"
-        "• “What should I text her next?”\n"
-        "• “Rewrite my bio based on my profile”\n"
-        "• “Explain my Daily Fate”\n"
-        "• “What’s my Moon sign / Nakshatra?”"
+        "• “What should I text her next?” 💬\n"
+        "• “Rewrite my bio from my profile” 📝\n"
+        "• “Explain my Daily Fate” 🔮\n"
+        "• “What’s my Moon sign / Nakshatra?” 🌙"
     )
 
 
@@ -332,15 +337,14 @@ def _build_soft_redirect(locale: str) -> str:
 # SYSTEM PROMPT (PERSONA)
 # =========================
 def _build_system_prompt(locale: str) -> str:
-    # Keep short and strong.
     return (
         "You are Shaadi Parrot — a cheerful Indian astrologer + dating coach inside a dating & Daily Fates app.\n"
-        "Your mission: be a guide to love, relationships, and understanding.\n"
-        "You help with: profile/bio/photos; relationship advice; what to text/reply; Vedic astrology, compatibility, Daily Fates; app usage.\n"
-        "Style: warm, playful, confident, practical. Keep replies concise. Max 1 emoji.\n"
-        "If user is vague ('help me with girls'): ask 1 clarifying question and offer 2-3 options.\n"
+        "Mission: guide the user through love, relationships, mutual understanding, and astrology.\n"
+        "You help with: texting/replies; dating strategy; interpreting signals; profile/bio/photo tips; Vedic astrology; compatibility; Daily Fates; app usage.\n"
+        "Style: charming, clear, emotionally intelligent, confident. Use 1–3 emojis naturally.\n"
+        "If user is vague ('help me with girls'): ask ONE clarifying question and give 2–3 ready options.\n"
         "You may receive USER_PROFILE and ASTRO_COMPUTED. Use them automatically.\n"
-        "If exact chart requires birthplace/timezone: say it clearly and give the best approximate answer.\n"
+        "If exact chart needs birthplace/timezone: say so briefly, still give best approximate answer.\n"
         "Do NOT help with cooking/recipes, coding, politics, hacking, drugs, or illegal activity.\n"
         f"Reply in {locale or 'en'}.\n"
     )
@@ -350,10 +354,6 @@ def _build_system_prompt(locale: str) -> str:
 # PROFILE SANITIZE + SUMMARY
 # =========================
 def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Remove sensitive/irrelevant fields (exact geo, tokens, internal fields).
-    Keep user-facing profile fields for personalization.
-    """
     if not raw:
         return {}
 
@@ -406,16 +406,11 @@ def _flatten_value(v: Any, max_len: int = 140) -> str:
                 parts.append(f"{kk}:{s}")
         out = "; ".join(parts)
         return (out[:max_len] + "…") if len(out) > max_len else out
-
     s = str(v).strip()
     return (s[:max_len] + "…") if len(s) > max_len else s
 
 
 def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
-    """
-    Ultra-compact summary for LLM context (token-friendly).
-    Also includes keys list so Parrot can describe the profile if asked.
-    """
     if not profile_doc:
         return ""
 
@@ -444,7 +439,6 @@ def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
         if len(parts) >= 22:
             break
 
-    # keys list (bounded)
     extra_keys = [k for k in profile_doc.keys() if k not in used]
     extra_keys = extra_keys[:30]
 
@@ -533,7 +527,7 @@ def _sign_from_sidereal_longitude(lon_deg: float) -> str:
 
 
 def _nakshatra_from_sidereal_longitude(lon_deg: float) -> str:
-    seg = 360.0 / 27.0  # 13.3333...
+    seg = 360.0 / 27.0
     idx = int((lon_deg % 360.0) / seg)
     idx = max(0, min(26, idx))
     return _NAKSHATRAS[idx]
@@ -542,16 +536,10 @@ def _nakshatra_from_sidereal_longitude(lon_deg: float) -> str:
 def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
     flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
     res, _ = swe.calc_ut(jd_ut, planet, flags)
-    lon = float(res[0])
-    return lon % 360.0
+    return float(res[0]) % 360.0
 
 
 def _compute_astro(profile: Dict[str, Any]) -> str:
-    """
-    Compact ASTRO_COMPUTED string for the LLM.
-    Uses sidereal Lahiri for Sun/Moon + Nakshatra.
-    Without birthplace+timezone: Ascendant/houses cannot be exact.
-    """
     bd = _parse_birth_date(profile)
     if not bd:
         return ""
@@ -559,8 +547,6 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
     y, mo, d = bd
     bt = _parse_birth_time(profile)
 
-    # No timezone/place yet => assume UTC.
-    # If time missing => use 12:00 UTC to reduce boundary errors.
     if bt:
         hh, mm = bt
         hour = hh + (mm / 60.0)
@@ -592,6 +578,88 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
 
 
 # =========================
+# CHAT STORAGE (Firestore)
+# =========================
+def _thread_id_clean(thread_id: Optional[str]) -> str:
+    x = (thread_id or DEFAULT_THREAD_ID).strip()
+    if not x:
+        x = DEFAULT_THREAD_ID
+    # Firestore doc id safe-ish
+    x = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", x)
+    return x[:80]
+
+
+def _chat_doc_ref(uid: str, thread_id: str):
+    if firestore_client is None:
+        return None
+    tid = _thread_id_clean(thread_id)
+    return firestore_client.collection("users").document(uid).collection(CHAT_SUBCOLLECTION).document(tid)
+
+
+def _to_turns(raw_messages: Any) -> List[ChatTurn]:
+    out: List[ChatTurn] = []
+    if not isinstance(raw_messages, list):
+        return out
+    for m in raw_messages:
+        try:
+            role = (m.get("role") or "").strip()
+            text = (m.get("text") or "").strip()
+            if role not in ["user", "assistant"]:
+                continue
+            if not text:
+                continue
+            out.append(ChatTurn(role=role, text=text))
+        except Exception:
+            continue
+    return out
+
+
+def _from_turns(turns: List[ChatTurn]) -> List[Dict[str, Any]]:
+    now_iso = _utc_iso()
+    result: List[Dict[str, Any]] = []
+    for t in turns:
+        txt = _normalize_text(t.text)
+        if not txt:
+            continue
+        result.append({"role": t.role, "text": txt, "ts": now_iso})
+    return result
+
+
+async def _load_thread_history(uid: str, thread_id: str) -> List[ChatTurn]:
+    ref = _chat_doc_ref(uid, thread_id)
+    if ref is None:
+        return []
+    try:
+        snap = ref.get()
+        if not snap.exists:
+            return []
+        data = snap.to_dict() or {}
+        return _to_turns(data.get("messages"))
+    except Exception:
+        logger.exception("Failed to load chat history")
+        return []
+
+
+async def _save_thread_history(uid: str, thread_id: str, turns: List[ChatTurn]) -> None:
+    ref = _chat_doc_ref(uid, thread_id)
+    if ref is None:
+        return
+    try:
+        # keep only last MAX_STORED_TURNS
+        trimmed = turns[-MAX_STORED_TURNS:]
+        payload = {
+            "uid": uid,
+            "threadId": _thread_id_clean(thread_id),
+            "messages": _from_turns(trimmed),
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAtIso": _utc_iso(),
+        }
+        ref.set(payload, merge=True)
+    except Exception:
+        logger.exception("Failed to save chat history")
+
+
+# =========================
 # DEEPSEEK CALL
 # =========================
 async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
@@ -601,8 +669,8 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 340,
+        "temperature": 0.75,
+        "max_tokens": 420,
     }
 
     headers = {
@@ -639,18 +707,40 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
 
 
 # =========================
-# DEBUG: PROFILE DUMP (SANITIZED)
+# API: HISTORY + RESET
 # =========================
-@app.get("/debug/profile")
-async def debug_profile(authorization: Optional[str] = Header(default=None)):
+@app.get("/ai/history", response_model=HistoryResponse)
+async def get_history(thread_id: Optional[str] = DEFAULT_THREAD_ID, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
-    profile = await _load_user_profile(uid)
-    keys = sorted(list(profile.keys()))
-    return {"uid": uid, "fields_count": len(keys), "keys": keys, "sample": profile}
+    tid = _thread_id_clean(thread_id)
+    turns = await _load_thread_history(uid, tid)
+    return HistoryResponse(thread_id=tid, messages=turns)
+
+
+@app.post("/ai/reset", response_model=ResetResponse)
+async def reset_history(thread_id: Optional[str] = DEFAULT_THREAD_ID, authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    tid = _thread_id_clean(thread_id)
+    ref = _chat_doc_ref(uid, tid)
+    if ref is not None:
+        try:
+            ref.set(
+                {
+                    "uid": uid,
+                    "threadId": tid,
+                    "messages": [],
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "updatedAtIso": _utc_iso(),
+                },
+                merge=True,
+            )
+        except Exception:
+            logger.exception("Failed to reset chat")
+    return ResetResponse(thread_id=tid, ok=True)
 
 
 # =========================
-# AI CHAT ENDPOINT
+# AI CHAT ENDPOINT (with persistence)
 # =========================
 @app.post("/ai/chat", response_model=AiChatResponse)
 async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
@@ -658,66 +748,71 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
 
     user_text = _normalize_text(body.text)
     if not user_text:
-        return AiChatResponse(reply_text="Ask me something 🙂")
+        return AiChatResponse(reply_text="Say hi, tell me what’s happening in your love story 🦜💛", blocked=False)
 
     locale = (body.locale or "en").strip() or "en"
+    thread_id = _thread_id_clean(body.thread_id)
 
-    # Hard off-topic block (recipes, coding, politics, hacking, drugs)
+    # hard off-topic redirect
     if _looks_offtopic(user_text):
-        return AiChatResponse(
-            reply_text=_build_soft_redirect(locale),
-            blocked=False,
-            reason="off_topic_redirect",
-        )
+        return AiChatResponse(reply_text=_build_soft_redirect(locale), blocked=False, reason="off_topic_redirect", thread_id=thread_id)
 
-    # If message doesn't look allowed, we still don't hard-block:
-    # we gently steer them into the love/astrology/app world.
+    # soft redirect if not clearly allowed
     if not _looks_allowed(user_text):
-        return AiChatResponse(
-            reply_text=_build_soft_redirect(locale),
-            blocked=False,
-            reason="needs_redirect",
-        )
+        return AiChatResponse(reply_text=_build_soft_redirect(locale), blocked=False, reason="needs_redirect", thread_id=thread_id)
 
-    system_prompt = _build_system_prompt(locale)
+    # ===== Load server history (source of truth) =====
+    stored_turns = await _load_thread_history(uid, thread_id)
 
-    # Load profile ONCE per request
-    profile = await _load_user_profile(uid)
+    # Optional: if client sends history, we can merge it lightly to avoid “lost” messages in edge cases.
+    # We will append any client messages that are not already at the end (simple heuristic).
+    if body.history:
+        client_turns = [ChatTurn(role=t.role, text=_normalize_text(t.text)) for t in body.history if t and _normalize_text(t.text)]
+        if client_turns:
+            # merge by last 6 items string match to reduce duplicates
+            stored_tail = [(t.role, _normalize_text(t.text)) for t in stored_turns[-12:]]
+            for ct in client_turns[-12:]:
+                key = (ct.role, _normalize_text(ct.text))
+                if key not in stored_tail:
+                    stored_turns.append(ct)
 
-    # Cached compact summary (token-friendly)
+    # add current user message
+    stored_turns.append(ChatTurn(role="user", text=user_text))
+
+    # ===== Profile + Astro =====
     profile_summary = await _load_user_profile_summary(uid)
-
-    # Astro computed (sidereal Lahiri)
+    profile = await _load_user_profile(uid)
     astro_computed = _compute_astro(profile)
 
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    # ===== Build LLM messages =====
+    system_prompt = _build_system_prompt(locale)
 
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
     if profile_summary:
         messages.append({"role": "system", "content": profile_summary})
-
     if astro_computed:
         messages.append({"role": "system", "content": astro_computed})
 
-    # Short history guard
-    if body.history:
-        turns = body.history[-6:]
-        for t in turns:
-            role = t.role
-            txt = _normalize_text(t.text)
-            if not txt:
-                continue
-            if role not in ["user", "assistant"]:
-                continue
-            if len(txt) > 320:
-                txt = txt[:320] + "…"
-            messages.append({"role": role, "content": txt})
+    # include last MAX_LLM_TURNS from stored history
+    llm_turns = stored_turns[-MAX_LLM_TURNS:]
+    for t in llm_turns:
+        txt = _normalize_text(t.text)
+        if not txt:
+            continue
+        messages.append({"role": t.role, "content": txt})
 
-    messages.append({"role": "user", "content": user_text})
-
+    # ===== Call model =====
     reply = await _call_deepseek(messages)
 
+    # save assistant response
+    stored_turns.append(ChatTurn(role="assistant", text=_normalize_text(reply)))
+
+    # persist
+    await _save_thread_history(uid, thread_id, stored_turns)
+
     logger.info(
-        f"[ai_chat] uid={uid} user_len={len(user_text)} profile_fields={len(profile) if profile else 0} "
+        f"[ai_chat] uid={uid} thread={thread_id} user_len={len(user_text)} stored_turns={len(stored_turns)} "
         f"astro={'yes' if bool(astro_computed) else 'no'}"
     )
-    return AiChatResponse(reply_text=reply, blocked=False)
+
+    return AiChatResponse(reply_text=reply, blocked=False, thread_id=thread_id)
