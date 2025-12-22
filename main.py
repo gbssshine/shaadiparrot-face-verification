@@ -2,86 +2,35 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, HttpUrl
 import logging
 import os
-import requests
 import re
 import time
-from datetime import datetime, timezone
 from typing import Optional, List, Literal, Dict, Any, Tuple
 
-from google.cloud import vision
-
-# Firebase Admin (verify idToken)
-import firebase_admin
-from firebase_admin import auth
-
-# Firestore Admin client (Cloud Run service account)
-from google.cloud import firestore
-
-# Swiss Ephemeris (Vedic sidereal)
+import requests
 import swisseph as swe
 
+from google.cloud import vision
+import firebase_admin
+from firebase_admin import auth
+from google.cloud import firestore
 
+# =========================
+# APP
+# =========================
 app = FastAPI(title="ShaadiParrot Cloud Run")
 
-# ===== logger =====
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shaadiparrot-cloudrun")
 
-# ===== Vision client =====
 vision_client: vision.ImageAnnotatorClient | None = None
-
-# ===== Firestore client =====
 firestore_client: firestore.Client | None = None
 
-# ===== DeepSeek config =====
 DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_MODEL = (os.getenv("DEEPSEEK_MODEL") or "deepseek-chat").strip()
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# ===== Firebase Admin init =====
 if not firebase_admin._apps:
     firebase_admin.initialize_app()
-
-# =========================
-# CONFIG
-# =========================
-CHAT_SUBCOLLECTION = "parrotChats"     # users/{uid}/parrotChats/{threadId}
-DEFAULT_THREAD_ID = "default"
-
-# how many turns we keep in memory
-MAX_STORED_TURNS = 40  # 40 turns = 20 user+assistant pairs
-# how many turns we send to LLM (token-friendly)
-MAX_LLM_TURNS = 12     # last 12 turns is usually enough
-
-PROFILE_CACHE_TTL_SEC = 600  # 10 min
-_profile_summary_cache: Dict[str, Tuple[float, str]] = {}
-
-
-def _utc_now():
-    return datetime.now(timezone.utc)
-
-
-def _utc_iso():
-    return _utc_now().isoformat()
-
-
-def _cache_get_profile_summary(uid: str) -> str:
-    item = _profile_summary_cache.get(uid)
-    if not item:
-        return ""
-    exp, txt = item
-    if time.time() > exp:
-        try:
-            del _profile_summary_cache[uid]
-        except Exception:
-            pass
-        return ""
-    return txt
-
-
-def _cache_set_profile_summary(uid: str, txt: str):
-    _profile_summary_cache[uid] = (time.time() + PROFILE_CACHE_TTL_SEC, txt)
-
 
 # =========================
 # MODELS
@@ -103,25 +52,13 @@ class AiChatRequest(BaseModel):
     text: str
     locale: Optional[str] = "en"
     mode: Optional[str] = "shaadi_parrot"
-    thread_id: Optional[str] = DEFAULT_THREAD_ID
-    history: Optional[List[ChatTurn]] = None  # client can still send, but server will persist
+    history: Optional[List[ChatTurn]] = None  # optional client-provided history
 
 
 class AiChatResponse(BaseModel):
     reply_text: str
     blocked: bool = False
     reason: Optional[str] = None
-    thread_id: Optional[str] = DEFAULT_THREAD_ID
-
-
-class HistoryResponse(BaseModel):
-    thread_id: str
-    messages: List[ChatTurn]
-
-
-class ResetResponse(BaseModel):
-    thread_id: str
-    ok: bool = True
 
 
 # =========================
@@ -131,6 +68,7 @@ class ResetResponse(BaseModel):
 def startup_event():
     global vision_client, firestore_client
 
+    # Swiss Ephemeris sidereal: Lahiri (Vedic)
     try:
         swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
         logger.info("Swiss Ephemeris sidereal mode set: Lahiri")
@@ -163,6 +101,345 @@ def health():
         "deepseek_model": DEEPSEEK_MODEL,
         "sidereal": "Lahiri",
     }
+
+
+# =========================
+# AUTH HELPERS
+# =========================
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        return ""
+    authorization = authorization.strip()
+    if not authorization.lower().startswith("bearer "):
+        return ""
+    return authorization[7:].strip()
+
+
+def _verify_firebase_token_or_401(authorization: Optional[str]) -> str:
+    token = _extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+
+    try:
+        decoded = auth.verify_id_token(token)
+        uid = (decoded.get("uid") or "").strip()
+        if not uid:
+            raise HTTPException(status_code=401, detail="Invalid token (no uid)")
+        return uid
+    except Exception:
+        logger.exception("Firebase token verify failed")
+        raise HTTPException(status_code=401, detail="Invalid/expired token")
+
+
+def _normalize_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+# =========================
+# TOPIC GATE (NO PANCAKES)
+# =========================
+def _is_allowed_topic(user_text: str) -> bool:
+    t = (user_text or "").lower()
+
+    # Block obvious cooking/recipes
+    blocked_keywords = [
+        "recipe", "cook", "cooking", "pancake", "omelet", "baking", "cake",
+        "how to fry", "ingredients", "gram", "ml", "kefir", "flour", "sugar",
+        "рецепт", "готовить", "омлет", "блин", "мука", "ингредиент"
+    ]
+    if any(k in t for k in blocked_keywords):
+        return False
+
+    allowed_keywords = [
+        # relationships / texting
+        "dating", "relationship", "love", "crush", "girlfriend", "boyfriend",
+        "girls", "guys", "her", "him", "she", "he",
+        "message", "reply", "text", "what should i say", "how to respond",
+        "help me with girls", "help me with guys", "pick up", "flirt",
+        "date idea", "first date", "apology", "breakup", "jealous",
+
+        # profile help
+        "profile", "bio", "about me", "photos", "photo", "pictures", "rewrite",
+        "describe my profile", "improve my profile",
+
+        # astrology / fates
+        "astrology", "vedic", "kundli", "horoscope", "zodiac", "sign",
+        "birth date", "birthdate", "born", "nakshatra", "moon", "sun",
+        "compatibility", "match", "fate", "daily fates", "planets",
+
+        # app context
+        "shaadi", "parrot", "app", "premium", "subscription",
+    ]
+    return any(k in t for k in allowed_keywords)
+
+
+# =========================
+# SYSTEM PROMPT (PERSONA)
+# - IMPORTANT: no markdown **, no code fences
+# =========================
+def _build_system_prompt(locale: str) -> str:
+    lang = (locale or "en").strip() or "en"
+    return (
+        "You are Shaadi Parrot 🦜 — a cheerful Indian astrologer + dating coach inside a dating & Daily Fates app.\n"
+        "Your mission: guide users in love, relationships, mutual understanding, and Vedic astrology.\n"
+        "You can help with:\n"
+        "• what to text/reply (real message drafts)\n"
+        "• dating strategy and relationship advice\n"
+        "• profile/bio/photo improvements\n"
+        "• Vedic astrology & compatibility (sidereal Lahiri)\n"
+        "Style:\n"
+        "- Write beautifully, warm, confident, practical.\n"
+        "- Use emojis naturally (1–3 max).\n"
+        "- IMPORTANT: do NOT use markdown formatting (no **bold**, no # headings, no backticks).\n"
+        "- Prefer clean bullets with '•'.\n"
+        "Data:\n"
+        "- You may receive USER_PROFILE, ASTRO_COMPUTED, and PARROT_MEMORY.\n"
+        "- Use them automatically.\n"
+        "Accuracy:\n"
+        "- Without birth place + timezone you cannot compute Ascendant/houses exactly.\n"
+        "- Be honest and ask only for missing data when needed.\n"
+        "Safety:\n"
+        "- If user asks off-topic (recipes, coding help, random trivia), refuse briefly and redirect to love/astro/profile.\n"
+        f"Reply in {lang}.\n"
+    )
+
+
+# =========================
+# PROFILE LOAD (FROM profiles/{uid})
+# =========================
+def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    deny_prefixes = ["geo", "lat", "lng", "location", "idtoken", "refreshtoken", "token", "__"]
+    deny_exact = {"updatedAt", "deviceId", "pushToken", "refreshToken"}
+
+    clean: Dict[str, Any] = {}
+    for k, v in raw.items():
+        key = (k or "").strip()
+        if not key:
+            continue
+        lk = key.lower()
+        if lk in (x.lower() for x in deny_exact):
+            continue
+        if any(lk.startswith(p) for p in deny_prefixes):
+            continue
+        clean[key] = v
+    return clean
+
+
+def _flatten_value(v: Any, max_len: int = 140) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        s = v.strip()
+        return (s[:max_len] + "…") if len(s) > max_len else s
+    if isinstance(v, list):
+        parts = []
+        for item in v[:12]:
+            s = _flatten_value(item, max_len=40)
+            if s:
+                parts.append(s)
+        out = ", ".join(parts)
+        if len(v) > 12:
+            out += "…"
+        return (out[:max_len] + "…") if len(out) > max_len else out
+    if isinstance(v, dict):
+        parts = []
+        for i, (kk, vv) in enumerate(v.items()):
+            if i >= 8:
+                parts.append("…")
+                break
+            s = _flatten_value(vv, max_len=40)
+            if s:
+                parts.append(f"{kk}:{s}")
+        out = "; ".join(parts)
+        return (out[:max_len] + "…") if len(out) > max_len else out
+    s = str(v).strip()
+    return (s[:max_len] + "…") if len(s) > max_len else s
+
+
+def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
+    if not profile_doc:
+        return ""
+
+    preferred_keys = [
+        "firstName", "lastName", "gender",
+        "seekerType", "orientation", "lookingForGender",
+        "birthDate", "birthTime", "age",
+        "cityName", "countryName", "stateName",
+        "community", "religion",
+        "relationshipIntent",
+        "bio", "aboutMe",
+        "interests", "languages", "tags",
+        "drinking", "smoking", "workout", "pets", "social",
+        "education", "jobTitle", "occupation",
+        "height", "heightDisplayText",
+    ]
+
+    parts: List[str] = []
+    used = set()
+
+    for k in preferred_keys:
+        if k in profile_doc:
+            val = _flatten_value(profile_doc.get(k))
+            if val:
+                parts.append(f"{k}={val}")
+                used.add(k)
+        if len(parts) >= 22:
+            break
+
+    if not parts:
+        return ""
+
+    return "USER_PROFILE: " + " | ".join(parts)
+
+
+async def _load_user_profile(uid: str) -> Dict[str, Any]:
+    if firestore_client is None:
+        return {}
+    try:
+        snap = firestore_client.collection("profiles").document(uid).get()
+        if not snap.exists:
+            return {}
+        raw = snap.to_dict() or {}
+        return _safe_profile_dict(raw)
+    except Exception:
+        logger.exception("Failed to load profiles/{uid}")
+        return {}
+
+
+# =========================
+# ASTROLOGY (VEDIC SIDEREAL LAHIRI)
+# =========================
+_ZODIAC = [
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+]
+
+_NAKSHATRAS = [
+    "Ashwini","Bharani","Krittika","Rohini","Mrigashirsha","Ardra","Punarvasu","Pushya","Ashlesha",
+    "Magha","Purva Phalguni","Uttara Phalguni","Hasta","Chitra","Swati","Vishakha","Anuradha","Jyeshtha",
+    "Mula","Purva Ashadha","Uttara Ashadha","Shravana","Dhanishta","Shatabhisha","Purva Bhadrapada","Uttara Bhadrapada","Revati"
+]
+
+_PLANETS = {
+    "Sun": swe.SUN,
+    "Moon": swe.MOON,
+    "Mars": swe.MARS,
+    "Mercury": swe.MERCURY,
+    "Jupiter": swe.JUPITER,
+    "Venus": swe.VENUS,
+    "Saturn": swe.SATURN,
+    "Rahu": swe.MEAN_NODE,  # North node
+    # Ketu will be Rahu + 180
+}
+
+def _parse_birth_date(profile: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
+    raw = profile.get("birthDate")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*$", s)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
+def _parse_birth_time(profile: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    raw = profile.get("birthTime")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        m = re.match(r"^\s*(\d{1,2}):(\d{2})", s)
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+            return None
+        return (hh, mm)
+    return None
+
+
+def _sign_from_lon(lon_deg: float) -> str:
+    idx = int((lon_deg % 360.0) / 30.0)
+    idx = max(0, min(11, idx))
+    return _ZODIAC[idx]
+
+
+def _nakshatra_from_lon(lon_deg: float) -> str:
+    seg = 360.0 / 27.0
+    idx = int((lon_deg % 360.0) / seg)
+    idx = max(0, min(26, idx))
+    return _NAKSHATRAS[idx]
+
+
+def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
+    flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
+    res, _ = swe.calc_ut(jd_ut, planet, flags)
+    return float(res[0]) % 360.0
+
+
+def _compute_astro(profile: Dict[str, Any]) -> str:
+    bd = _parse_birth_date(profile)
+    if not bd:
+        return ""
+
+    y, mo, d = bd
+    bt = _parse_birth_time(profile)
+
+    # No birthplace/timezone yet. We assume UTC.
+    # If time missing -> 12:00 UTC to reduce boundary errors.
+    if bt:
+        hh, mm = bt
+        hour = hh + (mm / 60.0)
+        time_mode = "birthTime_provided_timezone_unknown"
+    else:
+        hour = 12.0
+        time_mode = "date_only"
+
+    jd_ut = swe.julday(y, mo, d, hour)
+
+    try:
+        sun_lon = _calc_sidereal_lon_ut(jd_ut, swe.SUN)
+        moon_lon = _calc_sidereal_lon_ut(jd_ut, swe.MOON)
+
+        sun_sign = _sign_from_lon(sun_lon)
+        moon_sign = _sign_from_lon(moon_lon)
+        nak = _nakshatra_from_lon(moon_lon)
+
+        # Planet positions (compact)
+        planet_bits: List[str] = []
+        for name, pid in _PLANETS.items():
+            lon = _calc_sidereal_lon_ut(jd_ut, pid)
+            planet_bits.append(f"{name}:{_sign_from_lon(lon)}")
+
+        # Ketu opposite Rahu
+        rahu_lon = _calc_sidereal_lon_ut(jd_ut, swe.MEAN_NODE)
+        ketu_lon = (rahu_lon + 180.0) % 360.0
+        planet_bits.append(f"Ketu:{_sign_from_lon(ketu_lon)}")
+
+        note = "Ascendant/houses need birthPlace + timezone."
+        if time_mode == "date_only":
+            note = "Moon/Nakshatra accuracy improves with birthTime + birthPlace/timezone."
+
+        return (
+            "ASTRO_COMPUTED (Vedic sidereal Lahiri): "
+            f"SunSign={sun_sign}; MoonSign={moon_sign}; Nakshatra={nak}; "
+            f"Planets={', '.join(planet_bits)}; "
+            f"TimeMode={time_mode}. {note}"
+        )
+    except Exception:
+        logger.exception("Astro compute failed")
+        return ""
 
 
 # =========================
@@ -255,408 +532,171 @@ def verify_face(data: VerifyFaceRequest):
 
 
 # =========================
-# AUTH HELPERS
+# PERSISTENT CHAT STORAGE (Firestore)
 # =========================
-def _extract_bearer_token(authorization: Optional[str]) -> str:
-    if not authorization:
-        return ""
-    authorization = authorization.strip()
-    if not authorization.lower().startswith("bearer "):
-        return ""
-    return authorization[7:].strip()
-
-
-def _verify_firebase_token_or_401(authorization: Optional[str]) -> str:
-    token = _extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
-
-    try:
-        decoded = auth.verify_id_token(token)
-        uid = (decoded.get("uid") or "").strip()
-        if not uid:
-            raise HTTPException(status_code=401, detail="Invalid token (no uid)")
-        return uid
-    except Exception:
-        logger.exception("Firebase token verify failed")
-        raise HTTPException(status_code=401, detail="Invalid/expired token")
-
-
-def _normalize_text(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-# =========================
-# TOPIC ROUTER (human-friendly)
-# =========================
-_OFFTOPIC_BLOCK_PATTERNS = [
-    r"\b(recipe|cook|cooking|pancake|pancakes|omelet|cake|bake|ingredients)\b",
-    r"\b(hack|ddos|phish|malware|exploit|crack|keylogger)\b",
-    r"\b(code|python|c\+\+|java|javascript|sql|api|compile|bug fix|debug)\b",
-    r"\b(election|president|politics|war|propaganda)\b",
-    r"\b(heroin|cocaine|meth|weed|drug deal|how to buy)\b",
-]
-
-_ALLOWED_HINTS_PATTERNS = [
-    r"\b(girl|girls|guy|guys|dating|date|relationship|love|crush|romance)\b",
-    r"\b(text|message|dm|reply|respond|what should i say|what to say|how to respond)\b",
-    r"\b(ghost(ed|ing)|ignored|left on read|seen)\b",
-    r"\b(match|matches|tinder|bumble|hinge)\b",
-    r"\b(bio|profile|about me|photos?|pictures?)\b",
-    r"\b(astrology|vedic|kundli|horoscope|zodiac|nakshatra|moon sign|sun sign|compatib)\b",
-    r"\b(app|shaadi|parrot|premium|subscription|how it works)\b",
-]
-
-
-def _looks_offtopic(user_text: str) -> bool:
-    t = (user_text or "").lower()
-    return any(re.search(pat, t, re.IGNORECASE) for pat in _OFFTOPIC_BLOCK_PATTERNS)
-
-
-def _looks_allowed(user_text: str) -> bool:
-    t = (user_text or "").lower()
-    return any(re.search(pat, t, re.IGNORECASE) for pat in _ALLOWED_HINTS_PATTERNS)
-
-
-def _build_soft_redirect(locale: str) -> str:
-    # nicer + still focused + allows emojis
-    return (
-        "I’m Shaadi Parrot 🦜✨\n"
-        "I’m your guide to love, texting, profiles, and Vedic astrology.\n\n"
-        "Try one of these:\n"
-        "• “What should I text her next?” 💬\n"
-        "• “Rewrite my bio from my profile” 📝\n"
-        "• “Explain my Daily Fate” 🔮\n"
-        "• “What’s my Moon sign / Nakshatra?” 🌙"
-    )
-
-
-# =========================
-# SYSTEM PROMPT (PERSONA)
-# =========================
-def _build_system_prompt(locale: str) -> str:
-    return (
-        "You are Shaadi Parrot — a cheerful Indian astrologer + dating coach inside a dating & Daily Fates app.\n"
-        "Mission: guide the user through love, relationships, mutual understanding, and astrology.\n"
-        "You help with: texting/replies; dating strategy; interpreting signals; profile/bio/photo tips; Vedic astrology; compatibility; Daily Fates; app usage.\n"
-        "Style: charming, clear, emotionally intelligent, confident. Use 1–3 emojis naturally.\n"
-        "If user is vague ('help me with girls'): ask ONE clarifying question and give 2–3 ready options.\n"
-        "You may receive USER_PROFILE and ASTRO_COMPUTED. Use them automatically.\n"
-        "If exact chart needs birthplace/timezone: say so briefly, still give best approximate answer.\n"
-        "Do NOT help with cooking/recipes, coding, politics, hacking, drugs, or illegal activity.\n"
-        f"Reply in {locale or 'en'}.\n"
-    )
-
-
-# =========================
-# PROFILE SANITIZE + SUMMARY
-# =========================
-def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
-    if not raw:
-        return {}
-
-    deny_prefixes = ["geo", "lat", "lng", "location", "idtoken", "refreshtoken", "token", "__"]
-    deny_exact = {"updatedAt", "deviceId", "pushToken"}
-
-    clean: Dict[str, Any] = {}
-    for k, v in raw.items():
-        key = (k or "").strip()
-        if not key:
-            continue
-        lk = key.lower()
-        if lk in (x.lower() for x in deny_exact):
-            continue
-        if any(lk.startswith(p) for p in deny_prefixes):
-            continue
-        clean[key] = v
-
-    return clean
-
-
-def _flatten_value(v: Any, max_len: int = 140) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return str(v)
-    if isinstance(v, str):
-        s = v.strip()
-        return (s[:max_len] + "…") if len(s) > max_len else s
-    if isinstance(v, list):
-        parts = []
-        for item in v[:12]:
-            s = _flatten_value(item, max_len=40)
-            if s:
-                parts.append(s)
-        out = ", ".join(parts)
-        if len(v) > 12:
-            out += "…"
-        return (out[:max_len] + "…") if len(out) > max_len else out
-    if isinstance(v, dict):
-        parts = []
-        for i, (kk, vv) in enumerate(v.items()):
-            if i >= 8:
-                parts.append("…")
-                break
-            s = _flatten_value(vv, max_len=40)
-            if s:
-                parts.append(f"{kk}:{s}")
-        out = "; ".join(parts)
-        return (out[:max_len] + "…") if len(out) > max_len else out
-    s = str(v).strip()
-    return (s[:max_len] + "…") if len(s) > max_len else s
-
-
-def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
-    if not profile_doc:
-        return ""
-
-    preferred_keys = [
-        "firstName", "lastName", "name", "gender",
-        "seekerType", "lookingFor", "seeking", "orientation", "lookingForGender",
-        "birthDate", "birthTime", "age",
-        "cityName", "countryName", "stateName", "community", "religion",
-        "relationshipIntent", "relationshipGoal", "intent",
-        "bio", "aboutMe",
-        "interests", "languages", "tags",
-        "drinking", "smoking", "workout", "diet", "pets", "social",
-        "education", "jobTitle", "occupation",
-        "height", "heightDisplayText",
-    ]
-
-    parts: List[str] = []
-    used = set()
-
-    for k in preferred_keys:
-        if k in profile_doc:
-            val = _flatten_value(profile_doc.get(k))
-            if val:
-                parts.append(f"{k}={val}")
-                used.add(k)
-        if len(parts) >= 22:
-            break
-
-    extra_keys = [k for k in profile_doc.keys() if k not in used]
-    extra_keys = extra_keys[:30]
-
-    out = ""
-    if parts:
-        out += "USER_PROFILE: " + " | ".join(parts)
-    if extra_keys:
-        out += "\nPROFILE_KEYS_AVAILABLE: " + ", ".join(extra_keys)
-    return out.strip()
-
-
-async def _load_user_profile(uid: str) -> Dict[str, Any]:
-    if firestore_client is None:
-        return {}
-    try:
-        snap = firestore_client.collection("profiles").document(uid).get()
-        if not snap.exists:
-            return {}
-        raw = snap.to_dict() or {}
-        return _safe_profile_dict(raw)
-    except Exception:
-        logger.exception("Failed to load profiles/{uid}")
-        return {}
-
-
-async def _load_user_profile_summary(uid: str) -> str:
-    cached = _cache_get_profile_summary(uid)
-    if cached:
-        return cached
-
-    profile = await _load_user_profile(uid)
-    summary = _profile_summary_text(profile)
-    if summary:
-        _cache_set_profile_summary(uid, summary)
-    return summary
-
-
-# =========================
-# ASTROLOGY (VEDIC SIDEREAL LAHIRI)
-# =========================
-_ZODIAC = [
-    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
-    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
-]
-
-_NAKSHATRAS = [
-    "Ashwini","Bharani","Krittika","Rohini","Mrigashirsha","Ardra","Punarvasu","Pushya","Ashlesha",
-    "Magha","Purva Phalguni","Uttara Phalguni","Hasta","Chitra","Swati","Vishakha","Anuradha","Jyeshtha",
-    "Mula","Purva Ashadha","Uttara Ashadha","Shravana","Dhanishta","Shatabhisha","Purva Bhadrapada","Uttara Bhadrapada","Revati"
-]
-
-
-def _parse_birth_date(profile: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
-    raw = profile.get("birthDate")
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*$", s)
-        if not m:
-            return None
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    return None
-
-
-def _parse_birth_time(profile: Dict[str, Any]) -> Optional[Tuple[int, int]]:
-    raw = profile.get("birthTime")
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-        m = re.match(r"^\s*(\d{1,2}):(\d{2})", s)
-        if not m:
-            return None
-        hh, mm = int(m.group(1)), int(m.group(2))
-        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-            return None
-        return (hh, mm)
-    return None
-
-
-def _sign_from_sidereal_longitude(lon_deg: float) -> str:
-    idx = int((lon_deg % 360.0) / 30.0)
-    idx = max(0, min(11, idx))
-    return _ZODIAC[idx]
-
-
-def _nakshatra_from_sidereal_longitude(lon_deg: float) -> str:
-    seg = 360.0 / 27.0
-    idx = int((lon_deg % 360.0) / seg)
-    idx = max(0, min(26, idx))
-    return _NAKSHATRAS[idx]
-
-
-def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
-    flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
-    res, _ = swe.calc_ut(jd_ut, planet, flags)
-    return float(res[0]) % 360.0
-
-
-def _compute_astro(profile: Dict[str, Any]) -> str:
-    bd = _parse_birth_date(profile)
-    if not bd:
-        return ""
-
-    y, mo, d = bd
-    bt = _parse_birth_time(profile)
-
-    if bt:
-        hh, mm = bt
-        hour = hh + (mm / 60.0)
-        time_mode = "birthTime_provided_timezone_unknown"
-        note = "Exact ascendant/houses need birthPlace + timezone."
-    else:
-        hour = 12.0
-        time_mode = "date_only"
-        note = "Moon/Nakshatra accuracy improves with birthTime + birthPlace/timezone."
-
-    jd_ut = swe.julday(y, mo, d, hour)
-
-    try:
-        sun_lon = _calc_sidereal_lon_ut(jd_ut, swe.SUN)
-        moon_lon = _calc_sidereal_lon_ut(jd_ut, swe.MOON)
-
-        sun_sign = _sign_from_sidereal_longitude(sun_lon)
-        moon_sign = _sign_from_sidereal_longitude(moon_lon)
-        nak = _nakshatra_from_sidereal_longitude(moon_lon)
-
-        return (
-            "ASTRO_COMPUTED (Vedic sidereal Lahiri): "
-            f"SunSign={sun_sign}; MoonSign={moon_sign}; Nakshatra={nak}; "
-            f"TimeMode={time_mode}. {note}"
-        )
-    except Exception:
-        logger.exception("Astro compute failed")
-        return ""
-
-
-# =========================
-# CHAT STORAGE (Firestore)
-# =========================
-def _thread_id_clean(thread_id: Optional[str]) -> str:
-    x = (thread_id or DEFAULT_THREAD_ID).strip()
-    if not x:
-        x = DEFAULT_THREAD_ID
-    # Firestore doc id safe-ish
-    x = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", x)
-    return x[:80]
-
-
-def _chat_doc_ref(uid: str, thread_id: str):
+def _chat_doc_ref(uid: str):
     if firestore_client is None:
         return None
-    tid = _thread_id_clean(thread_id)
-    return firestore_client.collection("users").document(uid).collection(CHAT_SUBCOLLECTION).document(tid)
+    return firestore_client.collection("parrotChats").document(uid)
+
+def _chat_msgs_col_ref(uid: str):
+    if firestore_client is None:
+        return None
+    return firestore_client.collection("parrotChats").document(uid).collection("messages")
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
 
 
-def _to_turns(raw_messages: Any) -> List[ChatTurn]:
-    out: List[ChatTurn] = []
-    if not isinstance(raw_messages, list):
-        return out
-    for m in raw_messages:
-        try:
-            role = (m.get("role") or "").strip()
-            text = (m.get("text") or "").strip()
-            if role not in ["user", "assistant"]:
-                continue
-            if not text:
-                continue
-            out.append(ChatTurn(role=role, text=text))
-        except Exception:
-            continue
-    return out
-
-
-def _from_turns(turns: List[ChatTurn]) -> List[Dict[str, Any]]:
-    now_iso = _utc_iso()
-    result: List[Dict[str, Any]] = []
-    for t in turns:
-        txt = _normalize_text(t.text)
-        if not txt:
-            continue
-        result.append({"role": t.role, "text": txt, "ts": now_iso})
-    return result
-
-
-async def _load_thread_history(uid: str, thread_id: str) -> List[ChatTurn]:
-    ref = _chat_doc_ref(uid, thread_id)
+def _load_chat_state(uid: str) -> Dict[str, Any]:
+    ref = _chat_doc_ref(uid)
     if ref is None:
-        return []
+        return {}
     try:
         snap = ref.get()
         if not snap.exists:
-            return []
-        data = snap.to_dict() or {}
-        return _to_turns(data.get("messages"))
+            return {}
+        return snap.to_dict() or {}
+    except Exception:
+        logger.exception("Failed to load parrotChats/{uid}")
+        return {}
+
+
+def _save_chat_state(uid: str, patch: Dict[str, Any]) -> None:
+    ref = _chat_doc_ref(uid)
+    if ref is None:
+        return
+    try:
+        ref.set(patch, merge=True)
+    except Exception:
+        logger.exception("Failed to save parrotChats/{uid}")
+
+
+def _save_chat_message(uid: str, role: str, text: str, created_at_iso: str) -> None:
+    col = _chat_msgs_col_ref(uid)
+    if col is None:
+        return
+    try:
+        msg_id = f"{int(time.time() * 1000)}_{role}"
+        col.document(msg_id).set({
+            "role": role,
+            "text": text,
+            "createdAtIso": created_at_iso
+        })
+    except Exception:
+        logger.exception("Failed to save chat message")
+
+
+def _load_chat_history(uid: str, limit: int = 24) -> List[Dict[str, str]]:
+    """
+    Loads last N messages from Firestore.
+    Respects clearedAtIso if exists.
+    """
+    col = _chat_msgs_col_ref(uid)
+    if col is None:
+        return []
+
+    state = _load_chat_state(uid)
+    cleared_at = (state.get("clearedAtIso") or "").strip()
+
+    try:
+        q = col.order_by("createdAtIso", direction=firestore.Query.DESCENDING).limit(limit)
+        snaps = list(q.stream())
+        rows = []
+        for s in snaps:
+            d = s.to_dict() or {}
+            role = (d.get("role") or "").strip()
+            text = (d.get("text") or "").strip()
+            ts = (d.get("createdAtIso") or "").strip()
+
+            if not role or not text:
+                continue
+            if cleared_at and ts and ts <= cleared_at:
+                continue
+
+            rows.append({"role": role, "content": text})
+
+        rows.reverse()  # chronological
+        return rows
     except Exception:
         logger.exception("Failed to load chat history")
         return []
 
 
-async def _save_thread_history(uid: str, thread_id: str, turns: List[ChatTurn]) -> None:
-    ref = _chat_doc_ref(uid, thread_id)
-    if ref is None:
-        return
-    try:
-        # keep only last MAX_STORED_TURNS
-        trimmed = turns[-MAX_STORED_TURNS:]
-        payload = {
-            "uid": uid,
-            "threadId": _thread_id_clean(thread_id),
-            "messages": _from_turns(trimmed),
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "updatedAtIso": _utc_iso(),
-        }
-        ref.set(payload, merge=True)
-    except Exception:
-        logger.exception("Failed to save chat history")
+def _memory_text_from_state(state: Dict[str, Any]) -> str:
+    mem = state.get("memory") if isinstance(state.get("memory"), dict) else {}
+    if not mem:
+        return ""
+    bits = []
+    for k in ["lastTopic", "partnerName", "partnerBirthDate", "partnerZodiac", "userZodiac"]:
+        v = (mem.get(k) or "").strip()
+        if v:
+            bits.append(f"{k}={v}")
+    if not bits:
+        return ""
+    return "PARROT_MEMORY: " + " | ".join(bits)
+
+
+def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_text: str) -> Dict[str, Any]:
+    """
+    Cheap deterministic memory extractor (no extra LLM cost).
+    Saves partner birth date, names, etc.
+    """
+    mem = state.get("memory") if isinstance(state.get("memory"), dict) else {}
+    t = (user_text or "").strip()
+
+    # Partner birth date patterns
+    # Examples: "she was born at 28 november", "born on 28 November", "her birthday is 28/11"
+    m = re.search(r"\b(?:born|birthday)\b.*?\b(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\b", t, re.IGNORECASE)
+    if m:
+        day = m.group(1)
+        mon = m.group(2)
+        mem["partnerBirthDate"] = f"{day} {mon.title()}"
+
+    m2 = re.search(r"\b(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\b", t)
+    if m2:
+        d = m2.group(1)
+        mo = m2.group(2)
+        yr = m2.group(3) or ""
+        mem["partnerBirthDate"] = f"{d}/{mo}" + (f"/{yr}" if yr else "")
+
+    # Quick zodiac mentions
+    mz = re.search(r"\b(i'?m|i am)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
+    if mz:
+        mem["userZodiac"] = mz.group(2).title()
+
+    mz2 = re.search(r"\b(she'?s|she is|he'?s|he is)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
+    if mz2:
+        mem["partnerZodiac"] = mz2.group(2).title()
+
+    # Topic hint
+    if "text" in t.lower() or "message" in t.lower() or "reply" in t.lower():
+        mem["lastTopic"] = "texting"
+    elif "compat" in t.lower() or "match" in t.lower() or "kundli" in t.lower():
+        mem["lastTopic"] = "compatibility"
+    elif "profile" in t.lower() or "bio" in t.lower() or "photos" in t.lower():
+        mem["lastTopic"] = "profile"
+    elif "relationship" in t.lower() or "girls" in t.lower() or "love" in t.lower():
+        mem["lastTopic"] = "relationships"
+
+    state["memory"] = mem
+    return state
+
+
+@app.get("/parrot/history")
+def parrot_history(limit: int = 24, authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    limit = max(1, min(80, int(limit)))
+    items = _load_chat_history(uid, limit=limit)
+    return {"uid": uid, "count": len(items), "items": items}
+
+
+@app.post("/parrot/reset")
+def parrot_reset(authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    now_iso = _now_iso()
+    _save_chat_state(uid, {"uid": uid, "clearedAtIso": now_iso, "updatedAtIso": now_iso})
+    return {"status": "ok", "uid": uid, "clearedAtIso": now_iso}
 
 
 # =========================
@@ -681,7 +721,7 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     import json
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=35) as client:
+        async with httpx.AsyncClient(timeout=40) as client:
             r = await client.post(DEEPSEEK_URL, headers=headers, content=json.dumps(payload))
             text = r.text
             if r.status_code != 200:
@@ -697,50 +737,17 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
         data = r.json()
         choices = data.get("choices") or []
         if not choices:
-            return "I couldn't generate a reply. Try again."
+            return "I couldn't generate a reply. Please try again."
         msg = choices[0].get("message") or {}
         content = (msg.get("content") or "").strip()
-        return content or "I couldn't generate a reply. Try again."
+        return content or "I couldn't generate a reply. Please try again."
     except Exception:
         logger.exception("DeepSeek response parse failed")
-        return "I couldn't parse the reply. Try again."
+        return "I couldn't parse the reply. Please try again."
 
 
 # =========================
-# API: HISTORY + RESET
-# =========================
-@app.get("/ai/history", response_model=HistoryResponse)
-async def get_history(thread_id: Optional[str] = DEFAULT_THREAD_ID, authorization: Optional[str] = Header(default=None)):
-    uid = _verify_firebase_token_or_401(authorization)
-    tid = _thread_id_clean(thread_id)
-    turns = await _load_thread_history(uid, tid)
-    return HistoryResponse(thread_id=tid, messages=turns)
-
-
-@app.post("/ai/reset", response_model=ResetResponse)
-async def reset_history(thread_id: Optional[str] = DEFAULT_THREAD_ID, authorization: Optional[str] = Header(default=None)):
-    uid = _verify_firebase_token_or_401(authorization)
-    tid = _thread_id_clean(thread_id)
-    ref = _chat_doc_ref(uid, tid)
-    if ref is not None:
-        try:
-            ref.set(
-                {
-                    "uid": uid,
-                    "threadId": tid,
-                    "messages": [],
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                    "updatedAtIso": _utc_iso(),
-                },
-                merge=True,
-            )
-        except Exception:
-            logger.exception("Failed to reset chat")
-    return ResetResponse(thread_id=tid, ok=True)
-
-
-# =========================
-# AI CHAT ENDPOINT (with persistence)
+# AI CHAT ENDPOINT (WITH MEMORY)
 # =========================
 @app.post("/ai/chat", response_model=AiChatResponse)
 async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
@@ -748,71 +755,88 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
 
     user_text = _normalize_text(body.text)
     if not user_text:
-        return AiChatResponse(reply_text="Say hi, tell me what’s happening in your love story 🦜💛", blocked=False)
+        return AiChatResponse(reply_text="Ask me something 🦜")
+
+    if not _is_allowed_topic(user_text):
+        return AiChatResponse(
+            reply_text=(
+                "I’m Shaadi Parrot 🦜\n"
+                "I can help with:\n"
+                "• love, dating, relationships\n"
+                "• what to text/reply (I’ll write the message)\n"
+                "• profile/bio/photos improvements\n"
+                "• Vedic astrology & compatibility\n\n"
+                "Ask me about one of these 🙂"
+            ),
+            blocked=True,
+            reason="topic_not_allowed",
+        )
 
     locale = (body.locale or "en").strip() or "en"
-    thread_id = _thread_id_clean(body.thread_id)
-
-    # hard off-topic redirect
-    if _looks_offtopic(user_text):
-        return AiChatResponse(reply_text=_build_soft_redirect(locale), blocked=False, reason="off_topic_redirect", thread_id=thread_id)
-
-    # soft redirect if not clearly allowed
-    if not _looks_allowed(user_text):
-        return AiChatResponse(reply_text=_build_soft_redirect(locale), blocked=False, reason="needs_redirect", thread_id=thread_id)
-
-    # ===== Load server history (source of truth) =====
-    stored_turns = await _load_thread_history(uid, thread_id)
-
-    # Optional: if client sends history, we can merge it lightly to avoid “lost” messages in edge cases.
-    # We will append any client messages that are not already at the end (simple heuristic).
-    if body.history:
-        client_turns = [ChatTurn(role=t.role, text=_normalize_text(t.text)) for t in body.history if t and _normalize_text(t.text)]
-        if client_turns:
-            # merge by last 6 items string match to reduce duplicates
-            stored_tail = [(t.role, _normalize_text(t.text)) for t in stored_turns[-12:]]
-            for ct in client_turns[-12:]:
-                key = (ct.role, _normalize_text(ct.text))
-                if key not in stored_tail:
-                    stored_turns.append(ct)
-
-    # add current user message
-    stored_turns.append(ChatTurn(role="user", text=user_text))
-
-    # ===== Profile + Astro =====
-    profile_summary = await _load_user_profile_summary(uid)
-    profile = await _load_user_profile(uid)
-    astro_computed = _compute_astro(profile)
-
-    # ===== Build LLM messages =====
     system_prompt = _build_system_prompt(locale)
 
+    # Load user profile (for personalization)
+    profile = await _load_user_profile(uid)
+    profile_summary = _profile_summary_text(profile)
+
+    # Astro computed (vedic sidereal)
+    astro_computed = _compute_astro(profile)
+
+    # Load persistent chat memory + last messages
+    state = _load_chat_state(uid)
+    memory_text = _memory_text_from_state(state)
+    persisted_history = _load_chat_history(uid, limit=26)
+
+    # Optional: merge client history (if you still send it) - keep it small
+    client_history: List[Dict[str, str]] = []
+    if body.history:
+        for t in body.history[-10:]:
+            role = t.role
+            txt = _normalize_text(t.text)
+            if role in ["user", "assistant"] and txt:
+                if len(txt) > 320:
+                    txt = txt[:320] + "…"
+                client_history.append({"role": role, "content": txt})
+
+    # Build final LLM messages
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
     if profile_summary:
         messages.append({"role": "system", "content": profile_summary})
+
     if astro_computed:
         messages.append({"role": "system", "content": astro_computed})
 
-    # include last MAX_LLM_TURNS from stored history
-    llm_turns = stored_turns[-MAX_LLM_TURNS:]
-    for t in llm_turns:
-        txt = _normalize_text(t.text)
-        if not txt:
-            continue
-        messages.append({"role": t.role, "content": txt})
+    if memory_text:
+        messages.append({"role": "system", "content": memory_text})
 
-    # ===== Call model =====
+    # Prefer persisted history (source of truth), then client
+    combined = persisted_history[-16:]  # keep token budget
+    if client_history:
+        # add last few client turns only if persisted is empty or short
+        if len(combined) < 8:
+            combined = (combined + client_history)[-16:]
+
+    for m in combined:
+        if m.get("role") in ["user", "assistant"] and m.get("content"):
+            messages.append({"role": m["role"], "content": m["content"]})
+
+    # Current user message
+    messages.append({"role": "user", "content": user_text})
+
+    # Call model
     reply = await _call_deepseek(messages)
 
-    # save assistant response
-    stored_turns.append(ChatTurn(role="assistant", text=_normalize_text(reply)))
+    # Persist messages + update memory/state
+    now_iso = _now_iso()
+    _save_chat_message(uid, "user", user_text, now_iso)
+    _save_chat_message(uid, "assistant", reply, now_iso)
 
-    # persist
-    await _save_thread_history(uid, thread_id, stored_turns)
+    state = _update_memory_from_text(state, user_text, reply)
+    _save_chat_state(uid, {"uid": uid, "updatedAtIso": now_iso, "memory": state.get("memory", {})})
 
     logger.info(
-        f"[ai_chat] uid={uid} thread={thread_id} user_len={len(user_text)} stored_turns={len(stored_turns)} "
-        f"astro={'yes' if bool(astro_computed) else 'no'}"
+        f"[ai_chat] uid={uid} user_len={len(user_text)} profile_fields={len(profile) if profile else 0} "
+        f"persisted_hist={len(persisted_history)} astro={'yes' if bool(astro_computed) else 'no'}"
     )
-
-    return AiChatResponse(reply_text=reply, blocked=False, thread_id=thread_id)
+    return AiChatResponse(reply_text=reply, blocked=False)
