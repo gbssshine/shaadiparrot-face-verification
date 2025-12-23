@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import time
+from fastapi.middleware.cors import CORSMiddleware
+
 import hashlib
 from typing import Optional, List, Literal, Dict, Any, Tuple
 
@@ -19,6 +21,14 @@ from google.cloud import firestore
 # APP
 # =========================
 app = FastAPI(title="ShaadiParrot Cloud Run")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shaadiparrot-cloudrun")
