@@ -41,6 +41,12 @@ class VerifyFaceRequest(BaseModel):
     image_url: HttpUrl
 
 
+# ✅ NEW: verify uploaded photo in Firebase Storage via gs://... URI
+class VerifyPhotoRequest(BaseModel):
+    gcs_uri: str
+    require_face: bool = True
+
+
 Role = Literal["user", "assistant"]
 
 
@@ -486,6 +492,70 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
     except Exception:
         logger.exception("Astro compute failed")
         return ""
+
+
+# =========================
+# PHOTO MODERATION (SafeSearch + Face detection) ✅ NEW
+# =========================
+_LIKELIHOOD = {
+    "UNKNOWN": 0,
+    "VERY_UNLIKELY": 1,
+    "UNLIKELY": 2,
+    "POSSIBLE": 3,
+    "LIKELY": 4,
+    "VERY_LIKELY": 5,
+}
+
+@app.post("/verify-photo")
+def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header(default=None)):
+    # protect endpoint from abuse
+    _ = _verify_firebase_token_or_401(authorization)
+
+    if vision_client is None:
+        raise HTTPException(status_code=503, detail="Vision client not available")
+
+    gcs_uri = (body.gcs_uri or "").strip()
+    if not gcs_uri.startswith("gs://"):
+        raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
+
+    try:
+        image = vision.Image(source=vision.ImageSource(gcs_image_uri=gcs_uri))
+
+        resp = vision_client.annotate_image({
+            "image": image,
+            "features": [
+                {"type_": vision.Feature.Type.SAFE_SEARCH_DETECTION},
+                {"type_": vision.Feature.Type.FACE_DETECTION},
+            ],
+        })
+    except Exception as e:
+        logger.exception("Vision annotate_image failed")
+        raise HTTPException(status_code=502, detail=f"Vision API error: {type(e).__name__}")
+
+    if resp.error and resp.error.message:
+        raise HTTPException(status_code=502, detail=f"Vision API error: {resp.error.message}")
+
+    ss = resp.safe_search_annotation
+    adult = (ss.adult.name if ss and ss.adult else "UNKNOWN")
+    racy = (ss.racy.name if ss and ss.racy else "UNKNOWN")
+    violence = (ss.violence.name if ss and ss.violence else "UNKNOWN")
+
+    faces = len(resp.face_annotations or [])
+
+    # thresholds (simple & safe)
+    if _LIKELIHOOD.get(adult, 0) >= _LIKELIHOOD["LIKELY"]:
+        return {"ok": False, "reason": "adult_content", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
+
+    if _LIKELIHOOD.get(racy, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
+        return {"ok": False, "reason": "highly_racy", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
+
+    if _LIKELIHOOD.get(violence, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
+        return {"ok": False, "reason": "high_violence", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
+
+    if bool(body.require_face) and faces == 0:
+        return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
+
+    return {"ok": True, "reason": "ok", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
 
 
 # =========================
