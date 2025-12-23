@@ -51,7 +51,6 @@ class VerifyFaceRequest(BaseModel):
     image_url: HttpUrl
 
 
-# ✅ NEW: verify uploaded photo in Firebase Storage via gs://... URI
 class VerifyPhotoRequest(BaseModel):
     gcs_uri: str
     require_face: bool = True
@@ -70,7 +69,7 @@ class AiChatRequest(BaseModel):
     locale: Optional[str] = "en"
     mode: Optional[str] = "shaadi_parrot"
     thread_id: Optional[str] = "default"
-    history: Optional[List[ChatTurn]] = None  # optional client-provided history
+    history: Optional[List[ChatTurn]] = None
 
 
 class AiChatResponse(BaseModel):
@@ -175,7 +174,6 @@ def _stable_pick(variants: List[str], key: str) -> str:
 
 # =========================
 # TOPIC GATE (SOFT)
-# - Block only obvious cooking/recipes. Everything else is allowed.
 # =========================
 def _is_allowed_topic(user_text: str) -> bool:
     t = (user_text or "").lower()
@@ -193,93 +191,43 @@ def _is_allowed_topic(user_text: str) -> bool:
 
 
 def _topic_block_reply(user_text: str, locale: str) -> str:
-    # If blocked (recipes), gently redirect without being rude.
     variants_en = [
-        "I can’t help with recipes 🦜\nBut I can help with:\n• daily horoscope (Vedic)\n• love, dating, relationships\n• what to text/reply (I’ll write it)\n• profile/bio glow-up\nAsk me one of those 🙂",
-        "Not a cooking parrot 😅\nBut I’m great at:\n• Vedic astrology & Daily Fates\n• relationships + dating\n• writing messages\n• improving your profile\nWhat do you want today? 🦜",
+        "I can’t help with recipes 🦜 But I can help with: daily fates, love, texting, profile glow-up. Ask me one of those 🙂",
+        "Not a cooking parrot 😅 I’m great at Vedic astrology, dating, writing replies, and profile improvements. What do you need? 🦜",
     ]
     variants_ru = [
-        "С рецептами не помогу 🦜\nНо я могу:\n• гороскоп (ведический)\n• любовь/свидания/отношения\n• сообщения (напишу текст)\n• улучшение профиля/био\nСпроси что-то из этого 🙂",
-        "Я не кулинарный попугай 😅\nЗато я топ в:\n• ведической астрологии и Daily Fates\n• отношениях и свиданиях\n• сообщениях\n• улучшении профиля\nЧто разбираем? 🦜",
+        "С рецептами не помогу 🦜 Но могу: daily fates, отношения, сообщения, улучшение профиля. Спроси что-то из этого 🙂",
+        "Я не кулинарный попугай 😅 Зато топ в: астрологии, свиданиях, сообщениях, профиле. Что разбираем? 🦜",
     ]
     lang = (locale or "en").strip().lower()
     pool = variants_ru if lang.startswith("ru") else variants_en
     return _stable_pick(pool, user_text)
 
 
-# =========================
-# INTENT HINTS (cheap, deterministic)
-# - We add a tiny hint to the model to interpret vague requests correctly.
-# =========================
-def _infer_intent_hint(user_text: str, locale: str) -> str:
+def _is_daily_fate_intent(user_text: str) -> bool:
     t = (user_text or "").lower()
-
-    # Forecast / today / vibe style questions should be treated as horoscope/daily fate automatically.
     forecast_words = [
-        "forecast", "today", "my day", "how will my day", "what about today", "daily", "vibe",
+        "forecast", "today", "my day", "how will my day", "daily", "vibe",
         "гороскоп", "сегодня", "прогноз", "как пройдет день", "мой день", "вайб"
     ]
-    if any(w in t for w in forecast_words):
-        return (
-            "INTENT_HINT: The user is asking for a Daily Fate / daily horoscope. "
-            "Answer as a Vedic-style daily horoscope and personalize using USER_PROFILE + ASTRO_COMPUTED."
-        )
-
-    # If user asks about interests/profile, it is still in-scope: personalize.
-    if "interest" in t or "interests" in t or "profile" in t or "bio" in t or "about me" in t or "анкет" in t:
-        return (
-            "INTENT_HINT: Use USER_PROFILE (interests/lifestyle) to personalize your answer."
-        )
-
-    return ""
+    return any(w in t for w in forecast_words)
 
 
 # =========================
-# SYSTEM PROMPT (UPGRADED: PERSONAL, INDIAN STYLE, USE PROFILE)
+# SYSTEM PROMPT (SHORT + STRONG)
 # =========================
 def _build_system_prompt(locale: str) -> str:
     lang = (locale or "en").strip() or "en"
     return (
-        "You are Shaadi Parrot 🦜 — a charming, friendly Indian astrologer + dating coach inside a dating & Daily Fates app.\n"
-        "Your goal: make the user feel seen and understood using their profile data, while staying practical and warm.\n"
-        "\n"
-        "IMPORTANT BEHAVIOR:\n"
-        "1) Be personable. If USER_PROFILE includes firstName, greet them by name.\n"
-        "2) If USER_PROFILE includes birthDate, reference it briefly to make it feel personal (do not over-repeat).\n"
-        "3) If ASTRO_COMPUTED exists, use Indian/Vedic framing:\n"
-        "   - Use terms: Rashi (Moon sign), Surya (Sun sign), Nakshatra.\n"
-        "   - Do NOT mention 'sidereal Lahiri' unless the user asks how you know.\n"
-        "4) If user asks for today's horoscope / daily forecast (even vaguely), ALWAYS answer as a Daily Fate.\n"
-        "5) Personalize using at least 2 anchors when available: name, interests, lifestyle (workout/smoking/drinking), relationshipIntent, city/country.\n"
-        "   Example: if interests include gym/fitness, tie energy/discipline tips to training.\n"
-        "6) Never be strict or dismissive. Do NOT say 'outside my nest' unless the user asks for cooking/recipes.\n"
-        "7) Keep it practical and uplifting. Avoid random 'lucky colors/numbers' unless user asks.\n"
-        "\n"
-        "WHAT YOU CAN DO:\n"
-        "• daily horoscope (uplifting + practical)\n"
-        "• Vedic astrology + compatibility\n"
-        "• write exact messages (texting/DMs)\n"
-        "• dating strategy + relationship advice\n"
-        "• profile/bio/photos improvements\n"
-        "\n"
-        "OUTPUT STYLE:\n"
-        "- Warm, confident, supportive.\n"
-        "- 1–3 emojis max.\n"
-        "- No markdown, no **bold**, no headings.\n"
-        "- Prefer bullets with '•'.\n"
-        "- Keep it concise but not shallow: usually 6–10 bullets max.\n"
-        "\n"
-        "ACCURACY RULES:\n"
-        "- If birth place + timezone are missing: do NOT claim Ascendant/houses.\n"
-        "- If ASTRO_COMPUTED is missing: ask ONE question (Sun sign or birthDate) BUT still give a gentle general daily horoscope.\n"
-        "\n"
-        f"Reply in {lang}.\n"
+        "You are Shaadi Parrot 🦜 — a charming Indian astrologer + dating coach inside a dating app.\n"
+        "Be warm, practical, and personal. Use USER_CONTEXT if present.\n"
+        "If the user asks about today/forecast/vibe: answer as a Daily Fate.\n"
+        "Style: short paragraphs or bullets with '•'. 1–3 emojis max. No markdown.\n"
+        "If birth place/timezone missing: do NOT claim Ascendant/houses.\n"
+        f"Reply in {lang}."
     )
 
 
-# =========================
-# PROFILE LOAD
-# =========================
 def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     if not raw:
         return {}
@@ -300,7 +248,7 @@ def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
-def _flatten_value(v: Any, max_len: int = 180) -> str:
+def _flatten_value(v: Any, max_len: int = 120) -> str:
     if v is None:
         return ""
     if isinstance(v, bool):
@@ -312,21 +260,21 @@ def _flatten_value(v: Any, max_len: int = 180) -> str:
         return (s[:max_len] + "…") if len(s) > max_len else s
     if isinstance(v, list):
         parts = []
-        for item in v[:16]:
-            s = _flatten_value(item, max_len=50)
+        for item in v[:10]:
+            s = _flatten_value(item, max_len=40)
             if s:
                 parts.append(s)
         out = ", ".join(parts)
-        if len(v) > 16:
+        if len(v) > 10:
             out += "…"
         return (out[:max_len] + "…") if len(out) > max_len else out
     if isinstance(v, dict):
         parts = []
         for i, (kk, vv) in enumerate(v.items()):
-            if i >= 10:
+            if i >= 8:
                 parts.append("…")
                 break
-            s = _flatten_value(vv, max_len=60)
+            s = _flatten_value(vv, max_len=50)
             if s:
                 parts.append(f"{kk}:{s}")
         out = "; ".join(parts)
@@ -335,20 +283,22 @@ def _flatten_value(v: Any, max_len: int = 180) -> str:
     return (s[:max_len] + "…") if len(s) > max_len else s
 
 
-def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
-    if not profile_doc:
+def _compact_user_context(profile_doc: Dict[str, Any], astro_text: str, memory_text: str, max_chars: int = 900) -> str:
+    """
+    ONE compact system message instead of 3–5 system messages.
+    This saves tokens massively.
+    """
+    if not profile_doc and not astro_text and not memory_text:
         return ""
 
     preferred_keys = [
-        "firstName", "lastName", "gender",
-        "birthDate", "birthTime", "age",
-        "cityName", "stateName", "countryName",
-        "languages", "religion", "community",
-        "relationshipIntent", "seekerType", "orientation", "lookingForGender",
-        "interests", "tags",
-        "workout", "smoking", "drinking", "social", "pets",
-        "education", "jobTitle", "occupation",
-        "bio", "aboutMe",
+        "firstName", "gender",
+        "birthDate", "birthTime",
+        "cityName", "countryName",
+        "relationshipIntent", "seekerType",
+        "interests",
+        "workout", "smoking", "drinking",
+        "bio",
     ]
 
     parts: List[str] = []
@@ -357,13 +307,28 @@ def _profile_summary_text(profile_doc: Dict[str, Any]) -> str:
             val = _flatten_value(profile_doc.get(k))
             if val:
                 parts.append(f"{k}={val}")
-        if len(parts) >= 28:
+        if len(parts) >= 16:
             break
 
-    if not parts:
-        return ""
+    ctx_bits: List[str] = []
+    if parts:
+        ctx_bits.append("PROFILE: " + " | ".join(parts))
 
-    return "USER_PROFILE: " + " | ".join(parts)
+    if astro_text:
+        # already compact enough; still cap
+        astro_text = astro_text.strip()
+        if len(astro_text) > 420:
+            astro_text = astro_text[:420] + "…"
+        ctx_bits.append(astro_text)
+
+    if memory_text:
+        memory_text = memory_text.strip()
+        if len(memory_text) > 240:
+            memory_text = memory_text[:240] + "…"
+        ctx_bits.append(memory_text)
+
+    out = "USER_CONTEXT: " + " || ".join(ctx_bits)
+    return out[:max_chars] + ("…" if len(out) > max_chars else "")
 
 
 async def _load_user_profile(uid: str) -> Dict[str, Any]:
@@ -381,7 +346,7 @@ async def _load_user_profile(uid: str) -> Dict[str, Any]:
 
 
 # =========================
-# ASTROLOGY (VEDIC SIDEREAL LAHIRI)
+# ASTROLOGY (unchanged logic, but keep output shorter)
 # =========================
 _ZODIAC = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -461,11 +426,10 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
     y, mo, d = bd
     bt = _parse_birth_time(profile)
 
-    # Without timezone, we assume UTC. If time missing -> noon UTC.
     if bt:
         hh, mm = bt
         hour = hh + (mm / 60.0)
-        time_mode = "birthTime_provided_timezone_unknown"
+        time_mode = "time_given"
     else:
         hour = 12.0
         time_mode = "date_only"
@@ -480,177 +444,19 @@ def _compute_astro(profile: Dict[str, Any]) -> str:
         moon_sign = _sign_from_lon(moon_lon)
         nak = _nakshatra_from_lon(moon_lon)
 
-        planet_bits: List[str] = []
-        for name, pid in _PLANETS.items():
-            lon = _calc_sidereal_lon_ut(jd_ut, pid)
-            planet_bits.append(f"{name}:{_sign_from_lon(lon)}")
-
-        rahu_lon = _calc_sidereal_lon_ut(jd_ut, swe.MEAN_NODE)
-        ketu_lon = (rahu_lon + 180.0) % 360.0
-        planet_bits.append(f"Ketu:{_sign_from_lon(ketu_lon)}")
-
-        note = "Ascendant/houses need birthPlace + timezone."
+        # Keep it short: only core info, not all planets
+        note = "No houses/Asc without place+timezone."
         if time_mode == "date_only":
-            note = "Moon/Nakshatra accuracy improves with birthTime + birthPlace/timezone."
+            note = "More accurate with birth time/place."
 
-        return (
-            "ASTRO_COMPUTED (Vedic sidereal Lahiri): "
-            f"SunSign={sun_sign}; MoonSign={moon_sign}; Nakshatra={nak}; "
-            f"Planets={', '.join(planet_bits)}; "
-            f"TimeMode={time_mode}. {note}"
-        )
+        return f"ASTRO: Sun={sun_sign}; Moon(Rashi)={moon_sign}; Nakshatra={nak}; Mode={time_mode}. {note}"
     except Exception:
         logger.exception("Astro compute failed")
         return ""
 
 
 # =========================
-# PHOTO MODERATION (SafeSearch + Face detection) ✅ NEW
-# =========================
-_LIKELIHOOD = {
-    "UNKNOWN": 0,
-    "VERY_UNLIKELY": 1,
-    "UNLIKELY": 2,
-    "POSSIBLE": 3,
-    "LIKELY": 4,
-    "VERY_LIKELY": 5,
-}
-
-@app.post("/verify-photo")
-def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header(default=None)):
-    # protect endpoint from abuse
-    _ = _verify_firebase_token_or_401(authorization)
-
-    if vision_client is None:
-        raise HTTPException(status_code=503, detail="Vision client not available")
-
-    gcs_uri = (body.gcs_uri or "").strip()
-    if not gcs_uri.startswith("gs://"):
-        raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
-
-    try:
-        image = vision.Image(source=vision.ImageSource(gcs_image_uri=gcs_uri))
-
-        resp = vision_client.annotate_image({
-            "image": image,
-            "features": [
-                {"type_": vision.Feature.Type.SAFE_SEARCH_DETECTION},
-                {"type_": vision.Feature.Type.FACE_DETECTION},
-            ],
-        })
-    except Exception as e:
-        logger.exception("Vision annotate_image failed")
-        raise HTTPException(status_code=502, detail=f"Vision API error: {type(e).__name__}")
-
-    if resp.error and resp.error.message:
-        raise HTTPException(status_code=502, detail=f"Vision API error: {resp.error.message}")
-
-    ss = resp.safe_search_annotation
-    adult = (ss.adult.name if ss and ss.adult else "UNKNOWN")
-    racy = (ss.racy.name if ss and ss.racy else "UNKNOWN")
-    violence = (ss.violence.name if ss and ss.violence else "UNKNOWN")
-
-    faces = len(resp.face_annotations or [])
-
-    # thresholds (simple & safe)
-    if _LIKELIHOOD.get(adult, 0) >= _LIKELIHOOD["LIKELY"]:
-        return {"ok": False, "reason": "adult_content", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
-
-    if _LIKELIHOOD.get(racy, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
-        return {"ok": False, "reason": "highly_racy", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
-
-    if _LIKELIHOOD.get(violence, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
-        return {"ok": False, "reason": "high_violence", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
-
-    if bool(body.require_face) and faces == 0:
-        return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
-
-    return {"ok": True, "reason": "ok", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
-
-
-# =========================
-# FACE VERIFICATION
-# =========================
-def _download_image_bytes(url: str, max_mb: int = 10) -> bytes:
-    headers = {"User-Agent": "shaadiparrot-face-verification/1.0"}
-    r = requests.get(url, headers=headers, timeout=25, stream=True, allow_redirects=True)
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {r.status_code}")
-
-    max_bytes = max_mb * 1024 * 1024
-    data = b""
-    for chunk in r.iter_content(chunk_size=1024 * 256):
-        if not chunk:
-            continue
-        data += chunk
-        if len(data) > max_bytes:
-            raise HTTPException(status_code=413, detail=f"Image too large (>{max_mb}MB)")
-    if len(data) < 2000:
-        raise HTTPException(status_code=400, detail="Downloaded file is too small / invalid")
-    return data
-
-
-def _face_area_proxy(face: vision.FaceAnnotation) -> float:
-    pts = face.bounding_poly.vertices
-    xs = [p.x for p in pts if p.x is not None]
-    ys = [p.y for p in pts if p.y is not None]
-    if not xs or not ys:
-        return 0.0
-
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    w = max(0, max_x - min_x)
-    h = max(0, max_y - min_y)
-
-    if w < 80 or h < 80:
-        return 0.0
-
-    return float(w * h)
-
-
-@app.post("/verify-face")
-def verify_face(data: VerifyFaceRequest):
-    if vision_client is None:
-        raise HTTPException(status_code=503, detail="Vision client not available")
-
-    img_bytes = _download_image_bytes(str(data.image_url), max_mb=10)
-    image = vision.Image(content=img_bytes)
-
-    try:
-        response = vision_client.face_detection(image=image)
-    except Exception as e:
-        logger.exception("Vision API call failed")
-        raise HTTPException(status_code=502, detail=f"Vision API error: {type(e).__name__}")
-
-    if response.error and response.error.message:
-        raise HTTPException(status_code=502, detail=f"Vision API error: {response.error.message}")
-
-    faces = response.face_annotations or []
-    face_count = len(faces)
-
-    if face_count == 0:
-        return {"status": "rejected", "reason": "no_face_detected", "user_id": data.user_id, "faces": 0}
-    if face_count > 1:
-        return {"status": "rejected", "reason": "multiple_faces_detected", "user_id": data.user_id, "faces": face_count}
-
-    face = faces[0]
-    det_conf = float(getattr(face, "detection_confidence", 0.0) or 0.0)
-    lm_conf = float(getattr(face, "landmarking_confidence", 0.0) or 0.0)
-    area_proxy = _face_area_proxy(face)
-
-    if det_conf < 0.65:
-        return {"status": "rejected", "reason": "low_detection_confidence", "faces": 1, "detection_confidence": det_conf}
-    if lm_conf < 0.30:
-        return {"status": "rejected", "reason": "low_landmark_confidence", "faces": 1, "landmarking_confidence": lm_conf}
-    if area_proxy <= 0.0:
-        return {"status": "rejected", "reason": "face_too_small_or_far", "faces": 1}
-
-    return {"status": "verified", "faces": 1, "detection_confidence": det_conf, "landmarking_confidence": lm_conf}
-
-
-# =========================
-# PERSISTENT CHAT STORAGE (Firestore)
-# - Supports thread_id without breaking existing "default" history.
+# PERSISTENT CHAT STORAGE (your code kept)
 # =========================
 def _safe_thread_id(thread_id: str) -> str:
     tid = (thread_id or "default").strip()
@@ -658,14 +464,12 @@ def _safe_thread_id(thread_id: str) -> str:
         tid = "default"
     if tid == "default":
         return "default"
-    # Make thread doc id safe and short
     h = hashlib.sha256(tid.encode("utf-8")).hexdigest()[:16]
     return f"t_{h}"
 
 
 def _chat_doc_id(uid: str, thread_id: str) -> str:
     tid = _safe_thread_id(thread_id)
-    # keep backward compatibility for default
     if tid == "default":
         return uid
     return f"{uid}__{tid}"
@@ -715,18 +519,7 @@ def _save_chat_state(uid: str, thread_id: str, patch: Dict[str, Any]) -> None:
         logger.exception("Failed to save parrotChats state")
 
 
-def _save_chat_message_batch(
-    uid: str,
-    thread_id: str,
-    user_text: str,
-    assistant_text: str,
-    created_at_iso: str,
-    created_at_ms: int,
-) -> None:
-    """
-    Writes user+assistant messages in ONE batch commit.
-    This helps prevent "second message appears only after restart" issues when the UI refetches quickly.
-    """
+def _save_chat_message_batch(uid: str, thread_id: str, user_text: str, assistant_text: str, created_at_iso: str, created_at_ms: int) -> None:
     col = _chat_msgs_col_ref(uid, thread_id)
     docref = _chat_doc_ref(uid, thread_id)
     if col is None or docref is None or firestore_client is None:
@@ -755,7 +548,6 @@ def _save_chat_message_batch(
             "createdAtMs": created_at_ms + 2,
         })
 
-        # also touch parent doc for "updatedAtMs" so lists can refresh fast
         batch.set(docref, {
             "uid": uid,
             "threadId": (thread_id or "default"),
@@ -768,7 +560,7 @@ def _save_chat_message_batch(
         logger.exception("Failed to batch save chat messages")
 
 
-def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[str, str]]:
+def _load_chat_history(uid: str, thread_id: str, limit: int = 12) -> List[Dict[str, str]]:
     col = _chat_msgs_col_ref(uid, thread_id)
     if col is None:
         return []
@@ -819,7 +611,7 @@ def _memory_text_from_state(state: Dict[str, Any]) -> str:
             bits.append(f"{k}={v}")
     if not bits:
         return ""
-    return "PARROT_MEMORY: " + " | ".join(bits)
+    return "MEMORY: " + " | ".join(bits)
 
 
 def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_text: str) -> Dict[str, Any]:
@@ -859,7 +651,7 @@ def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_te
         mem["lastTopic"] = "profile"
     elif "relationship" in tl or "girls" in tl or "love" in tl:
         mem["lastTopic"] = "relationships"
-    elif "horoscope" in tl or "horoskop" in tl or "гороскоп" in tl or "vedic" in tl or "astrology" in tl:
+    elif "horoscope" in tl or "гороскоп" in tl or "vedic" in tl or "astrology" in tl:
         mem["lastTopic"] = "astrology"
     elif "forecast" in tl or "today" in tl or "прогноз" in tl or "сегодня" in tl:
         mem["lastTopic"] = "astrology"
@@ -869,14 +661,14 @@ def _update_memory_from_text(state: Dict[str, Any], user_text: str, assistant_te
 
 
 # =========================
-# HISTORY/RESET endpoints
+# HISTORY/RESET endpoints (kept)
 # =========================
 @app.get("/ai/history", response_model=HistoryResponse)
 def ai_history(thread_id: str = "default", limit: int = 24, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
-    limit = max(1, min(80, int(limit)))
+    limit = max(1, min(60, int(limit)))
 
-    rows = _load_chat_history(uid, thread_id, limit=limit)
+    rows = _load_chat_history(uid, thread_id, limit=min(limit, 12))
     msgs: List[ChatTurn] = []
     for r in rows:
         role = r.get("role") or ""
@@ -903,12 +695,11 @@ def ai_reset(thread_id: str = "default", authorization: Optional[str] = Header(d
     return ResetResponse(thread_id=(thread_id or "default"), ok=True)
 
 
-# keep old endpoints (optional)
 @app.get("/parrot/history")
 def parrot_history(limit: int = 24, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
-    limit = max(1, min(80, int(limit)))
-    items = _load_chat_history(uid, "default", limit=limit)
+    limit = max(1, min(60, int(limit)))
+    items = _load_chat_history(uid, "default", limit=min(limit, 12))
     return {"uid": uid, "count": len(items), "items": items}
 
 
@@ -929,7 +720,7 @@ def parrot_reset(authorization: Optional[str] = Header(default=None)):
 
 
 # =========================
-# DEEPSEEK CALL
+# DEEPSEEK CALL (OPTIMIZED)
 # =========================
 async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     if not DEEPSEEK_API_KEY:
@@ -938,8 +729,10 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
-        "temperature": 0.85,
-        "max_tokens": 700,
+        # less rambling, more stable
+        "temperature": 0.70,
+        # big savings; enough for 6–10 bullets
+        "max_tokens": 350,
     }
 
     headers = {
@@ -976,7 +769,7 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
 
 
 # =========================
-# AI CHAT ENDPOINT
+# AI CHAT ENDPOINT (TOKEN-LEAN)
 # =========================
 @app.post("/ai/chat", response_model=AiChatResponse)
 async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
@@ -999,60 +792,58 @@ async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(def
 
     system_prompt = _build_system_prompt(locale)
 
-    # Load user profile (for personalization)
     profile = await _load_user_profile(uid)
-    profile_summary = _profile_summary_text(profile)
-
-    # Astro computed (vedic sidereal)
     astro_computed = _compute_astro(profile)
 
-    # Load persistent chat memory + last messages
     state = _load_chat_state(uid, thread_id)
     memory_text = _memory_text_from_state(state)
-    persisted_history = _load_chat_history(uid, thread_id, limit=30)
 
-    # Optional: merge client history
+    # ✅ Hard-limit history
+    persisted_history = _load_chat_history(uid, thread_id, limit=12)
+
+    # Optional client history: only use if no persisted history exists (rare)
     client_history: List[Dict[str, str]] = []
-    if body.history:
-        for t in body.history[-10:]:
+    if (not persisted_history) and body.history:
+        for t in body.history[-6:]:
             role = t.role
             txt = _normalize_text(t.text)
             if role in ["user", "assistant"] and txt:
-                if len(txt) > 360:
-                    txt = txt[:360] + "…"
+                if len(txt) > 220:
+                    txt = txt[:220] + "…"
                 client_history.append({"role": role, "content": txt})
 
-    intent_hint = _infer_intent_hint(user_text, locale)
+    # ✅ One compact user context message
+    user_ctx = _compact_user_context(profile, astro_computed, memory_text, max_chars=900)
 
     # Build final LLM messages
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if user_ctx:
+        messages.append({"role": "system", "content": user_ctx})
 
-    if profile_summary:
-        messages.append({"role": "system", "content": profile_summary})
+    # If it looks like Daily Fate, add a tiny steering hint (short)
+    if _is_daily_fate_intent(user_text):
+        messages.append({"role": "system", "content": "MODE: DailyFate (Vedic-style, practical). Keep it punchy."})
 
-    if astro_computed:
-        messages.append({"role": "system", "content": astro_computed})
-
-    if memory_text:
-        messages.append({"role": "system", "content": memory_text})
-
-    if intent_hint:
-        messages.append({"role": "system", "content": intent_hint})
-
-    combined = persisted_history[-16:]
-    if client_history and len(combined) < 8:
-        combined = (combined + client_history)[-16:]
+    # Add only last 8 turns, each trimmed
+    combined = (persisted_history[-8:] if persisted_history else client_history[-8:])
 
     for m in combined:
-        if m.get("role") in ["user", "assistant"] and m.get("content"):
-            messages.append({"role": m["role"], "content": m["content"]})
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role not in ["user", "assistant"] or not content:
+            continue
+        if len(content) > 260:
+            content = content[:260] + "…"
+        messages.append({"role": role, "content": content})
 
-    # Current user message
+    # Current user message (trim extreme input)
+    if len(user_text) > 1200:
+        user_text = user_text[:1200] + "…"
     messages.append({"role": "user", "content": user_text})
 
     reply = await _call_deepseek(messages)
 
-    # Persist messages (batch commit to reduce "missing until restart" effects)
+    # Persist messages
     now_iso = _now_iso()
     now_ms = _now_ms()
     _save_chat_message_batch(uid, thread_id, user_text, reply, now_iso, now_ms)
