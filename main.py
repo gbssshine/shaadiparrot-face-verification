@@ -45,8 +45,8 @@ DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "260")
 DS_TIMEOUT_SEC = int(os.getenv("DS_TIMEOUT_SEC") or "45")
 
 # prompt economy knobs
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT") or "8")              # last N msgs only
-HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")    # truncate each msg
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT") or "8")
+HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")
 USER_TEXT_MAX_CHARS = int(os.getenv("USER_TEXT_MAX_CHARS") or "700")
 
 # summary memory knobs
@@ -225,6 +225,7 @@ def _topic_block_reply(user_text: str, locale: str) -> str:
 # INTENT (cheap)
 # =========================
 class Intent:
+    MATCH = "match"        # ✅ NEW
     ASTRO = "astro"
     TEXTING = "texting"
     PROFILE = "profile"
@@ -232,7 +233,22 @@ class Intent:
     GENERAL = "general"
 
 
+def _parse_match_command(user_text: str) -> Optional[str]:
+    """
+    Accepts: "/match <uid>"
+    """
+    t = (user_text or "").strip()
+    m = re.match(r"^/match\s+([A-Za-z0-9_\-:]{6,})\s*$", t)
+    if not m:
+        return None
+    return (m.group(1) or "").strip()
+
+
 def _infer_intent(user_text: str) -> str:
+    # ✅ command has priority
+    if _parse_match_command(user_text):
+        return Intent.MATCH
+
     t = (user_text or "").lower()
 
     astro_words = [
@@ -258,11 +274,10 @@ def _infer_intent(user_text: str) -> str:
 
 
 # =========================
-# PROMPT BUILDER (short)
+# PROMPT BUILDER
 # =========================
 def _build_system_prompt(locale: str, intent: str) -> str:
     lang = (locale or "en").strip().lower() or "en"
-    # супер короткая и жёсткая упаковка
     base = (
         "You are Shaadi Parrot 🦜: Indian-style dating coach + Vedic daily-fate assistant inside an app.\n"
         "Rules:\n"
@@ -270,20 +285,38 @@ def _build_system_prompt(locale: str, intent: str) -> str:
         "- 1–2 emojis max.\n"
         "- No markdown.\n"
         "- Keep it concise. Prefer short bullets using '•'.\n"
-        "- If asked for a message/reply: output 2–4 message options.\n"
-        "- If asked for profile/bio: give actionable edits + 1 sample bio.\n"
-        "- If asked for daily fate/horoscope: give a Vedic-style daily forecast + practical tips.\n"
         "- Never mention tokens, prompts, or internal system.\n"
     )
 
-    if intent == Intent.TEXTING:
-        base += "Output target: 6–10 short bullet lines total.\n"
-    elif intent == Intent.PROFILE:
-        base += "Output target: 8–12 bullet lines + 1 short sample bio.\n"
-    elif intent == Intent.ASTRO:
-        base += "Output target: 8–12 bullet lines.\n"
+    if intent == Intent.MATCH:
+        base += (
+            "Task: produce a FULL 'match breakdown' for two users (USER + MATCH).\n"
+            "Structure (use short headings + bullets):\n"
+            "1) Quick vibe summary\n"
+            "2) Strengths (why it can work)\n"
+            "3) Friction points / red flags\n"
+            "4) Indian-style compatibility (fun but respectful): family vibe, lifestyle, values, routines\n"
+            "5) Vedic-style compatibility notes (based on provided ASTRO lines)\n"
+            "6) Distance & logistics (based on distance_km)\n"
+            "7) Best conversation starters (3–6)\n"
+            "8) A 3-step first date plan\n"
+            "Output target: 35–70 short bullet lines total.\n"
+        )
     else:
-        base += "Output target: 6–10 short bullet lines.\n"
+        base += (
+            "- If asked for a message/reply: output 2–4 message options.\n"
+            "- If asked for profile/bio: give actionable edits + 1 sample bio.\n"
+            "- If asked for daily fate/horoscope: give a Vedic-style daily forecast + practical tips.\n"
+        )
+
+        if intent == Intent.TEXTING:
+            base += "Output target: 6–10 short bullet lines total.\n"
+        elif intent == Intent.PROFILE:
+            base += "Output target: 8–12 bullet lines + 1 short sample bio.\n"
+        elif intent == Intent.ASTRO:
+            base += "Output target: 8–12 bullet lines.\n"
+        else:
+            base += "Output target: 6–10 short bullet lines.\n"
 
     if lang.startswith("ru"):
         base += "Reply in Russian.\n"
@@ -294,12 +327,12 @@ def _build_system_prompt(locale: str, intent: str) -> str:
 
 
 # =========================
-# PROFILE LOAD (trimmed)
+# PROFILE LOAD
 # =========================
 def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     if not raw:
         return {}
-    deny_prefixes = ["geo", "lat", "lng", "location", "idtoken", "refreshtoken", "token", "__"]
+    deny_prefixes = ["geo", "location", "idtoken", "refreshtoken", "token", "__"]
     deny_exact = {"updatedAt", "deviceId", "pushToken", "refreshToken"}
 
     clean: Dict[str, Any] = {}
@@ -327,6 +360,22 @@ async def _load_user_profile(uid: str) -> Dict[str, Any]:
         return _safe_profile_dict(raw)
     except Exception:
         logger.exception("Failed to load profiles/{uid}")
+        return {}
+
+
+def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
+    """
+    ✅ raw profile for internal computations (lat/lon), NOT directly sent to LLM
+    """
+    if firestore_client is None:
+        return {}
+    try:
+        snap = firestore_client.collection("profiles").document(uid).get()
+        if not snap.exists:
+            return {}
+        return snap.to_dict() or {}
+    except Exception:
+        logger.exception("Failed to load profiles/{uid} raw")
         return {}
 
 
@@ -365,11 +414,10 @@ def _flatten_value(v: Any, max_len: int = 120) -> str:
     return (s[:max_len] + "…") if len(s) > max_len else s
 
 
-def _profile_context_compact(profile: Dict[str, Any], intent: str) -> str:
+def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str = "USER") -> str:
     if not profile:
         return ""
 
-    # минимум полей по интенту (денежная экономия)
     base_keys = ["firstName", "age", "gender", "cityName", "countryName", "relationshipIntent", "languages"]
     texting_keys = base_keys + ["bio", "aboutMe", "interests", "workout", "smoking", "drinking"]
     profile_keys = base_keys + ["interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "bio", "aboutMe"]
@@ -381,6 +429,8 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str) -> str:
         keys = profile_keys
     elif intent == Intent.ASTRO:
         keys = astro_keys
+    elif intent == Intent.MATCH:
+        keys = list(dict.fromkeys(base_keys + ["bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "birthDate", "birthTime"]))
     else:
         keys = base_keys + ["interests"]
 
@@ -390,16 +440,16 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str) -> str:
             val = _flatten_value(profile.get(k))
             if val:
                 parts.append(f"{k}={val}")
-        if len(parts) >= 14:
+        if len(parts) >= 18:
             break
 
     if not parts:
         return ""
-    return "USER_CONTEXT: " + " | ".join(parts)
+    return f"{prefix}_CONTEXT: " + " | ".join(parts)
 
 
 # =========================
-# ASTRO (ULTRA SHORT)
+# ASTRO (SHORT)
 # =========================
 _ZODIAC = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -444,13 +494,12 @@ def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
     return float(res[0]) % 360.0
 
 
-def _compute_astro_short(profile: Dict[str, Any]) -> str:
+def _compute_astro_short(profile: Dict[str, Any], label: str = "ASTRO") -> str:
     bd = _parse_birth_date(profile)
     if not bd:
         return ""
 
     y, mo, d = bd
-    # без таймзоны/места — берём noon UTC (стабильно и дешево)
     jd_ut = swe.julday(y, mo, d, 12.0)
 
     try:
@@ -459,14 +508,53 @@ def _compute_astro_short(profile: Dict[str, Any]) -> str:
         sun_sign = _sign_from_lon(sun_lon)
         moon_sign = _sign_from_lon(moon_lon)
         nak = _nakshatra_from_lon(moon_lon)
-        return f"ASTRO: Sun={sun_sign}; Moon(Rashi)={moon_sign}; Nakshatra={nak}."
+        return f"{label}: Sun={sun_sign}; Moon(Rashi)={moon_sign}; Nakshatra={nak}."
     except Exception:
         logger.exception("Astro compute failed")
         return ""
 
 
 # =========================
-# FIRESTORE CHAT STORAGE
+# DISTANCE
+# =========================
+def _try_get_float(d: Dict[str, Any], key: str) -> float:
+    v = d.get(key)
+    if v is None:
+        return 0.0
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _distance_km_from_profiles(raw_a: Dict[str, Any], raw_b: Dict[str, Any]) -> Optional[int]:
+    lat1 = _try_get_float(raw_a, "lat")
+    lon1 = _try_get_float(raw_a, "lon")
+    lat2 = _try_get_float(raw_b, "lat")
+    lon2 = _try_get_float(raw_b, "lon")
+    if not lat1 or not lon1 or not lat2 or not lon2:
+        return None
+    try:
+        km = _haversine_km(lat1, lon1, lat2, lon2)
+        if km < 0:
+            return None
+        return int(round(km))
+    except Exception:
+        return None
+
+
+# =========================
+# FIRESTORE CHAT STORAGE (unchanged)
 # =========================
 def _safe_thread_id(thread_id: str) -> str:
     tid = (thread_id or "default").strip()
@@ -634,7 +722,6 @@ def _append_summary(summary: str, key: str, value: str) -> str:
     if not key or not value:
         return summary
 
-    # replace if exists
     pattern = re.compile(rf"(?i)\b{re.escape(key)}\s*=\s*[^|]+")
     if pattern.search(summary):
         summary = pattern.sub(f"{key}={value}", summary)
@@ -651,13 +738,10 @@ def _append_summary(summary: str, key: str, value: str) -> str:
 def _update_summary_from_turn(summary: str, user_text: str, assistant_text: str, intent: str) -> str:
     t = (user_text or "").strip()
 
-    # lightweight “facts” extraction
-    # partner name
     m = re.search(r"\b(?:her name is|his name is|my gf is|my bf is)\s+([A-Z][a-z]+)\b", t, re.IGNORECASE)
     if m:
         summary = _append_summary(summary, "partnerName", m.group(1))
 
-    # zodiac claims
     mz = re.search(r"\b(i'?m|i am)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
     if mz:
         summary = _append_summary(summary, "userZodiac", mz.group(2).title())
@@ -666,14 +750,12 @@ def _update_summary_from_turn(summary: str, user_text: str, assistant_text: str,
     if mz2:
         summary = _append_summary(summary, "partnerZodiac", mz2.group(2).title())
 
-    # last topic
     summary = _append_summary(summary, "lastTopic", intent)
-
     return summary
 
 
 # =========================
-# PHOTO MODERATION
+# PHOTO MODERATION + FACE VERIFICATION (unchanged)
 # =========================
 _LIKELIHOOD = {
     "UNKNOWN": 0,
@@ -733,9 +815,6 @@ def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header
     return {"ok": True, "reason": "ok", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
 
 
-# =========================
-# FACE VERIFICATION
-# =========================
 def _download_image_bytes(url: str, max_mb: int = 10) -> bytes:
     headers = {"User-Agent": "shaadiparrot-face-verification/1.0"}
     r = requests.get(url, headers=headers, timeout=25, stream=True, allow_redirects=True)
@@ -761,132 +840,179 @@ def _face_area_proxy(face: vision.FaceAnnotation) -> float:
     ys = [p.y for p in pts if p.y is not None]
     if not xs or not ys:
         return 0.0
-
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    w = max(0, max_x - min_x)
-    h = max(0, max_y - min_y)
-
-    if w < 80 or h < 80:
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    if w <= 0 or h <= 0:
         return 0.0
-
     return float(w * h)
 
 
-@app.post("/verify-face")
-def verify_face(data: VerifyFaceRequest):
+def _pick_largest_face(faces: List[vision.FaceAnnotation]) -> Optional[vision.FaceAnnotation]:
+    if not faces:
+        return None
+    best = None
+    best_area = 0.0
+    for f in faces:
+        a = _face_area_proxy(f)
+        if a > best_area:
+            best_area = a
+            best = f
+    return best
+
+
+def _likelihood_name_to_int(name: str) -> int:
+    return int(_LIKELIHOOD.get((name or "UNKNOWN").strip().upper(), 0))
+
+
+def _face_quality_checks(face: vision.FaceAnnotation) -> Tuple[bool, str]:
+    """
+    Lightweight heuristics to reduce obvious junk:
+    - too tilted (roll/pan/tilt)
+    - too tiny face (area proxy threshold handled elsewhere)
+    - very low detection confidence
+    """
+    try:
+        conf = float(getattr(face, "detection_confidence", 0.0) or 0.0)
+        if conf < 0.45:
+            return False, "low_confidence"
+
+        # Vision angles are degrees
+        roll = abs(float(getattr(face, "roll_angle", 0.0) or 0.0))
+        pan = abs(float(getattr(face, "pan_angle", 0.0) or 0.0))
+        tilt = abs(float(getattr(face, "tilt_angle", 0.0) or 0.0))
+
+        if roll > 30 or pan > 30 or tilt > 30:
+            return False, "face_too_angled"
+
+        # eyes open check (soft)
+        left_open = getattr(face, "left_eye_open_probability", None)
+        right_open = getattr(face, "right_eye_open_probability", None)
+        if left_open is not None and right_open is not None:
+            try:
+                if float(left_open) < 0.10 and float(right_open) < 0.10:
+                    return False, "eyes_closed"
+            except Exception:
+                pass
+
+        return True, "ok"
+    except Exception:
+        return False, "face_quality_check_failed"
+
+
+def _detect_faces_and_safety_from_bytes(img_bytes: bytes):
     if vision_client is None:
         raise HTTPException(status_code=503, detail="Vision client not available")
 
-    img_bytes = _download_image_bytes(str(data.image_url), max_mb=10)
-    image = vision.Image(content=img_bytes)
-
     try:
-        response = vision_client.face_detection(image=image)
+        image = vision.Image(content=img_bytes)
+        resp = vision_client.annotate_image({
+            "image": image,
+            "features": [
+                {"type_": vision.Feature.Type.SAFE_SEARCH_DETECTION},
+                {"type_": vision.Feature.Type.FACE_DETECTION},
+            ],
+        })
     except Exception as e:
-        logger.exception("Vision API call failed")
+        logger.exception("Vision annotate_image failed")
         raise HTTPException(status_code=502, detail=f"Vision API error: {type(e).__name__}")
 
-    if response.error and response.error.message:
-        raise HTTPException(status_code=502, detail=f"Vision API error: {response.error.message}")
+    if resp.error and resp.error.message:
+        raise HTTPException(status_code=502, detail=f"Vision API error: {resp.error.message}")
 
-    faces = response.face_annotations or []
-    face_count = len(faces)
+    ss = resp.safe_search_annotation
+    adult = (ss.adult.name if ss and ss.adult else "UNKNOWN")
+    racy = (ss.racy.name if ss and ss.racy else "UNKNOWN")
+    violence = (ss.violence.name if ss and ss.violence else "UNKNOWN")
+    faces = list(resp.face_annotations or [])
 
-    if face_count == 0:
-        return {"status": "rejected", "reason": "no_face_detected", "user_id": data.user_id, "faces": 0}
-    if face_count > 1:
-        return {"status": "rejected", "reason": "multiple_faces_detected", "user_id": data.user_id, "faces": face_count}
-
-    face = faces[0]
-    det_conf = float(getattr(face, "detection_confidence", 0.0) or 0.0)
-    lm_conf = float(getattr(face, "landmarking_confidence", 0.0) or 0.0)
-    area_proxy = _face_area_proxy(face)
-
-    if det_conf < 0.65:
-        return {"status": "rejected", "reason": "low_detection_confidence", "faces": 1, "detection_confidence": det_conf}
-    if lm_conf < 0.30:
-        return {"status": "rejected", "reason": "low_landmark_confidence", "faces": 1, "landmarking_confidence": lm_conf}
-    if area_proxy <= 0.0:
-        return {"status": "rejected", "reason": "face_too_small_or_far", "faces": 1}
-
-    return {"status": "verified", "faces": 1, "detection_confidence": det_conf, "landmarking_confidence": lm_conf}
+    return adult, racy, violence, faces
 
 
-# =========================
-# HISTORY/RESET
-# =========================
-@app.get("/ai/history", response_model=HistoryResponse)
-def ai_history(thread_id: str = "default", limit: int = 24, authorization: Optional[str] = Header(default=None)):
+def _store_face_verified(uid: str, ok: bool, reason: str, meta: Dict[str, Any]) -> None:
+    """
+    Stores a minimal verification outcome.
+    """
+    if firestore_client is None:
+        return
+    try:
+        patch = {
+            "faceVerified": bool(ok),
+            "faceVerifiedReason": (reason or "").strip(),
+            "faceVerifiedAtIso": _now_iso(),
+            "faceVerifiedMeta": meta or {},
+        }
+        firestore_client.collection("profiles").document(uid).set(patch, merge=True)
+    except Exception:
+        logger.exception("Failed to store face verification outcome")
+
+
+@app.post("/verify-face")
+def verify_face(body: VerifyFaceRequest, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
-    limit = max(1, min(80, int(limit)))
-    rows = _load_chat_history(uid, thread_id, limit=limit)
-    msgs: List[ChatTurn] = []
-    for r in rows:
-        role = r.get("role") or ""
-        txt = r.get("content") or ""
-        if role in ["user", "assistant"] and txt:
-            msgs.append(ChatTurn(role=role, text=txt))
-    return HistoryResponse(thread_id=(thread_id or "default"), messages=msgs)
 
+    # Only allow self-verify
+    target_uid = (body.user_id or "").strip()
+    if not target_uid or target_uid != uid:
+        raise HTTPException(status_code=403, detail="user_id must match auth uid")
 
-@app.post("/ai/reset", response_model=ResetResponse)
-def ai_reset(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
-    uid = _verify_firebase_token_or_401(authorization)
-    now_iso = _now_iso()
-    now_ms = _now_ms()
-    _save_chat_state(uid, thread_id, {
-        "uid": uid,
-        "threadId": (thread_id or "default"),
-        "clearedAtIso": now_iso,
-        "clearedAtMs": now_ms,
-        "updatedAtIso": now_iso,
-        "updatedAtMs": now_ms,
-        "turnCount": 0,
-        "summary": "",
-    })
-    return ResetResponse(thread_id=(thread_id or "default"), ok=True)
+    url = (str(body.image_url) or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="image_url required")
 
+    img_bytes = _download_image_bytes(url, max_mb=10)
+    adult, racy, violence, faces = _detect_faces_and_safety_from_bytes(img_bytes)
 
-# Backward-compatible old endpoints
-@app.get("/parrot/history")
-def parrot_history(limit: int = 24, authorization: Optional[str] = Header(default=None)):
-    uid = _verify_firebase_token_or_401(authorization)
-    limit = max(1, min(80, int(limit)))
-    items = _load_chat_history(uid, "default", limit=limit)
-    return {"uid": uid, "count": len(items), "items": items}
+    # Safety gates
+    if _LIKELIHOOD.get(adult, 0) >= _LIKELIHOOD["LIKELY"]:
+        _store_face_verified(uid, False, "adult_content", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
+        return {"ok": False, "reason": "adult_content", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
 
+    if _LIKELIHOOD.get(racy, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
+        _store_face_verified(uid, False, "highly_racy", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
+        return {"ok": False, "reason": "highly_racy", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
 
-@app.post("/parrot/reset")
-def parrot_reset(authorization: Optional[str] = Header(default=None)):
-    uid = _verify_firebase_token_or_401(authorization)
-    now_iso = _now_iso()
-    now_ms = _now_ms()
-    _save_chat_state(uid, "default", {
-        "uid": uid,
-        "threadId": "default",
-        "clearedAtIso": now_iso,
-        "clearedAtMs": now_ms,
-        "updatedAtIso": now_iso,
-        "updatedAtMs": now_ms,
-        "turnCount": 0,
-        "summary": "",
-    })
-    return {"status": "ok", "uid": uid, "clearedAtIso": now_iso}
+    if _LIKELIHOOD.get(violence, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
+        _store_face_verified(uid, False, "high_violence", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
+        return {"ok": False, "reason": "high_violence", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
+
+    if len(faces) == 0:
+        _store_face_verified(uid, False, "no_face_detected", {"adult": adult, "racy": racy, "violence": violence, "faces": 0})
+        return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": 0}
+
+    # Pick largest face and validate quality
+    best = _pick_largest_face(faces)
+    if best is None:
+        _store_face_verified(uid, False, "no_face_detected", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
+        return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
+
+    # Make sure the face isn't tiny
+    area = _face_area_proxy(best)
+    # heuristic threshold (works as a proxy across common resolutions)
+    if area < 18_000:
+        _store_face_verified(uid, False, "face_too_small", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
+        return {"ok": False, "reason": "face_too_small", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
+
+    ok_quality, q_reason = _face_quality_checks(best)
+    if not ok_quality:
+        _store_face_verified(uid, False, q_reason, {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
+        return {"ok": False, "reason": q_reason, "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
+
+    _store_face_verified(uid, True, "ok", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
+    return {"ok": True, "reason": "ok", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
 
 
 # =========================
 # DEEPSEEK CALL
 # =========================
-async def _call_deepseek(messages: List[Dict[str, str]], max_tokens: int) -> str:
+def _deepseek_chat(messages: List[Dict[str, str]], max_tokens: int) -> str:
     if not DEEPSEEK_API_KEY:
-        raise HTTPException(status_code=500, detail="DEEPSEEK_API_KEY is not set in Cloud Run env vars")
+        raise HTTPException(status_code=503, detail="DeepSeek API key not configured")
 
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": DS_TEMPERATURE,
-        "max_tokens": int(max(120, min(420, max_tokens))),
+        "max_tokens": int(max_tokens),
     }
 
     headers = {
@@ -894,179 +1020,224 @@ async def _call_deepseek(messages: List[Dict[str, str]], max_tokens: int) -> str
         "Content-Type": "application/json",
     }
 
-    import json
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=DS_TIMEOUT_SEC) as client:
-            r = await client.post(DEEPSEEK_URL, headers=headers, content=json.dumps(payload))
-            text = r.text
-            if r.status_code != 200:
-                logger.error(f"DeepSeek error {r.status_code}: {text}")
-                raise HTTPException(status_code=502, detail=f"DeepSeek API error: HTTP {r.status_code}")
-    except HTTPException:
-        raise
+        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=DS_TIMEOUT_SEC)
     except Exception as e:
-        logger.exception("DeepSeek call failed")
-        raise HTTPException(status_code=502, detail=f"DeepSeek call failed: {type(e).__name__}")
+        logger.exception("DeepSeek request failed")
+        raise HTTPException(status_code=502, detail=f"DeepSeek request error: {type(e).__name__}")
+
+    if r.status_code != 200:
+        logger.error("DeepSeek non-200: %s %s", r.status_code, (r.text or "")[:400])
+        raise HTTPException(status_code=502, detail=f"DeepSeek error HTTP {r.status_code}")
 
     try:
         data = r.json()
-        choices = data.get("choices") or []
-        if not choices:
-            return "I couldn't generate a reply. Please try again."
-        msg = choices[0].get("message") or {}
-        content = (msg.get("content") or "").strip()
-        return content or "I couldn't generate a reply. Please try again."
     except Exception:
-        logger.exception("DeepSeek response parse failed")
-        return "I couldn't parse the reply. Please try again."
+        logger.exception("DeepSeek JSON parse failed")
+        raise HTTPException(status_code=502, detail="DeepSeek invalid JSON")
+
+    try:
+        txt = (data["choices"][0]["message"]["content"] or "").strip()
+        return txt
+    except Exception:
+        logger.exception("DeepSeek response shape unexpected: %s", str(data)[:400])
+        raise HTTPException(status_code=502, detail="DeepSeek response invalid")
 
 
-def _truncate(s: str, n: int) -> str:
+def _trim_text(s: str, max_chars: int) -> str:
     s = (s or "").strip()
-    if len(s) <= n:
+    if not s:
+        return ""
+    if len(s) <= max_chars:
         return s
-    return s[:n] + "…"
+    return s[:max_chars].rstrip() + "…"
 
 
-def _build_messages_for_llm(
+def _build_llm_messages(
     locale: str,
     intent: str,
-    user_context: str,
-    astro_short: str,
     summary: str,
-    history_rows: List[Dict[str, str]],
+    user_profile: Dict[str, Any],
+    match_profile: Optional[Dict[str, Any]],
+    distance_km: Optional[int],
     user_text: str,
+    history: List[Dict[str, str]],
 ) -> List[Dict[str, str]]:
-    system_prompt = _build_system_prompt(locale, intent)
+    system = _build_system_prompt(locale, intent)
 
-    # 1 system + 1 context (максимум 2 system)
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": system}]
 
-    # компактный контекст одной строкой
-    ctx_bits: List[str] = []
-    if user_context:
-        ctx_bits.append(user_context)
-    if intent == Intent.ASTRO and astro_short:
-        ctx_bits.append(astro_short)
+    # summary memory (cheap)
     if summary:
-        ctx_bits.append("THREAD_SUMMARY: " + _truncate(summary, SUMMARY_MAX_CHARS))
+        msgs.append({"role": "system", "content": f"SUMMARY_MEMORY: {_trim_text(summary, SUMMARY_MAX_CHARS)}"})
 
-    if ctx_bits:
-        messages.append({"role": "system", "content": " | ".join(ctx_bits)})
+    # compact profile context
+    uctx = _profile_context_compact(user_profile, intent, prefix="USER")
+    if uctx:
+        msgs.append({"role": "system", "content": uctx})
 
-    # история — только последние N сообщений, короткие
-    if history_rows:
-        trimmed = history_rows[-HISTORY_LIMIT:]
-        for m in trimmed:
-            role = m.get("role") or ""
-            content = _truncate(m.get("content") or "", HISTORY_MAX_CHARS)
-            if role in ["user", "assistant"] and content:
-                messages.append({"role": role, "content": content})
+    if intent == Intent.MATCH and match_profile:
+        mctx = _profile_context_compact(match_profile, intent, prefix="MATCH")
+        if mctx:
+            msgs.append({"role": "system", "content": mctx})
 
-    # текущее сообщение
-    messages.append({"role": "user", "content": _truncate(user_text, USER_TEXT_MAX_CHARS)})
+        # extra signals for match mode
+        ua = _compute_astro_short(user_profile, label="USER_ASTRO")
+        ma = _compute_astro_short(match_profile, label="MATCH_ASTRO")
+        if ua:
+            msgs.append({"role": "system", "content": ua})
+        if ma:
+            msgs.append({"role": "system", "content": ma})
+        if distance_km is not None:
+            msgs.append({"role": "system", "content": f"DISTANCE_KM: {int(distance_km)}"})
 
-    return messages
+    # history (already trimmed by loader and knobs)
+    for h in (history or [])[-HISTORY_LIMIT:]:
+        role = (h.get("role") or "").strip()
+        content = _trim_text(h.get("content") or "", HISTORY_MAX_CHARS)
+        if role in ("user", "assistant") and content:
+            msgs.append({"role": role, "content": content})
+
+    # current turn
+    msgs.append({"role": "user", "content": _trim_text(user_text, USER_TEXT_MAX_CHARS)})
+    return msgs
 
 
-def _pick_max_tokens(intent: str) -> int:
-    # можно дальше резать, но так сохраняется качество
-    if intent == Intent.TEXTING:
-        return 240
-    if intent == Intent.PROFILE:
-        return 300
-    if intent == Intent.ASTRO:
-        return 300
-    return DS_MAX_TOKENS_DEFAULT
+def _extract_reply_safe(txt: str) -> str:
+    txt = (txt or "").strip()
+    if not txt:
+        return "…"
+    # No markdown requested
+    txt = txt.replace("**", "").replace("```", "")
+    # Hard cap to keep mobile UI sane
+    if len(txt) > 1800:
+        txt = txt[:1800].rstrip() + "…"
+    return txt
 
 
 # =========================
-# AI CHAT
+# CHAT ENDPOINT
 # =========================
-@app.post("/ai/chat", response_model=AiChatResponse)
-async def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
+@app.post("/ai-chat", response_model=AiChatResponse)
+def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
 
-    user_text = _normalize_text(body.text)
+    user_text = _normalize_text(body.text or "")
+    locale = (body.locale or "en").strip()
     thread_id = (body.thread_id or "default").strip() or "default"
-    locale = (body.locale or "en").strip() or "en"
 
     if not user_text:
-        return AiChatResponse(reply_text="Ask me something 🦜", thread_id=thread_id)
+        raise HTTPException(status_code=400, detail="text required")
 
-    if len(user_text) > USER_TEXT_MAX_CHARS:
-        user_text = _truncate(user_text, USER_TEXT_MAX_CHARS)
-
+    # Topic gate
     if not _is_allowed_topic(user_text):
-        return AiChatResponse(
-            reply_text=_topic_block_reply(user_text, locale),
-            blocked=True,
-            reason="topic_not_allowed",
-            thread_id=thread_id,
-        )
+        reply = _topic_block_reply(user_text, locale)
+        return AiChatResponse(reply_text=reply, blocked=True, reason="topic_blocked", thread_id=thread_id)
 
     intent = _infer_intent(user_text)
 
-    # load state + short summary
+    # Load state + summary
     state = _load_chat_state(uid, thread_id)
     summary = _get_summary(state)
 
-    # history from firestore only (IGNORE client body.history for safety + tokens)
-    persisted_history = _load_chat_history(uid, thread_id, limit=max(18, HISTORY_LIMIT))
+    # Load history from Firestore (ignored body.history for token economy)
+    history = _load_chat_history(uid, thread_id, limit=24)
 
-    # profile (trim)
-    profile = await _load_user_profile(uid)
-    user_context = _profile_context_compact(profile, intent)
+    # Load user profile
+    user_profile = {}
+    user_profile_raw = {}
+    try:
+        user_profile = asyncio.run(_load_user_profile(uid))  # type: ignore
+    except Exception:
+        # if event loop already exists (rare in some deployments), fallback to sync raw only
+        user_profile = _safe_profile_dict(_load_user_profile_raw(uid))
 
-    # astro short only if needed
-    astro_short = _compute_astro_short(profile) if intent == Intent.ASTRO else ""
+    user_profile_raw = _load_user_profile_raw(uid)
 
-    # build messages
-    messages = _build_messages_for_llm(
+    # MATCH command: /match <uid>
+    match_uid = None
+    match_profile = None
+    distance_km = None
+
+    if intent == Intent.MATCH:
+        match_uid = _parse_match_command(user_text)
+        if not match_uid:
+            reply = "Usage: /match <uid>"
+            return AiChatResponse(reply_text=reply, blocked=False, reason=None, thread_id=thread_id)
+
+        # Load match profile
+        match_profile = _safe_profile_dict(_load_user_profile_raw(match_uid))
+        match_profile_raw = _load_user_profile_raw(match_uid)
+
+        # Distance
+        distance_km = _distance_km_from_profiles(user_profile_raw, match_profile_raw)
+
+    # Build messages and call DeepSeek
+    msgs = _build_llm_messages(
         locale=locale,
         intent=intent,
-        user_context=user_context,
-        astro_short=astro_short,
         summary=summary,
-        history_rows=persisted_history,
+        user_profile=user_profile,
+        match_profile=match_profile,
+        distance_km=distance_km,
         user_text=user_text,
+        history=history,
     )
 
-    max_tokens = _pick_max_tokens(intent)
+    max_tokens = DS_MAX_TOKENS_DEFAULT
+    if intent == Intent.MATCH:
+        max_tokens = max(420, DS_MAX_TOKENS_DEFAULT)  # match breakdown needs more room
 
-    reply = await _call_deepseek(messages, max_tokens=max_tokens)
+    assistant_text = _deepseek_chat(msgs, max_tokens=max_tokens)
+    assistant_text = _extract_reply_safe(assistant_text)
 
-    # persist
-    now_iso = _now_iso()
-    now_ms = _now_ms()
-    _save_chat_message_batch(uid, thread_id, user_text, reply, now_iso, now_ms)
+    # Save messages
+    created_at_ms = _now_ms()
+    created_at_iso = _now_iso()
+    _save_chat_message_batch(uid, thread_id, user_text, assistant_text, created_at_iso, created_at_ms)
 
-    # update turn count + summary every N turns (cheap)
-    turn_count = state.get("turnCount")
+    # Summary update every N turns (cheap)
     try:
-        turn_count = int(turn_count) if turn_count is not None else 0
+        turns = int(state.get("turns") or 0)
     except Exception:
-        turn_count = 0
-    turn_count += 1
+        turns = 0
+    turns += 1
 
-    if (turn_count % max(1, SUMMARY_UPDATE_EVERY_TURNS)) == 0:
-        summary = _update_summary_from_turn(summary, user_text, reply, intent)
+    if turns % max(1, SUMMARY_UPDATE_EVERY_TURNS) == 0:
+        new_summary = _update_summary_from_turn(summary, user_text, assistant_text, intent)
+        _save_chat_state(uid, thread_id, {"summary": new_summary, "turns": turns})
+    else:
+        _save_chat_state(uid, thread_id, {"turns": turns})
 
-    _save_chat_state(uid, thread_id, {
-        "uid": uid,
-        "threadId": thread_id,
-        "updatedAtIso": now_iso,
-        "updatedAtMs": now_ms,
-        "turnCount": turn_count,
-        "summary": _truncate(summary, SUMMARY_MAX_CHARS),
-    })
+    return AiChatResponse(reply_text=assistant_text, blocked=False, reason=None, thread_id=thread_id)
 
-    logger.info(
-        f"[ai_chat] uid={uid} thread={thread_id} intent={intent} "
-        f"user_len={len(user_text)} hist={len(persisted_history)} "
-        f"ctx={'yes' if bool(user_context) else 'no'} astro={'yes' if bool(astro_short) else 'no'} "
-        f"max_tokens={max_tokens}"
-    )
 
-    return AiChatResponse(reply_text=reply, blocked=False, thread_id=thread_id)
+# =========================
+# HISTORY + RESET
+# =========================
+@app.get("/history", response_model=HistoryResponse)
+def history(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    tid = (thread_id or "default").strip() or "default"
+
+    rows = _load_chat_history(uid, tid, limit=40)
+    out: List[ChatTurn] = []
+    for r in rows:
+        role = (r.get("role") or "").strip()
+        txt = (r.get("content") or "").strip()
+        if role in ("user", "assistant") and txt:
+            out.append(ChatTurn(role=role, text=txt))
+
+    return HistoryResponse(thread_id=tid, messages=out)
+
+
+@app.post("/reset", response_model=ResetResponse)
+def reset(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    tid = (thread_id or "default").strip() or "default"
+
+    # Soft reset: set clearedAtMs
+    ms = _now_ms()
+    _save_chat_state(uid, tid, {"clearedAtMs": ms, "updatedAtMs": ms, "updatedAtIso": _now_iso()})
+    return ResetResponse(thread_id=tid, ok=True)
+
