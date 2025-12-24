@@ -40,17 +40,23 @@ DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 DEEPSEEK_MODEL = (os.getenv("DEEPSEEK_MODEL") or "deepseek-chat").strip()
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# token economy knobs
-DS_TEMPERATURE = float(os.getenv("DS_TEMPERATURE") or "0.65")
-DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "260")
+# =========================
+# ECONOMY KNOBS
+# =========================
+# chat (economy)
+DS_TEMPERATURE = float(os.getenv("DS_TEMPERATURE") or "0.78")
+DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "340")  # ✅ обычный чат экономный
 DS_TIMEOUT_SEC = int(os.getenv("DS_TIMEOUT_SEC") or "45")
+
+# match analysis (no artificial tight caps)
+DS_MAX_TOKENS_MATCH = int(os.getenv("DS_MAX_TOKENS_MATCH") or "1200")  # ✅ анализ матча жирный
 
 # prompt economy knobs
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT") or "8")
 HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")
-USER_TEXT_MAX_CHARS = int(os.getenv("USER_TEXT_MAX_CHARS") or "700")
+USER_TEXT_MAX_CHARS = int(os.getenv("USER_TEXT_MAX_CHARS") or "900")
 
-# summary memory knobs
+# summary memory knobs (cheap)
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS") or "650")
 SUMMARY_UPDATE_EVERY_TURNS = int(os.getenv("SUMMARY_UPDATE_EVERY_TURNS") or "6")
 
@@ -83,7 +89,7 @@ class AiChatRequest(BaseModel):
     locale: Optional[str] = "en"
     mode: Optional[str] = "shaadi_parrot"
     thread_id: Optional[str] = "default"
-    history: Optional[List[ChatTurn]] = None  # IGNORED for token economy
+    history: Optional[List[ChatTurn]] = None  # ignored on server (token economy)
 
 
 class AiChatResponse(BaseModel):
@@ -145,6 +151,7 @@ def health():
             "history_limit": HISTORY_LIMIT,
             "history_max_chars": HISTORY_MAX_CHARS,
             "max_tokens_default": DS_MAX_TOKENS_DEFAULT,
+            "max_tokens_match": DS_MAX_TOKENS_MATCH,
             "temperature": DS_TEMPERATURE,
         }
     }
@@ -226,7 +233,7 @@ def _topic_block_reply(user_text: str, locale: str) -> str:
 # INTENT (cheap)
 # =========================
 class Intent:
-    MATCH = "match"        # ✅ NEW
+    MATCH = "match"
     ASTRO = "astro"
     TEXTING = "texting"
     PROFILE = "profile"
@@ -246,7 +253,6 @@ def _parse_match_command(user_text: str) -> Optional[str]:
 
 
 def _infer_intent(user_text: str) -> str:
-    # ✅ command has priority
     if _parse_match_command(user_text):
         return Intent.MATCH
 
@@ -282,26 +288,28 @@ def _build_system_prompt(locale: str, intent: str) -> str:
     base = (
         "You are Shaadi Parrot 🦜: Indian-style dating coach + Vedic daily-fate assistant inside an app.\n"
         "Rules:\n"
-        "- Be warm, confident, practical.\n"
-        "- 1–2 emojis max.\n"
+        "- Be warm, confident, practical, a bit playful.\n"
+        "- Use 4–10 emojis TOTAL across the whole answer (not every line).\n"
         "- No markdown.\n"
-        "- Keep it concise. Prefer short bullets using '•'.\n"
+        "- Use short headings + bullets using '•'.\n"
+        "- Make it fun to read: vivid phrasing, mini-hooks, short punchy lines.\n"
         "- Never mention tokens, prompts, or internal system.\n"
     )
 
     if intent == Intent.MATCH:
         base += (
             "Task: produce a FULL 'match breakdown' for two users (USER + MATCH).\n"
-            "Structure (use short headings + bullets):\n"
+            "Structure (short headings + bullets):\n"
             "1) Quick vibe summary\n"
             "2) Strengths (why it can work)\n"
             "3) Friction points / red flags\n"
             "4) Indian-style compatibility (fun but respectful): family vibe, lifestyle, values, routines\n"
             "5) Vedic-style compatibility notes (based on provided ASTRO lines)\n"
             "6) Distance & logistics (based on distance_km)\n"
-            "7) Best conversation starters (3–6)\n"
+            "7) Best conversation starters (3–8)\n"
             "8) A 3-step first date plan\n"
-            "Output target: 35–70 short bullet lines total.\n"
+            "Finish with 1 verdict line: 'Worth it' or 'Proceed with caution' + 1 emoji.\n"
+            "Output target: 45–90 short bullet lines total.\n"
         )
     else:
         base += (
@@ -311,13 +319,13 @@ def _build_system_prompt(locale: str, intent: str) -> str:
         )
 
         if intent == Intent.TEXTING:
-            base += "Output target: 6–10 short bullet lines total.\n"
+            base += "Output target: 6–12 short bullet lines total.\n"
         elif intent == Intent.PROFILE:
-            base += "Output target: 8–12 bullet lines + 1 short sample bio.\n"
+            base += "Output target: 8–14 bullet lines + 1 short sample bio.\n"
         elif intent == Intent.ASTRO:
-            base += "Output target: 8–12 bullet lines.\n"
+            base += "Output target: 8–14 bullet lines.\n"
         else:
-            base += "Output target: 6–10 short bullet lines.\n"
+            base += "Output target: 6–12 short bullet lines.\n"
 
     if lang.startswith("ru"):
         base += "Reply in Russian.\n"
@@ -366,7 +374,7 @@ async def _load_user_profile(uid: str) -> Dict[str, Any]:
 
 def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
     """
-    ✅ raw profile for internal computations (lat/lon), NOT directly sent to LLM
+    raw profile for internal computations (lat/lon), NOT directly sent to LLM
     """
     if firestore_client is None:
         return {}
@@ -555,7 +563,7 @@ def _distance_km_from_profiles(raw_a: Dict[str, Any], raw_b: Dict[str, Any]) -> 
 
 
 # =========================
-# FIRESTORE CHAT STORAGE (unchanged)
+# FIRESTORE CHAT STORAGE
 # =========================
 def _safe_thread_id(thread_id: str) -> str:
     tid = (thread_id or "default").strip()
@@ -756,7 +764,7 @@ def _update_summary_from_turn(summary: str, user_text: str, assistant_text: str,
 
 
 # =========================
-# PHOTO MODERATION + FACE VERIFICATION (unchanged)
+# PHOTO MODERATION + FACE VERIFICATION
 # =========================
 _LIKELIHOOD = {
     "UNKNOWN": 0,
@@ -861,23 +869,12 @@ def _pick_largest_face(faces: List[vision.FaceAnnotation]) -> Optional[vision.Fa
     return best
 
 
-def _likelihood_name_to_int(name: str) -> int:
-    return int(_LIKELIHOOD.get((name or "UNKNOWN").strip().upper(), 0))
-
-
 def _face_quality_checks(face: vision.FaceAnnotation) -> Tuple[bool, str]:
-    """
-    Lightweight heuristics to reduce obvious junk:
-    - too tilted (roll/pan/tilt)
-    - too tiny face (area proxy threshold handled elsewhere)
-    - very low detection confidence
-    """
     try:
         conf = float(getattr(face, "detection_confidence", 0.0) or 0.0)
         if conf < 0.45:
             return False, "low_confidence"
 
-        # Vision angles are degrees
         roll = abs(float(getattr(face, "roll_angle", 0.0) or 0.0))
         pan = abs(float(getattr(face, "pan_angle", 0.0) or 0.0))
         tilt = abs(float(getattr(face, "tilt_angle", 0.0) or 0.0))
@@ -885,7 +882,6 @@ def _face_quality_checks(face: vision.FaceAnnotation) -> Tuple[bool, str]:
         if roll > 30 or pan > 30 or tilt > 30:
             return False, "face_too_angled"
 
-        # eyes open check (soft)
         left_open = getattr(face, "left_eye_open_probability", None)
         right_open = getattr(face, "right_eye_open_probability", None)
         if left_open is not None and right_open is not None:
@@ -930,9 +926,6 @@ def _detect_faces_and_safety_from_bytes(img_bytes: bytes):
 
 
 def _store_face_verified(uid: str, ok: bool, reason: str, meta: Dict[str, Any]) -> None:
-    """
-    Stores a minimal verification outcome.
-    """
     if firestore_client is None:
         return
     try:
@@ -951,7 +944,6 @@ def _store_face_verified(uid: str, ok: bool, reason: str, meta: Dict[str, Any]) 
 def verify_face(body: VerifyFaceRequest, authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
 
-    # Only allow self-verify
     target_uid = (body.user_id or "").strip()
     if not target_uid or target_uid != uid:
         raise HTTPException(status_code=403, detail="user_id must match auth uid")
@@ -963,7 +955,6 @@ def verify_face(body: VerifyFaceRequest, authorization: Optional[str] = Header(d
     img_bytes = _download_image_bytes(url, max_mb=10)
     adult, racy, violence, faces = _detect_faces_and_safety_from_bytes(img_bytes)
 
-    # Safety gates
     if _LIKELIHOOD.get(adult, 0) >= _LIKELIHOOD["LIKELY"]:
         _store_face_verified(uid, False, "adult_content", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
         return {"ok": False, "reason": "adult_content", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
@@ -980,15 +971,12 @@ def verify_face(body: VerifyFaceRequest, authorization: Optional[str] = Header(d
         _store_face_verified(uid, False, "no_face_detected", {"adult": adult, "racy": racy, "violence": violence, "faces": 0})
         return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": 0}
 
-    # Pick largest face and validate quality
     best = _pick_largest_face(faces)
     if best is None:
         _store_face_verified(uid, False, "no_face_detected", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
         return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
 
-    # Make sure the face isn't tiny
     area = _face_area_proxy(best)
-    # heuristic threshold (works as a proxy across common resolutions)
     if area < 18_000:
         _store_face_verified(uid, False, "face_too_small", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
         return {"ok": False, "reason": "face_too_small", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
@@ -1068,11 +1056,9 @@ def _build_llm_messages(
 
     msgs: List[Dict[str, str]] = [{"role": "system", "content": system}]
 
-    # summary memory (cheap)
     if summary:
         msgs.append({"role": "system", "content": f"SUMMARY_MEMORY: {_trim_text(summary, SUMMARY_MAX_CHARS)}"})
 
-    # compact profile context
     uctx = _profile_context_compact(user_profile, intent, prefix="USER")
     if uctx:
         msgs.append({"role": "system", "content": uctx})
@@ -1082,7 +1068,6 @@ def _build_llm_messages(
         if mctx:
             msgs.append({"role": "system", "content": mctx})
 
-        # extra signals for match mode
         ua = _compute_astro_short(user_profile, label="USER_ASTRO")
         ma = _compute_astro_short(match_profile, label="MATCH_ASTRO")
         if ua:
@@ -1092,27 +1077,53 @@ def _build_llm_messages(
         if distance_km is not None:
             msgs.append({"role": "system", "content": f"DISTANCE_KM: {int(distance_km)}"})
 
-    # history (already trimmed by loader and knobs)
     for h in (history or [])[-HISTORY_LIMIT:]:
         role = (h.get("role") or "").strip()
         content = _trim_text(h.get("content") or "", HISTORY_MAX_CHARS)
         if role in ("user", "assistant") and content:
             msgs.append({"role": role, "content": content})
 
-    # current turn
     msgs.append({"role": "user", "content": _trim_text(user_text, USER_TEXT_MAX_CHARS)})
     return msgs
+
+
+def _fix_trailing_garbage(txt: str) -> str:
+    t = (txt or "").strip()
+    if not t:
+        return t
+
+    lines = [x.rstrip() for x in t.splitlines()]
+    while lines:
+        last = lines[-1].strip()
+
+        if last in ("•", "-", "—", "\"", "“", "”", "''", "'"):
+            lines.pop()
+            continue
+
+        if last.startswith("•") and len(last.replace("•", "").strip()) == 0:
+            lines.pop()
+            continue
+
+        if len(last) <= 1:
+            lines.pop()
+            continue
+
+        break
+
+    return "\n".join(lines).strip()
 
 
 def _extract_reply_safe(txt: str) -> str:
     txt = (txt or "").strip()
     if not txt:
         return "…"
-    # No markdown requested
+
     txt = txt.replace("**", "").replace("```", "")
-    # Hard cap to keep mobile UI sane
-    if len(txt) > 1800:
-        txt = txt[:1800].rstrip() + "…"
+
+    # ✅ для UI: обычный чат ограничим мягко, а матч пусть будет длиннее
+    if len(txt) > 6500:
+        txt = txt[:6500].rstrip() + "…"
+
     return txt
 
 
@@ -1130,32 +1141,25 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     if not user_text:
         raise HTTPException(status_code=400, detail="text required")
 
-    # Topic gate
     if not _is_allowed_topic(user_text):
         reply = _topic_block_reply(user_text, locale)
         return AiChatResponse(reply_text=reply, blocked=True, reason="topic_blocked", thread_id=thread_id)
 
     intent = _infer_intent(user_text)
 
-    # Load state + summary
     state = _load_chat_state(uid, thread_id)
     summary = _get_summary(state)
-
-    # Load history from Firestore (ignored body.history for token economy)
     history = _load_chat_history(uid, thread_id, limit=24)
 
-    # Load user profile
     user_profile = {}
     user_profile_raw = {}
     try:
         user_profile = asyncio.run(_load_user_profile(uid))  # type: ignore
     except Exception:
-        # if event loop already exists (rare in some deployments), fallback to sync raw only
         user_profile = _safe_profile_dict(_load_user_profile_raw(uid))
 
     user_profile_raw = _load_user_profile_raw(uid)
 
-    # MATCH command: /match <uid>
     match_uid = None
     match_profile = None
     distance_km = None
@@ -1163,17 +1167,14 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     if intent == Intent.MATCH:
         match_uid = _parse_match_command(user_text)
         if not match_uid:
-            reply = "Usage: /match <uid>"
+            reply = "Используй так: /match <uid> 🦜"
             return AiChatResponse(reply_text=reply, blocked=False, reason=None, thread_id=thread_id)
 
-        # Load match profile
         match_profile = _safe_profile_dict(_load_user_profile_raw(match_uid))
         match_profile_raw = _load_user_profile_raw(match_uid)
 
-        # Distance
         distance_km = _distance_km_from_profiles(user_profile_raw, match_profile_raw)
 
-    # Build messages and call DeepSeek
     msgs = _build_llm_messages(
         locale=locale,
         intent=intent,
@@ -1185,19 +1186,19 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         history=history,
     )
 
+    # ✅ лимиты токенов: матч — жирно, чат — экономно
     max_tokens = DS_MAX_TOKENS_DEFAULT
     if intent == Intent.MATCH:
-        max_tokens = max(420, DS_MAX_TOKENS_DEFAULT)  # match breakdown needs more room
+        max_tokens = DS_MAX_TOKENS_MATCH
 
     assistant_text = _deepseek_chat(msgs, max_tokens=max_tokens)
     assistant_text = _extract_reply_safe(assistant_text)
+    assistant_text = _fix_trailing_garbage(assistant_text)
 
-    # Save messages
     created_at_ms = _now_ms()
     created_at_iso = _now_iso()
     _save_chat_message_batch(uid, thread_id, user_text, assistant_text, created_at_iso, created_at_ms)
 
-    # Summary update every N turns (cheap)
     try:
         turns = int(state.get("turns") or 0)
     except Exception:
@@ -1217,7 +1218,7 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
 # HISTORY + RESET
 # =========================
 @app.get("/history", response_model=HistoryResponse)
-def history(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
+def history_endpoint(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
     tid = (thread_id or "default").strip() or "default"
 
@@ -1233,12 +1234,10 @@ def history(thread_id: str = "default", authorization: Optional[str] = Header(de
 
 
 @app.post("/reset", response_model=ResetResponse)
-def reset(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
+def reset_endpoint(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
     tid = (thread_id or "default").strip() or "default"
 
-    # Soft reset: set clearedAtMs
     ms = _now_ms()
     _save_chat_state(uid, tid, {"clearedAtMs": ms, "updatedAtMs": ms, "updatedAtIso": _now_iso()})
     return ResetResponse(thread_id=tid, ok=True)
-
