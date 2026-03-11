@@ -49,7 +49,8 @@ DS_TIMEOUT_SEC = int(os.getenv("DS_TIMEOUT_SEC") or "45")
 
 DS_MAX_TOKENS_MATCH = int(os.getenv("DS_MAX_TOKENS_MATCH") or "1200")
 
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT") or "8")
+# Keep at least last 5 messages for conversational continuity.
+HISTORY_LIMIT = max(5, int(os.getenv("HISTORY_LIMIT") or "5"))
 HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")
 USER_TEXT_MAX_CHARS = int(os.getenv("USER_TEXT_MAX_CHARS") or "900")
 
@@ -253,6 +254,7 @@ def _infer_intent(user_text: str) -> str:
 
     astro_words = [
         "horoscope", "forecast", "daily fate", "vedic", "kundli", "nakshatra", "rashi",
+        "tomorrow", "tmr", "zodiac", "moon sign",
         "гороскоп", "прогноз", "сегодня", "ведичес", "накшатр", "раши", "кундли", "совместим"
     ]
     if any(w in t for w in astro_words):
@@ -274,6 +276,41 @@ def _infer_intent(user_text: str) -> str:
         return Intent.RELATION
 
     return Intent.GENERAL
+
+
+def _recent_history_has_astro(history: List[Dict[str, str]], lookback: int = 5) -> bool:
+    if not history:
+        return False
+
+    astro_markers = [
+        "horoscope", "forecast", "daily fate", "vedic", "nakshatra", "rashi", "zodiac",
+        "гороскоп", "прогноз", "накшат", "раши", "астро"
+    ]
+
+    tail = (history or [])[-max(1, lookback):]
+    for item in tail:
+        content = (item.get("content") or "").lower()
+        if any(m in content for m in astro_markers):
+            return True
+
+    return False
+
+
+def _infer_intent_with_history(user_text: str, history: List[Dict[str, str]]) -> str:
+    inferred = _infer_intent(user_text)
+    if inferred != Intent.GENERAL:
+        return inferred
+
+    t = (user_text or "").strip().lower()
+    if not t:
+        return inferred
+
+    # Follow-up short asks like "what about tomorrow" should keep astro context
+    follow_up_time_markers = ["tomorrow", "tmr", "next day", "завтра", "на завтра"]
+    if any(m in t for m in follow_up_time_markers) and _recent_history_has_astro(history, lookback=5):
+        return Intent.ASTRO
+
+    return inferred
 
 
 def _is_identity_question(user_text: str) -> bool:
@@ -322,6 +359,7 @@ def _build_system_prompt(locale: str, intent: str) -> str:
         "- Use short headings + bullets using '•'.\n"
         "- Make it fun to read: vivid phrasing, mini-hooks, short punchy lines.\n"
         "- Never mention tokens, prompts, or internal system.\n"
+        "- Default to a detailed, useful answer unless user explicitly asks for short.\n"
     )
 
     if intent == Intent.MATCH:
@@ -347,13 +385,13 @@ def _build_system_prompt(locale: str, intent: str) -> str:
         )
 
         if intent == Intent.TEXTING:
-            base += "Output target: 6–12 short bullet lines total.\n"
+            base += "Output target: 8–14 short bullet lines total.\n"
         elif intent == Intent.PROFILE:
-            base += "Output target: 8–14 bullet lines + 1 short sample bio.\n"
+            base += "Output target: 10–16 bullet lines + 1 short sample bio.\n"
         elif intent == Intent.ASTRO:
-            base += "Output target: 8–14 bullet lines.\n"
+            base += "Output target: 12–18 bullet lines with sections: Energy, Love, Work, Practical tips, Mantra.\n"
         else:
-            base += "Output target: 6–12 short bullet lines.\n"
+            base += "Output target: 9–15 short bullet lines.\n"
 
     if lang.startswith("ru"):
         base += "Reply in Russian.\n"
@@ -1375,11 +1413,11 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         reply = _topic_block_reply(user_text, locale)
         return AiChatResponse(reply_text=reply, blocked=True, reason="topic_blocked", thread_id=thread_id)
 
-    intent = _infer_intent(user_text)
-
     state = _load_chat_state(uid, thread_id)
     summary = _get_summary(state)
     history = _load_chat_history(uid, thread_id, limit=24)
+
+    intent = _infer_intent_with_history(user_text, history)
 
     user_profile: Dict[str, Any] = {}
     try:
