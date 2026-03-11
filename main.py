@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 import logging
 import os
 import re
@@ -43,20 +43,16 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 # =========================
 # ECONOMY KNOBS
 # =========================
-# chat (economy)
 DS_TEMPERATURE = float(os.getenv("DS_TEMPERATURE") or "0.78")
-DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "340")  # ✅ обычный чат экономный
+DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "340")
 DS_TIMEOUT_SEC = int(os.getenv("DS_TIMEOUT_SEC") or "45")
 
-# match analysis (no artificial tight caps)
-DS_MAX_TOKENS_MATCH = int(os.getenv("DS_MAX_TOKENS_MATCH") or "1200")  # ✅ анализ матча жирный
+DS_MAX_TOKENS_MATCH = int(os.getenv("DS_MAX_TOKENS_MATCH") or "1200")
 
-# prompt economy knobs
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT") or "8")
 HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")
 USER_TEXT_MAX_CHARS = int(os.getenv("USER_TEXT_MAX_CHARS") or "900")
 
-# summary memory knobs (cheap)
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS") or "650")
 SUMMARY_UPDATE_EVERY_TURNS = int(os.getenv("SUMMARY_UPDATE_EVERY_TURNS") or "6")
 
@@ -89,7 +85,7 @@ class AiChatRequest(BaseModel):
     locale: Optional[str] = "en"
     mode: Optional[str] = "shaadi_parrot"
     thread_id: Optional[str] = "default"
-    history: Optional[List[ChatTurn]] = None  # ignored on server (token economy)
+    history: Optional[List[ChatTurn]] = None  # ignored on server
 
 
 class AiChatResponse(BaseModel):
@@ -101,7 +97,7 @@ class AiChatResponse(BaseModel):
 
 class HistoryResponse(BaseModel):
     thread_id: str = "default"
-    messages: List[ChatTurn] = []
+    messages: List[ChatTurn] = Field(default_factory=list)
 
 
 class ResetResponse(BaseModel):
@@ -230,7 +226,7 @@ def _topic_block_reply(user_text: str, locale: str) -> str:
 
 
 # =========================
-# INTENT (cheap)
+# INTENT
 # =========================
 class Intent:
     MATCH = "match"
@@ -242,9 +238,6 @@ class Intent:
 
 
 def _parse_match_command(user_text: str) -> Optional[str]:
-    """
-    Accepts: "/match <uid>"
-    """
     t = (user_text or "").strip()
     m = re.match(r"^/match\s+([A-Za-z0-9_\-:]{6,})\s*$", t)
     if not m:
@@ -265,7 +258,10 @@ def _infer_intent(user_text: str) -> str:
     if any(w in t for w in astro_words):
         return Intent.ASTRO
 
-    texting_words = ["text", "message", "reply", "dm", "what to say", "как ответить", "сообщение", "ответ", "написать ей", "написать ему"]
+    texting_words = [
+        "text", "message", "reply", "dm", "what to say",
+        "как ответить", "сообщение", "ответ", "написать ей", "написать ему"
+    ]
     if any(w in t for w in texting_words):
         return Intent.TEXTING
 
@@ -358,18 +354,22 @@ def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
-async def _load_user_profile(uid: str) -> Dict[str, Any]:
+def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
     if firestore_client is None:
         return {}
     try:
         snap = firestore_client.collection("profiles").document(uid).get()
         if not snap.exists:
             return {}
-        raw = snap.to_dict() or {}
-        return _safe_profile_dict(raw)
+        return snap.to_dict() or {}
     except Exception:
-        logger.exception("Failed to load profiles/{uid}")
+        logger.exception("Failed to load profiles/{uid} raw")
         return {}
+
+
+async def _load_user_profile(uid: str) -> Dict[str, Any]:
+    raw = _load_user_profile_raw(uid)
+    return _safe_profile_dict(raw)
 
 
 def _merge_dicts_prefer_first(*dicts: Dict[str, Any]) -> Dict[str, Any]:
@@ -384,10 +384,6 @@ def _merge_dicts_prefer_first(*dicts: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _load_user_all_context(uid: str) -> Dict[str, Any]:
-    """
-    Collects user context from profiles + publicProfiles + users.
-    Public and user docs are merged in a safe form for LLM.
-    """
     if firestore_client is None:
         return {}
 
@@ -414,22 +410,6 @@ def _load_user_all_context(uid: str) -> Dict[str, Any]:
         return _safe_profile_dict(merged)
     except Exception:
         logger.exception("Failed to load full user context")
-        return {}
-
-
-def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
-    """
-    raw profile for internal computations (lat/lon), NOT directly sent to LLM
-    """
-    if firestore_client is None:
-        return {}
-    try:
-        snap = firestore_client.collection("profiles").document(uid).get()
-        if not snap.exists:
-            return {}
-        return snap.to_dict() or {}
-    except Exception:
-        logger.exception("Failed to load profiles/{uid} raw")
         return {}
 
 
@@ -509,7 +489,11 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     elif intent == Intent.ASTRO:
         keys = astro_keys
     elif intent == Intent.MATCH:
-        keys = list(dict.fromkeys(base_keys + ["bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "birthDate", "birthTime", "birthPlace", "birthCity", "birthCountry"]))
+        keys = list(dict.fromkeys(base_keys + [
+            "bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking",
+            "education", "jobTitle", "occupation", "birthDate", "birthTime",
+            "birthPlace", "birthCity", "birthCountry"
+        ]))
     else:
         keys = base_keys + ["interests"]
 
@@ -528,7 +512,7 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
 
 
 # =========================
-# ASTRO (SHORT)
+# ASTRO
 # =========================
 _ZODIAC = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -536,10 +520,11 @@ _ZODIAC = [
 ]
 
 _NAKSHATRAS = [
-    "Ashwini","Bharani","Krittika","Rohini","Mrigashirsha","Ardra","Punarvasu","Pushya","Ashlesha",
-    "Magha","Purva Phalguni","Uttara Phalguni","Hasta","Chitra","Swati","Vishakha","Anuradha","Jyeshtha",
-    "Mula","Purva Ashadha","Uttara Ashadha","Shravana","Dhanishta","Shatabhisha","Purva Bhadrapada","Uttara Bhadrapada","Revati"
+    "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashirsha", "Ardra", "Punarvasu", "Pushya", "Ashlesha",
+    "Magha", "Purva Phalguni", "Uttara Phalguni", "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
+    "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta", "Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati"
 ]
+
 
 def _parse_birth_date(profile: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
     raw = profile.get("birthDate")
@@ -611,7 +596,7 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2) ** 2
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
@@ -661,7 +646,10 @@ def _chat_doc_ref(uid: str, thread_id: str):
 def _chat_msgs_col_ref(uid: str, thread_id: str):
     if firestore_client is None:
         return None
-    return _chat_doc_ref(uid, thread_id).collection("messages")
+    docref = _chat_doc_ref(uid, thread_id)
+    if docref is None:
+        return None
+    return docref.collection("messages")
 
 
 def _now_ms() -> int:
@@ -744,6 +732,66 @@ def _save_chat_message_batch(
         logger.exception("Failed to batch save chat messages")
 
 
+def _looks_like_legacy_prompt_dump(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    markers = [
+        "USER_CONTEXT:",
+        "MATCH_CONTEXT:",
+        "SUMMARY_MEMORY:",
+        "USER_ASTRO:",
+        "MATCH_ASTRO:",
+        "DISTANCE_KM:",
+        "[USER_MESSAGE]",
+        "photoPaths=",
+        "photoUrls=",
+        "updatedAtIso=",
+        "firebase",
+        "firebasestorage.googleapis.com",
+    ]
+
+    marker_hits = sum(1 for m in markers if m.lower() in t.lower())
+    pipe_count = t.count("|")
+    eq_count = t.count("=")
+
+    if marker_hits >= 2:
+        return True
+    if pipe_count >= 6 and eq_count >= 8:
+        return True
+    return False
+
+
+def _sanitize_legacy_history_text(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    if "[USER_MESSAGE]" in t:
+        tail = t.split("[USER_MESSAGE]", 1)[1].strip()
+        if tail:
+            return _trim_text(_normalize_text(tail), 600)
+
+    if _looks_like_legacy_prompt_dump(t):
+        return ""
+
+    t = re.sub(r"\s+", " ", t).strip()
+    return _trim_text(t, 1200)
+
+
+def _read_message_text(doc: Dict[str, Any]) -> str:
+    if not isinstance(doc, dict):
+        return ""
+
+    for key in ("text", "content", "message", "reply_text"):
+        val = doc.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    return ""
+
+
 def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[str, str]]:
     col = _chat_msgs_col_ref(uid, thread_id)
     if col is None:
@@ -763,7 +811,7 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[s
         for s in snaps:
             d = s.to_dict() or {}
             role = (d.get("role") or "").strip()
-            text = (d.get("text") or "").strip()
+            text = _sanitize_legacy_history_text(_read_message_text(d))
             ms = d.get("createdAtMs")
             try:
                 ms = int(ms) if ms is not None else 0
@@ -773,6 +821,8 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[s
             if not role or not text:
                 continue
             if cleared_ms and ms and ms <= cleared_ms:
+                continue
+            if role not in ("user", "assistant"):
                 continue
 
             rows.append({"role": role, "content": text})
@@ -785,7 +835,7 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[s
 
 
 # =========================
-# SUMMARY MEMORY (cheap, no LLM)
+# SUMMARY MEMORY
 # =========================
 def _get_summary(state: Dict[str, Any]) -> str:
     s = state.get("summary")
@@ -844,6 +894,7 @@ _LIKELIHOOD = {
     "LIKELY": 4,
     "VERY_LIKELY": 5,
 }
+
 
 @app.post("/verify-photo")
 def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header(default=None)):
@@ -1086,7 +1137,7 @@ def _deepseek_chat(messages: List[Dict[str, str]], max_tokens: int) -> str:
         raise HTTPException(status_code=502, detail=f"DeepSeek request error: {type(e).__name__}")
 
     if r.status_code != 200:
-        logger.error("DeepSeek non-200: %s %s", r.status_code, (r.text or "")[:400])
+        logger.error("DeepSeek non-200: %s %s", r.status_code, (r.text or "")[:500])
         raise HTTPException(status_code=502, detail=f"DeepSeek error HTTP {r.status_code}")
 
     try:
@@ -1099,7 +1150,7 @@ def _deepseek_chat(messages: List[Dict[str, str]], max_tokens: int) -> str:
         txt = (data["choices"][0]["message"]["content"] or "").strip()
         return txt
     except Exception:
-        logger.exception("DeepSeek response shape unexpected: %s", str(data)[:400])
+        logger.exception("DeepSeek response shape unexpected: %s", str(data)[:500])
         raise HTTPException(status_code=502, detail="DeepSeek response invalid")
 
 
@@ -1190,11 +1241,42 @@ def _extract_reply_safe(txt: str) -> str:
 
     txt = txt.replace("**", "").replace("```", "")
 
-    # ✅ для UI: обычный чат ограничим мягко, а матч пусть будет длиннее
     if len(txt) > 6500:
         txt = txt[:6500].rstrip() + "…"
 
     return txt
+
+
+def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any]) -> str:
+    text = (reply_text or "").strip()
+    if not text:
+        return text
+
+    birth_date = (user_profile.get("birthDate") or "").strip() if isinstance(user_profile.get("birthDate"), str) else ""
+    birth_time = (user_profile.get("birthTime") or "").strip() if isinstance(user_profile.get("birthTime"), str) else ""
+    birth_place = (
+        (user_profile.get("birthPlace") or user_profile.get("birthCity") or "").strip()
+        if isinstance(user_profile.get("birthPlace") or user_profile.get("birthCity") or "", str)
+        else ""
+    )
+
+    has_birth_date = bool(birth_date)
+    missing_time_or_place = not birth_time or not birth_place
+
+    lower = text.lower()
+    astroish = any(k in lower for k in [
+        "horoscope", "vedic", "nakshatra", "rashi", "moon", "venus", "cosmic",
+        "астро", "гороскоп", "накшатра", "раши", "венера", "луна"
+    ])
+
+    if astroish and has_birth_date and missing_time_or_place:
+        hint = (
+            "\n\nRemember, for a more precise reading next time, add your birth time and place in your profile 🪐"
+        )
+        if len(text) + len(hint) <= 6900 and "birth time and place" not in lower:
+            text += hint
+
+    return text
 
 
 # =========================
@@ -1221,10 +1303,9 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     summary = _get_summary(state)
     history = _load_chat_history(uid, thread_id, limit=24)
 
-    user_profile = {}
-    user_profile_raw = {}
+    user_profile: Dict[str, Any] = {}
     try:
-        user_profile = asyncio.run(_load_user_profile(uid))  # type: ignore
+        user_profile = asyncio.run(_load_user_profile(uid))
     except Exception:
         user_profile = _safe_profile_dict(_load_user_profile_raw(uid))
 
@@ -1246,7 +1327,6 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
 
         match_profile = _load_user_all_context(match_uid)
         match_profile_raw = _load_user_all_context_raw(match_uid)
-
         distance_km = _distance_km_from_profiles(user_profile_raw, match_profile_raw)
 
     msgs = _build_llm_messages(
@@ -1260,7 +1340,6 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         history=history,
     )
 
-    # ✅ лимиты токенов: матч — жирно, чат — экономно
     max_tokens = DS_MAX_TOKENS_DEFAULT
     if intent == Intent.MATCH:
         max_tokens = DS_MAX_TOKENS_MATCH
@@ -1301,7 +1380,7 @@ def history_endpoint(thread_id: str = "default", authorization: Optional[str] = 
     out: List[ChatTurn] = []
     for r in rows:
         role = (r.get("role") or "").strip()
-        txt = (r.get("content") or "").strip()
+        txt = _sanitize_legacy_history_text((r.get("content") or "").strip())
         if role in ("user", "assistant") and txt:
             out.append(ChatTurn(role=role, text=txt))
 
