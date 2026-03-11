@@ -252,7 +252,7 @@ def _infer_intent(user_text: str) -> str:
     t = (user_text or "").lower()
 
     astro_words = [
-        "horoscope", "forecast", "today", "daily fate", "vedic", "kundli", "nakshatra", "rashi",
+        "horoscope", "forecast", "daily fate", "vedic", "kundli", "nakshatra", "rashi",
         "гороскоп", "прогноз", "сегодня", "ведичес", "накшатр", "раши", "кундли", "совместим"
     ]
     if any(w in t for w in astro_words):
@@ -274,6 +274,38 @@ def _infer_intent(user_text: str) -> str:
         return Intent.RELATION
 
     return Intent.GENERAL
+
+
+def _is_identity_question(user_text: str) -> bool:
+    t = (user_text or "").strip().lower()
+    if not t:
+        return False
+
+    markers = [
+        "who are you", "what are you", "who r u", "what can you do",
+        "кто ты", "ты кто", "что ты умеешь", "чем ты можешь помочь"
+    ]
+    return any(m in t for m in markers)
+
+
+def _identity_reply(locale: str) -> str:
+    lang = (locale or "en").strip().lower()
+    if lang.startswith("ru"):
+        return (
+            "Я Shaadi Parrot 🦜\n"
+            "• Помогаю с общением в дейтинге и отношениях\n"
+            "• Делаю разборы мэтчей и идеи для первого шага\n"
+            "• Даю ведические daily-fate подсказки\n"
+            "Напиши, что сейчас происходит — разберём по шагам ✨"
+        )
+
+    return (
+        "I’m Shaadi Parrot 🦜\n"
+        "• I help with dating chats and relationship advice\n"
+        "• I do match breakdowns and first-message ideas\n"
+        "• I give Vedic-style daily fate guidance\n"
+        "Tell me what’s happening, and I’ll break it down step by step ✨"
+    )
 
 
 # =========================
@@ -581,14 +613,14 @@ def _compute_astro_short(profile: Dict[str, Any], label: str = "ASTRO") -> str:
 # =========================
 # DISTANCE
 # =========================
-def _try_get_float(d: Dict[str, Any], key: str) -> float:
+def _try_get_float(d: Dict[str, Any], key: str) -> Optional[float]:
     v = d.get(key)
     if v is None:
-        return 0.0
+        return None
     try:
         return float(v)
     except Exception:
-        return 0.0
+        return None
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -606,8 +638,12 @@ def _distance_km_from_profiles(raw_a: Dict[str, Any], raw_b: Dict[str, Any]) -> 
     lon1 = _try_get_float(raw_a, "lon")
     lat2 = _try_get_float(raw_b, "lat")
     lon2 = _try_get_float(raw_b, "lon")
-    if not lat1 or not lon1 or not lat2 or not lon2:
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
         return None
+
+    if not (-90.0 <= lat1 <= 90.0 and -180.0 <= lon1 <= 180.0 and -90.0 <= lat2 <= 90.0 and -180.0 <= lon2 <= 180.0):
+        return None
+
     try:
         km = _haversine_km(lat1, lon1, lat2, lon2)
         if km < 0:
@@ -1154,6 +1190,44 @@ def _deepseek_chat(messages: List[Dict[str, str]], max_tokens: int) -> str:
         raise HTTPException(status_code=502, detail="DeepSeek response invalid")
 
 
+def _normalize_for_duplicate_check(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s]+", "", t)
+    return t
+
+
+def _last_assistant_text(history: List[Dict[str, str]]) -> str:
+    for item in reversed(history or []):
+        role = (item.get("role") or "").strip()
+        if role != "assistant":
+            continue
+        content = (item.get("content") or "").strip()
+        if content:
+            return content
+    return ""
+
+
+def _looks_repetitive_reply(candidate: str, history: List[Dict[str, str]]) -> bool:
+    prev = _last_assistant_text(history)
+    if not prev:
+        return False
+
+    a = _normalize_for_duplicate_check(candidate)
+    b = _normalize_for_duplicate_check(prev)
+    if not a or not b:
+        return False
+
+    if a == b:
+        return True
+
+    min_len = min(len(a), len(b))
+    if min_len >= 120 and (a in b or b in a):
+        return True
+
+    return False
+
+
 def _trim_text(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     if not s:
@@ -1247,9 +1321,12 @@ def _extract_reply_safe(txt: str) -> str:
     return txt
 
 
-def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any]) -> str:
+def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any], intent: str, history: List[Dict[str, str]]) -> str:
     text = (reply_text or "").strip()
     if not text:
+        return text
+
+    if intent != Intent.ASTRO:
         return text
 
     birth_date = (user_profile.get("birthDate") or "").strip() if isinstance(user_profile.get("birthDate"), str) else ""
@@ -1273,7 +1350,8 @@ def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any]
         hint = (
             "\n\nRemember, for a more precise reading next time, add your birth time and place in your profile 🪐"
         )
-        if len(text) + len(hint) <= 6900 and "birth time and place" not in lower:
+        prev_assistant = (_last_assistant_text(history) or "").lower()
+        if len(text) + len(hint) <= 6900 and "birth time and place" not in lower and "birth time and place" not in prev_assistant:
             text += hint
 
     return text
@@ -1344,10 +1422,25 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     if intent == Intent.MATCH:
         max_tokens = DS_MAX_TOKENS_MATCH
 
-    assistant_text = _deepseek_chat(msgs, max_tokens=max_tokens)
-    assistant_text = _extract_reply_safe(assistant_text)
-    assistant_text = _fix_trailing_garbage(assistant_text)
-    assistant_text = _append_profile_hint_if_needed(assistant_text, user_profile)
+    if _is_identity_question(user_text):
+        assistant_text = _identity_reply(locale)
+    else:
+        assistant_text = _deepseek_chat(msgs, max_tokens=max_tokens)
+        assistant_text = _extract_reply_safe(assistant_text)
+        assistant_text = _fix_trailing_garbage(assistant_text)
+
+        if _looks_repetitive_reply(assistant_text, history):
+            retry_msgs = list(msgs)
+            retry_msgs.append({
+                "role": "system",
+                "content": "Previous draft repeats older assistant text. Rewrite with fresh wording and directly answer the latest user message. Do not copy previous paragraphs."
+            })
+            retry_text = _deepseek_chat(retry_msgs, max_tokens=max_tokens)
+            retry_text = _fix_trailing_garbage(_extract_reply_safe(retry_text))
+            if retry_text and not _looks_repetitive_reply(retry_text, history):
+                assistant_text = retry_text
+
+    assistant_text = _append_profile_hint_if_needed(assistant_text, user_profile, intent, history)
 
     created_at_ms = _now_ms()
     created_at_iso = _now_iso()
