@@ -372,6 +372,51 @@ async def _load_user_profile(uid: str) -> Dict[str, Any]:
         return {}
 
 
+def _merge_dicts_prefer_first(*dicts: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        for k, v in d.items():
+            if k not in out and v is not None:
+                out[k] = v
+    return out
+
+
+def _load_user_all_context(uid: str) -> Dict[str, Any]:
+    """
+    Collects user context from profiles + publicProfiles + users.
+    Public and user docs are merged in a safe form for LLM.
+    """
+    if firestore_client is None:
+        return {}
+
+    try:
+        profile_raw = _load_user_profile_raw(uid)
+        public_raw: Dict[str, Any] = {}
+        user_raw: Dict[str, Any] = {}
+
+        try:
+            s = firestore_client.collection("publicProfiles").document(uid).get()
+            if s.exists:
+                public_raw = s.to_dict() or {}
+        except Exception:
+            logger.exception("Failed to load publicProfiles/{uid}")
+
+        try:
+            s = firestore_client.collection("users").document(uid).get()
+            if s.exists:
+                user_raw = s.to_dict() or {}
+        except Exception:
+            logger.exception("Failed to load users/{uid}")
+
+        merged = _merge_dicts_prefer_first(profile_raw, public_raw, user_raw)
+        return _safe_profile_dict(merged)
+    except Exception:
+        logger.exception("Failed to load full user context")
+        return {}
+
+
 def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
     """
     raw profile for internal computations (lat/lon), NOT directly sent to LLM
@@ -386,6 +431,31 @@ def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
     except Exception:
         logger.exception("Failed to load profiles/{uid} raw")
         return {}
+
+
+def _load_user_all_context_raw(uid: str) -> Dict[str, Any]:
+    if firestore_client is None:
+        return {}
+
+    profile_raw = _load_user_profile_raw(uid)
+    public_raw: Dict[str, Any] = {}
+    user_raw: Dict[str, Any] = {}
+
+    try:
+        s = firestore_client.collection("publicProfiles").document(uid).get()
+        if s.exists:
+            public_raw = s.to_dict() or {}
+    except Exception:
+        logger.exception("Failed to load publicProfiles/{uid} raw")
+
+    try:
+        s = firestore_client.collection("users").document(uid).get()
+        if s.exists:
+            user_raw = s.to_dict() or {}
+    except Exception:
+        logger.exception("Failed to load users/{uid} raw")
+
+    return _merge_dicts_prefer_first(profile_raw, public_raw, user_raw)
 
 
 def _flatten_value(v: Any, max_len: int = 120) -> str:
@@ -430,7 +500,7 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     base_keys = ["firstName", "age", "gender", "cityName", "countryName", "relationshipIntent", "languages"]
     texting_keys = base_keys + ["bio", "aboutMe", "interests", "workout", "smoking", "drinking"]
     profile_keys = base_keys + ["interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "bio", "aboutMe"]
-    astro_keys = base_keys + ["birthDate", "birthTime"]
+    astro_keys = base_keys + ["birthDate", "birthTime", "birthPlace", "birthCity", "birthCountry", "interests"]
 
     if intent == Intent.TEXTING:
         keys = texting_keys
@@ -439,7 +509,7 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     elif intent == Intent.ASTRO:
         keys = astro_keys
     elif intent == Intent.MATCH:
-        keys = list(dict.fromkeys(base_keys + ["bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "birthDate", "birthTime"]))
+        keys = list(dict.fromkeys(base_keys + ["bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "birthDate", "birthTime", "birthPlace", "birthCity", "birthCountry"]))
     else:
         keys = base_keys + ["interests"]
 
@@ -1158,7 +1228,11 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     except Exception:
         user_profile = _safe_profile_dict(_load_user_profile_raw(uid))
 
-    user_profile_raw = _load_user_profile_raw(uid)
+    full_ctx = _load_user_all_context(uid)
+    if full_ctx:
+        user_profile = _merge_dicts_prefer_first(user_profile, full_ctx)
+
+    user_profile_raw = _load_user_all_context_raw(uid)
 
     match_uid = None
     match_profile = None
@@ -1167,11 +1241,11 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     if intent == Intent.MATCH:
         match_uid = _parse_match_command(user_text)
         if not match_uid:
-            reply = "Используй так: /match <uid> 🦜"
+            reply = "Use this format: /match <uid> 🦜"
             return AiChatResponse(reply_text=reply, blocked=False, reason=None, thread_id=thread_id)
 
-        match_profile = _safe_profile_dict(_load_user_profile_raw(match_uid))
-        match_profile_raw = _load_user_profile_raw(match_uid)
+        match_profile = _load_user_all_context(match_uid)
+        match_profile_raw = _load_user_all_context_raw(match_uid)
 
         distance_km = _distance_km_from_profiles(user_profile_raw, match_profile_raw)
 
@@ -1194,6 +1268,7 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     assistant_text = _deepseek_chat(msgs, max_tokens=max_tokens)
     assistant_text = _extract_reply_safe(assistant_text)
     assistant_text = _fix_trailing_garbage(assistant_text)
+    assistant_text = _append_profile_hint_if_needed(assistant_text, user_profile)
 
     created_at_ms = _now_ms()
     created_at_iso = _now_iso()
