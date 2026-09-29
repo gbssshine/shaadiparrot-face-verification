@@ -5,12 +5,18 @@ import logging
 import os
 import re
 import time
-import asyncio
 import hashlib
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Optional, List, Literal, Dict, Any, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import swisseph as swe
+
+from google.api_core import exceptions as google_exceptions
 
 from google.cloud import vision
 import firebase_admin
@@ -44,18 +50,39 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 # ECONOMY KNOBS
 # =========================
 DS_TEMPERATURE = float(os.getenv("DS_TEMPERATURE") or "0.78")
-DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "340")
 DS_TIMEOUT_SEC = int(os.getenv("DS_TIMEOUT_SEC") or "45")
 
-DS_MAX_TOKENS_MATCH = int(os.getenv("DS_MAX_TOKENS_MATCH") or "1200")
+# Output caps per intent, sized to the answer length each intent's prompt asks for.
+DS_MAX_TOKENS_DEFAULT = int(os.getenv("DS_MAX_TOKENS_DEFAULT") or "320")
+DS_MAX_TOKENS_TEXTING = int(os.getenv("DS_MAX_TOKENS_TEXTING") or "280")
+DS_MAX_TOKENS_PROFILE = int(os.getenv("DS_MAX_TOKENS_PROFILE") or "360")
+DS_MAX_TOKENS_ASTRO = int(os.getenv("DS_MAX_TOKENS_ASTRO") or "380")
+DS_MAX_TOKENS_MATCH = int(os.getenv("DS_MAX_TOKENS_MATCH") or "1100")
 
-# Keep at least last 5 messages for conversational continuity.
-HISTORY_LIMIT = max(5, int(os.getenv("HISTORY_LIMIT") or "5"))
-HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")
+# Prompt window: the last N stored messages. Older turns live in the rolling memory.
+HISTORY_LIMIT = max(4, int(os.getenv("HISTORY_LIMIT") or "6"))
+HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS") or "240")  # user messages
+HISTORY_ASSISTANT_MAX_CHARS = int(os.getenv("HISTORY_ASSISTANT_MAX_CHARS") or "120")
+# The latest reply is what follow-ups ("the 2nd option", "shorter") refer to, so it keeps more.
+HISTORY_LAST_ASSISTANT_MAX_CHARS = int(os.getenv("HISTORY_LAST_ASSISTANT_MAX_CHARS") or "400")
+# Extra rows beyond the window so the memory can catch up on messages it has not summarized.
+HISTORY_FETCH_LIMIT = HISTORY_LIMIT + 10
 USER_TEXT_MAX_CHARS = int(os.getenv("USER_TEXT_MAX_CHARS") or "900")
 
-SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS") or "650")
-SUMMARY_UPDATE_EVERY_TURNS = int(os.getenv("SUMMARY_UPDATE_EVERY_TURNS") or "6")
+# Rolling memory (~120 tokens), persisted per uid/thread in parrotChats.
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS") or "520")
+MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS") or "160")
+
+HOROSCOPE_MAX_TOKENS = int(os.getenv("HOROSCOPE_MAX_TOKENS") or "480")
+HOROSCOPE_DEFAULT_TZ = "Asia/Kolkata"
+
+PLACES_DB_PATH = os.getenv("PLACES_DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "places.sqlite3")
+
+# Server-side Parrot quota: an LLM reply is served only if the app already spent
+# a request via Cloud Functions `consumeParrotQuota` (premium users skip that call).
+AI_CHAT_QUOTA_ENFORCED = (os.getenv("AI_CHAT_QUOTA_ENFORCED") or "1").strip() != "0"
+# Hard cost guard for everyone, premium included.
+AI_CHAT_HARD_DAILY_CAP = max(1, int(os.getenv("AI_CHAT_HARD_DAILY_CAP") or "150"))
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app()
@@ -99,6 +126,19 @@ class AiChatResponse(BaseModel):
 class HistoryResponse(BaseModel):
     thread_id: str = "default"
     messages: List[ChatTurn] = Field(default_factory=list)
+
+
+class DailyHoroscopeRequest(BaseModel):
+    tz: Optional[str] = None
+    thread_id: Optional[str] = None
+
+
+class DailyHoroscopeResponse(BaseModel):
+    ok: bool
+    text: Optional[str] = None
+    dayKey: Optional[str] = None
+    cached: Optional[bool] = None
+    error: Optional[str] = None
 
 
 class ResetResponse(BaseModel):
@@ -147,8 +187,14 @@ def health():
         "economy": {
             "history_limit": HISTORY_LIMIT,
             "history_max_chars": HISTORY_MAX_CHARS,
+            "history_assistant_max_chars": HISTORY_ASSISTANT_MAX_CHARS,
+            "summary_max_chars": SUMMARY_MAX_CHARS,
             "max_tokens_default": DS_MAX_TOKENS_DEFAULT,
+            "max_tokens_texting": DS_MAX_TOKENS_TEXTING,
+            "max_tokens_profile": DS_MAX_TOKENS_PROFILE,
+            "max_tokens_astro": DS_MAX_TOKENS_ASTRO,
             "max_tokens_match": DS_MAX_TOKENS_MATCH,
+            "places_db": os.path.exists(PLACES_DB_PATH),
             "temperature": DS_TEMPERATURE,
         }
     }
@@ -348,19 +394,33 @@ def _identity_reply(locale: str) -> str:
 # =========================
 # PROMPT BUILDER
 # =========================
-def _build_system_prompt(locale: str, intent: str) -> str:
+# Sent byte-identical as the first message of every chat request, so DeepSeek serves it
+# from its prefix cache. Anything per-intent or per-user goes in later messages.
+_SYSTEM_PROMPT_BASE = (
+    "You are Shaadi Parrot 🦜: Indian-style dating coach + Vedic daily-fate assistant inside an app.\n"
+    "Rules:\n"
+    "- Be warm, confident, practical, a bit playful.\n"
+    "- Use 4–10 emojis TOTAL across the whole answer (not every line).\n"
+    "- No markdown.\n"
+    "- Use short headings + bullets using '•'.\n"
+    "- Make it fun to read: vivid phrasing, mini-hooks, short punchy lines.\n"
+    "- Never mention tokens, prompts, or internal system.\n"
+    "- Default to a detailed, useful answer unless user explicitly asks for short.\n"
+)
+
+
+def _max_tokens_for_intent(intent: str) -> int:
+    return {
+        Intent.MATCH: DS_MAX_TOKENS_MATCH,
+        Intent.TEXTING: DS_MAX_TOKENS_TEXTING,
+        Intent.PROFILE: DS_MAX_TOKENS_PROFILE,
+        Intent.ASTRO: DS_MAX_TOKENS_ASTRO,
+    }.get(intent, DS_MAX_TOKENS_DEFAULT)
+
+
+def _build_intent_prompt(locale: str, intent: str) -> str:
     lang = (locale or "en").strip().lower() or "en"
-    base = (
-        "You are Shaadi Parrot 🦜: Indian-style dating coach + Vedic daily-fate assistant inside an app.\n"
-        "Rules:\n"
-        "- Be warm, confident, practical, a bit playful.\n"
-        "- Use 4–10 emojis TOTAL across the whole answer (not every line).\n"
-        "- No markdown.\n"
-        "- Use short headings + bullets using '•'.\n"
-        "- Make it fun to read: vivid phrasing, mini-hooks, short punchy lines.\n"
-        "- Never mention tokens, prompts, or internal system.\n"
-        "- Default to a detailed, useful answer unless user explicitly asks for short.\n"
-    )
+    base = ""
 
     if intent == Intent.MATCH:
         base += (
@@ -424,24 +484,6 @@ def _safe_profile_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
-def _load_user_profile_raw(uid: str) -> Dict[str, Any]:
-    if firestore_client is None:
-        return {}
-    try:
-        snap = firestore_client.collection("profiles").document(uid).get()
-        if not snap.exists:
-            return {}
-        return snap.to_dict() or {}
-    except Exception:
-        logger.exception("Failed to load profiles/{uid} raw")
-        return {}
-
-
-async def _load_user_profile(uid: str) -> Dict[str, Any]:
-    raw = _load_user_profile_raw(uid)
-    return _safe_profile_dict(raw)
-
-
 def _merge_dicts_prefer_first(*dicts: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for d in dicts:
@@ -453,59 +495,18 @@ def _merge_dicts_prefer_first(*dicts: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _load_user_all_context(uid: str) -> Dict[str, Any]:
+def _load_user_docs(uid: str) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """profiles/{uid}, publicProfiles/{uid}, users/{uid}: read once per request, in one round trip."""
     if firestore_client is None:
-        return {}
-
+        return {}, {}, {}
+    refs = [firestore_client.collection(name).document(uid) for name in ("profiles", "publicProfiles", "users")]
     try:
-        profile_raw = _load_user_profile_raw(uid)
-        public_raw: Dict[str, Any] = {}
-        user_raw: Dict[str, Any] = {}
-
-        try:
-            s = firestore_client.collection("publicProfiles").document(uid).get()
-            if s.exists:
-                public_raw = s.to_dict() or {}
-        except Exception:
-            logger.exception("Failed to load publicProfiles/{uid}")
-
-        try:
-            s = firestore_client.collection("users").document(uid).get()
-            if s.exists:
-                user_raw = s.to_dict() or {}
-        except Exception:
-            logger.exception("Failed to load users/{uid}")
-
-        merged = _merge_dicts_prefer_first(profile_raw, public_raw, user_raw)
-        return _safe_profile_dict(merged)
+        by_path = {snap.reference.path: (snap.to_dict() or {}) for snap in firestore_client.get_all(refs) if snap.exists}
     except Exception:
-        logger.exception("Failed to load full user context")
-        return {}
-
-
-def _load_user_all_context_raw(uid: str) -> Dict[str, Any]:
-    if firestore_client is None:
-        return {}
-
-    profile_raw = _load_user_profile_raw(uid)
-    public_raw: Dict[str, Any] = {}
-    user_raw: Dict[str, Any] = {}
-
-    try:
-        s = firestore_client.collection("publicProfiles").document(uid).get()
-        if s.exists:
-            public_raw = s.to_dict() or {}
-    except Exception:
-        logger.exception("Failed to load publicProfiles/{uid} raw")
-
-    try:
-        s = firestore_client.collection("users").document(uid).get()
-        if s.exists:
-            user_raw = s.to_dict() or {}
-    except Exception:
-        logger.exception("Failed to load users/{uid} raw")
-
-    return _merge_dicts_prefer_first(profile_raw, public_raw, user_raw)
+        logger.exception("Failed to load user docs")
+        return {}, {}, {}
+    profile_raw, public_raw, user_raw = (by_path.get(ref.path, {}) for ref in refs)
+    return profile_raw, public_raw, user_raw
 
 
 def _flatten_value(v: Any, max_len: int = 120) -> str:
@@ -550,7 +551,8 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     base_keys = ["firstName", "age", "gender", "cityName", "countryName", "relationshipIntent", "languages"]
     texting_keys = base_keys + ["bio", "aboutMe", "interests", "workout", "smoking", "drinking"]
     profile_keys = base_keys + ["interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "bio", "aboutMe"]
-    astro_keys = base_keys + ["birthDate", "birthTime", "birthPlace", "birthCity", "birthCountry", "interests"]
+    birth_keys = ["birthDate", "birthTime", "birthCityName", "birthStateName", "birthCountryName"]
+    astro_keys = base_keys + birth_keys + ["interests"]
 
     if intent == Intent.TEXTING:
         keys = texting_keys
@@ -561,9 +563,8 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     elif intent == Intent.MATCH:
         keys = list(dict.fromkeys(base_keys + [
             "bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking",
-            "education", "jobTitle", "occupation", "birthDate", "birthTime",
-            "birthPlace", "birthCity", "birthCountry"
-        ]))
+            "education", "jobTitle", "occupation"
+        ] + birth_keys))
     else:
         keys = base_keys + ["interests"]
 
@@ -628,24 +629,117 @@ def _calc_sidereal_lon_ut(jd_ut: float, planet: int) -> float:
     return float(res[0]) % 360.0
 
 
-def _compute_astro_short(profile: Dict[str, Any], label: str = "ASTRO") -> str:
+def _parse_birth_time(profile: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(profile.get("birthTime") or ""))
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _zone(name: Any, fallback: str = HOROSCOPE_DEFAULT_TZ) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(name or "").strip() or fallback)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(fallback)
+
+
+def _jd_ut(moment: datetime) -> float:
+    utc = moment.astimezone(timezone.utc)
+    return swe.julday(utc.year, utc.month, utc.day, utc.hour + utc.minute / 60.0 + utc.second / 3600.0)
+
+
+# places.sqlite3 is built by tools/build_places_db.py from the app's own location DBs, so the
+# birthCityName / birthStateName / birthCountryIso2 the app stores resolve without a geocoder.
+_places_conn: Optional[sqlite3.Connection] = None
+_places_lock = threading.Lock()
+
+
+def _places_query(sql: str, params: Tuple[Any, ...]) -> List[Tuple[Any, ...]]:
+    global _places_conn
+    with _places_lock:
+        if _places_conn is None:
+            if not os.path.exists(PLACES_DB_PATH):
+                return []
+            _places_conn = sqlite3.connect(f"file:{PLACES_DB_PATH}?mode=ro", uri=True, check_same_thread=False)
+        return _places_conn.execute(sql, params).fetchall()
+
+
+def _norm_place(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _resolve_birth_place(profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """lat/lon/tz of the birth place; precision is city, state or country."""
+    city = _norm_place(profile.get("birthCityName"))
+    state = _norm_place(profile.get("birthStateName"))
+    cc = str(profile.get("birthCountryIso2") or "").strip().upper()
+    try:
+        if not cc:
+            rows = _places_query("SELECT cc FROM countries WHERE name = ?", (_norm_place(profile.get("birthCountryName")),))
+            cc = rows[0][0] if rows else ""
+        if not cc:
+            return None
+        if city:
+            rows = _places_query(
+                "SELECT c.lat, c.lon, c.tz, s.state FROM cities c LEFT JOIN states s ON s.id = c.state_id "
+                "WHERE c.cc = ? AND c.city = ? ORDER BY COALESCE(c.pop, 0) DESC", (cc, city))
+            if rows:
+                lat, lon, tz, _ = next((r for r in rows if state and r[3] == state), rows[0])
+                return {"lat": lat, "lon": lon, "tz": tz, "precision": "city"}
+        if state:
+            rows = _places_query("SELECT lat, lon, tz FROM states WHERE cc = ? AND state = ?", (cc, state))
+            if rows and rows[0][0] is not None:
+                return {"lat": rows[0][0], "lon": rows[0][1], "tz": rows[0][2], "precision": "state"}
+        rows = _places_query("SELECT lat, lon, tz FROM countries WHERE cc = ?", (cc,))
+        if rows and rows[0][0] is not None:
+            return {"lat": rows[0][0], "lon": rows[0][1], "tz": rows[0][2], "precision": "country"}
+    except sqlite3.Error:
+        logger.exception("Birth place lookup failed")
+    return None
+
+
+def _natal_chart(profile: Dict[str, Any], fallback_tz: str = HOROSCOPE_DEFAULT_TZ) -> Optional[Dict[str, Any]]:
+    """Sidereal (Lahiri) natal basics. Unknown birth time -> local noon and no lagna."""
     bd = _parse_birth_date(profile)
     if not bd:
-        return ""
-
-    y, mo, d = bd
-    jd_ut = swe.julday(y, mo, d, 12.0)
-
+        return None
+    bt = _parse_birth_time(profile)
+    place = _resolve_birth_place(profile)
+    tz = _zone(place.get("tz") if place else None, fallback=_zone(fallback_tz).key)
     try:
-        sun_lon = _calc_sidereal_lon_ut(jd_ut, swe.SUN)
-        moon_lon = _calc_sidereal_lon_ut(jd_ut, swe.MOON)
-        sun_sign = _sign_from_lon(sun_lon)
-        moon_sign = _sign_from_lon(moon_lon)
-        nak = _nakshatra_from_lon(moon_lon)
-        return f"{label}: Sun={sun_sign}; Moon(Rashi)={moon_sign}; Nakshatra={nak}."
+        jd = _jd_ut(datetime(bd[0], bd[1], bd[2], bt[0] if bt else 12, bt[1] if bt else 0, tzinfo=tz))
+        sun_lon = _calc_sidereal_lon_ut(jd, swe.SUN)
+        moon_lon = _calc_sidereal_lon_ut(jd, swe.MOON)
+        lagna = None
+        # The ascendant moves a sign every ~2h: only trust it with a real time and a city.
+        if bt and place and place["precision"] == "city":
+            _, ascmc = swe.houses_ex(jd, float(place["lat"]), float(place["lon"]), b"W", swe.FLG_SIDEREAL)
+            lagna = _sign_from_lon(float(ascmc[0]))
     except Exception:
-        logger.exception("Astro compute failed")
+        logger.exception("Natal chart compute failed")
+        return None
+    return {
+        "sun_sign": _sign_from_lon(sun_lon),
+        "moon_sign": _sign_from_lon(moon_lon),
+        "moon_sign_idx": int(moon_lon // 30.0) % 12,
+        "nakshatra": _nakshatra_from_lon(moon_lon),
+        "nakshatra_idx": int(moon_lon // (360.0 / 27.0)) % 27,
+        "lagna": lagna,
+        "time_known": bt is not None,
+    }
+
+
+def _compute_astro_short(profile: Dict[str, Any], label: str = "ASTRO") -> str:
+    chart = _natal_chart(profile)
+    if not chart:
         return ""
+    line = f"{label}: Sun={chart['sun_sign']}; Moon(Rashi)={chart['moon_sign']}; Nakshatra={chart['nakshatra']}"
+    if chart["lagna"]:
+        line += f"; Lagna={chart['lagna']}"
+    return line + "."
 
 
 # =========================
@@ -850,8 +944,11 @@ def _sanitize_legacy_history_text(text: str) -> str:
     if _looks_like_legacy_prompt_dump(t):
         return ""
 
-    t = re.sub(r"\s+", " ", t).strip()
-    return _trim_text(t, 1200)
+    # Keep line breaks and full length: replies are multi-line (headings + bullets) and /history
+    # must show them as they were sent. The prompt window trims separately.
+    t = re.sub(r"[ \t]+", " ", t.replace("\r\n", "\n"))
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return _trim_text(t, 7000)
 
 
 def _read_message_text(doc: Dict[str, Any]) -> str:
@@ -866,12 +963,14 @@ def _read_message_text(doc: Dict[str, Any]) -> str:
     return ""
 
 
-def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[str, str]]:
+def _load_chat_history(uid: str, thread_id: str, limit: int = 24, state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Oldest-first rows {role, content, ms}; pass `state` when the caller already loaded it."""
     col = _chat_msgs_col_ref(uid, thread_id)
     if col is None:
         return []
 
-    state = _load_chat_state(uid, thread_id)
+    if state is None:
+        state = _load_chat_state(uid, thread_id)
     cleared_ms = state.get("clearedAtMs")
     try:
         cleared_ms = int(cleared_ms) if cleared_ms is not None else 0
@@ -899,7 +998,7 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[s
             if role not in ("user", "assistant"):
                 continue
 
-            rows.append({"role": role, "content": text})
+            rows.append({"role": role, "content": text, "ms": ms})
 
         rows.reverse()
         return rows
@@ -909,8 +1008,26 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24) -> List[Dict[s
 
 
 # =========================
-# SUMMARY MEMORY
+# ROLLING MEMORY
 # =========================
+# parrotChats state keeps `summary` (<= SUMMARY_MAX_CHARS) covering every stored message up to
+# `summaryThroughMs`. The prompt carries the summary plus the last HISTORY_LIMIT messages. Once
+# HISTORY_LIMIT messages are unsummarized, the oldest is about to leave the window, so they are
+# folded into the summary by a small parallel LLM call (no added latency for the user).
+_MEMORY_SYSTEM_PROMPT = (
+    "You maintain the long-term memory that Shaadi Parrot, a dating coach and Vedic astrology assistant, "
+    "keeps about ONE app user.\n"
+    "Merge PREVIOUS MEMORY with NEW MESSAGES into one updated memory.\n"
+    "Keep only durable, useful facts: the user's situation and goals, people they mention (names, relationship "
+    "stage, zodiac), preferences and boundaries, decisions made, advice already given, open questions to follow up.\n"
+    "Drop greetings, small talk, and anything outdated.\n"
+    "Write in English, third person ('User ...'), at most 80 words, short phrases separated by '; ', no markdown.\n"
+    "Output only the memory text."
+)
+
+_memory_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="memory")
+
+
 def _get_summary(state: Dict[str, Any]) -> str:
     s = state.get("summary")
     if isinstance(s, str):
@@ -918,43 +1035,25 @@ def _get_summary(state: Dict[str, Any]) -> str:
     return ""
 
 
-def _append_summary(summary: str, key: str, value: str) -> str:
-    summary = (summary or "").strip()
-    key = (key or "").strip()
-    value = (value or "").strip()
-    if not key or not value:
-        return summary
-
-    pattern = re.compile(rf"(?i)\b{re.escape(key)}\s*=\s*[^|]+")
-    if pattern.search(summary):
-        summary = pattern.sub(f"{key}={value}", summary)
-    else:
-        if summary:
-            summary += " | "
-        summary += f"{key}={value}"
-
-    if len(summary) > SUMMARY_MAX_CHARS:
-        summary = summary[-SUMMARY_MAX_CHARS:]
-    return summary
+def _unsummarized(history: List[Dict[str, Any]], state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    through_ms = _to_int(state.get("summaryThroughMs"))
+    return [h for h in history if _to_int(h.get("ms")) > through_ms]
 
 
-def _update_summary_from_turn(summary: str, user_text: str, assistant_text: str, intent: str) -> str:
-    t = (user_text or "").strip()
-
-    m = re.search(r"\b(?:her name is|his name is|my gf is|my bf is)\s+([A-Z][a-z]+)\b", t, re.IGNORECASE)
-    if m:
-        summary = _append_summary(summary, "partnerName", m.group(1))
-
-    mz = re.search(r"\b(i'?m|i am)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
-    if mz:
-        summary = _append_summary(summary, "userZodiac", mz.group(2).title())
-
-    mz2 = re.search(r"\b(she'?s|she is|he'?s|he is)\s+a?\s*(aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces)\b", t, re.IGNORECASE)
-    if mz2:
-        summary = _append_summary(summary, "partnerZodiac", mz2.group(2).title())
-
-    summary = _append_summary(summary, "lastTopic", intent)
-    return summary
+def _summarize_memory(previous: str, messages: List[Dict[str, Any]]) -> str:
+    lines = []
+    for m in messages:
+        content = _normalize_text(m.get("content") or "")
+        if m.get("role") == "user":
+            lines.append("User: " + _trim_text(content, 300))
+        else:
+            lines.append("Parrot: " + _trim_text(content, 200))
+    msgs = [
+        {"role": "system", "content": _MEMORY_SYSTEM_PROMPT},
+        {"role": "user", "content": f"PREVIOUS MEMORY: {previous or '(empty)'}\nNEW MESSAGES:\n" + "\n".join(lines)},
+    ]
+    text, _ = _deepseek_complete(msgs, max_tokens=MEMORY_MAX_TOKENS, temperature=0.2, kind="memory")
+    return _trim_text(_normalize_text(text.replace("**", "")), SUMMARY_MAX_CHARS)
 
 
 # =========================
@@ -1188,14 +1287,20 @@ def verify_face(body: VerifyFaceRequest, authorization: Optional[str] = Header(d
 # =========================
 # DEEPSEEK CALL
 # =========================
-def _deepseek_chat(messages: List[Dict[str, str]], max_tokens: int) -> str:
+def _deepseek_complete(
+    messages: List[Dict[str, str]],
+    max_tokens: int,
+    temperature: Optional[float] = None,
+    kind: str = "chat",
+) -> Tuple[str, str]:
+    """Returns (text, finish_reason) and logs token usage, including prefix-cache hits."""
     if not DEEPSEEK_API_KEY:
         raise HTTPException(status_code=503, detail="DeepSeek API key not configured")
 
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
-        "temperature": DS_TEMPERATURE,
+        "temperature": DS_TEMPERATURE if temperature is None else temperature,
         "max_tokens": int(max_tokens),
     }
 
@@ -1221,11 +1326,31 @@ def _deepseek_chat(messages: List[Dict[str, str]], max_tokens: int) -> str:
         raise HTTPException(status_code=502, detail="DeepSeek invalid JSON")
 
     try:
-        txt = (data["choices"][0]["message"]["content"] or "").strip()
-        return txt
+        choice = data["choices"][0]
+        txt = (choice["message"]["content"] or "").strip()
+        finish_reason = str(choice.get("finish_reason") or "")
     except Exception:
         logger.exception("DeepSeek response shape unexpected: %s", str(data)[:500])
         raise HTTPException(status_code=502, detail="DeepSeek response invalid")
+
+    usage = data.get("usage") or {}
+    logger.info(
+        "deepseek_usage kind=%s prompt=%s cache_hit=%s completion=%s max_tokens=%s finish=%s",
+        kind, usage.get("prompt_tokens"), usage.get("prompt_cache_hit_tokens"),
+        usage.get("completion_tokens"), max_tokens, finish_reason,
+    )
+    return txt, finish_reason
+
+
+def _drop_cut_off_tail(text: str) -> str:
+    """For replies stopped by max_tokens: drop the unfinished last line instead of showing half a sentence."""
+    lines = (text or "").rstrip().splitlines()
+    if len(lines) >= 3:
+        return "\n".join(lines[:-1]).rstrip()
+    cut = max(text.rfind(". "), text.rfind("! "), text.rfind("? "))
+    if cut >= int(len(text) * 0.6):
+        return text[:cut + 1].rstrip()
+    return text
 
 
 def _normalize_for_duplicate_check(text: str) -> str:
@@ -1275,6 +1400,29 @@ def _trim_text(s: str, max_chars: int) -> str:
     return s[:max_chars].rstrip() + "…"
 
 
+def _history_window(history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    window = [h for h in (history or [])[-HISTORY_LIMIT:] if h.get("role") in ("user", "assistant")]
+    last_assistant = max((i for i, h in enumerate(window) if h["role"] == "assistant"), default=-1)
+    out: List[Dict[str, str]] = []
+    for i, h in enumerate(window):
+        if h["role"] == "user":
+            limit = HISTORY_MAX_CHARS
+        elif i == last_assistant:
+            limit = HISTORY_LAST_ASSISTANT_MAX_CHARS
+        else:
+            limit = HISTORY_ASSISTANT_MAX_CHARS
+        content = _trim_text(h.get("content") or "", limit)
+        if content:
+            out.append({"role": h["role"], "content": content})
+    return out
+
+
+def _is_repeated_question(user_text: str, history: List[Dict[str, Any]]) -> bool:
+    prev = next((h.get("content") or "" for h in reversed(history or []) if h.get("role") == "user"), "")
+    a = _normalize_for_duplicate_check(user_text)
+    return bool(a) and a == _normalize_for_duplicate_check(prev)
+
+
 def _build_llm_messages(
     locale: str,
     intent: str,
@@ -1283,18 +1431,26 @@ def _build_llm_messages(
     match_profile: Optional[Dict[str, Any]],
     distance_km: Optional[int],
     user_text: str,
-    history: List[Dict[str, str]],
+    history: List[Dict[str, Any]],
+    repeated_question: bool = False,
 ) -> List[Dict[str, str]]:
-    system = _build_system_prompt(locale, intent)
-
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": system}]
+    # Most stable first, so consecutive requests share a cached prefix: global rules,
+    # then this user's memory, then the per-intent instructions and facts.
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": _SYSTEM_PROMPT_BASE}]
 
     if summary:
         msgs.append({"role": "system", "content": f"SUMMARY_MEMORY: {_trim_text(summary, SUMMARY_MAX_CHARS)}"})
 
+    msgs.append({"role": "system", "content": _build_intent_prompt(locale, intent)})
+
     uctx = _profile_context_compact(user_profile, intent, prefix="USER")
     if uctx:
         msgs.append({"role": "system", "content": uctx})
+
+    if intent == Intent.ASTRO:
+        ua = _compute_astro_short(user_profile, label="USER_ASTRO")
+        if ua:
+            msgs.append({"role": "system", "content": ua})
 
     if intent == Intent.MATCH and match_profile:
         mctx = _profile_context_compact(match_profile, intent, prefix="MATCH")
@@ -1310,11 +1466,13 @@ def _build_llm_messages(
         if distance_km is not None:
             msgs.append({"role": "system", "content": f"DISTANCE_KM: {int(distance_km)}"})
 
-    for h in (history or [])[-HISTORY_LIMIT:]:
-        role = (h.get("role") or "").strip()
-        content = _trim_text(h.get("content") or "", HISTORY_MAX_CHARS)
-        if role in ("user", "assistant") and content:
-            msgs.append({"role": role, "content": content})
+    msgs.extend(_history_window(history))
+
+    if repeated_question:
+        msgs.append({
+            "role": "system",
+            "content": "The user sent the same message again. Answer it with fresh wording and a new angle; do not repeat your previous reply."
+        })
 
     msgs.append({"role": "user", "content": _trim_text(user_text, USER_TEXT_MAX_CHARS)})
     return msgs
@@ -1369,11 +1527,7 @@ def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any]
 
     birth_date = (user_profile.get("birthDate") or "").strip() if isinstance(user_profile.get("birthDate"), str) else ""
     birth_time = (user_profile.get("birthTime") or "").strip() if isinstance(user_profile.get("birthTime"), str) else ""
-    birth_place = (
-        (user_profile.get("birthPlace") or user_profile.get("birthCity") or "").strip()
-        if isinstance(user_profile.get("birthPlace") or user_profile.get("birthCity") or "", str)
-        else ""
-    )
+    birth_place = str(user_profile.get("birthCityName") or "").strip()
 
     has_birth_date = bool(birth_date)
     missing_time_or_place = not birth_time or not birth_place
@@ -1396,6 +1550,114 @@ def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any]
 
 
 # =========================
+# PARROT QUOTA (SERVER-SIDE)
+# =========================
+# Cloud Functions `consumeParrotQuota` counts spent requests in
+# users/{uid}.parrotQuotaUsedCount for the UTC day users/{uid}.parrotQuotaDayKey.
+# The app calls it before every /ai-chat unless it considers the user premium
+# (SubscriptionEntitlementService.IsPremiumActiveAsync). Here we count served
+# LLM replies per UTC day and refuse to serve more than were paid for.
+PARROT_USAGE_COLLECTION = "parrotServerUsage"
+
+
+def _utc_day_key() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _to_utc_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_premium_like_client(users_data: Dict[str, Any], profile_data: Dict[str, Any], now: datetime) -> bool:
+    # Must match the app's IsPremiumActiveAsync: the app skips consumeParrotQuota for these users.
+    if users_data.get("premiumActive") is True:
+        return True
+    promo_until = _to_utc_datetime(profile_data.get("promoPremiumUntilUtcIso"))
+    return promo_until is not None and promo_until > now
+
+
+def _paid_requests_today(users_data: Dict[str, Any], day_key: str) -> int:
+    if str(users_data.get("parrotQuotaDayKey") or "").strip() != day_key:
+        return 0
+    return _to_int(users_data.get("parrotQuotaUsedCount"))
+
+
+def _parrot_quota_refusal(served_today: int, paid_today: int, is_premium: bool, hard_cap: int) -> Optional[str]:
+    """None when one more LLM reply may be served, otherwise the refusal reason."""
+    if served_today >= hard_cap:
+        return "daily_cap"
+    if is_premium:
+        return None
+    if served_today >= paid_today:
+        return "quota_exhausted"
+    return None
+
+
+def _reserve_parrot_reply(uid: str, users_data: Dict[str, Any], profile_data: Dict[str, Any]) -> Optional[str]:
+    """Atomically counts one served reply. Returns the refusal reason, or None if allowed.
+    users_data / profile_data are this request's users/{uid} and profiles/{uid} docs."""
+    if not AI_CHAT_QUOTA_ENFORCED or firestore_client is None:
+        return None
+
+    try:
+        day_key = _utc_day_key()
+        is_premium = _is_premium_like_client(users_data, profile_data, datetime.now(timezone.utc))
+        paid_today = _paid_requests_today(users_data, day_key)
+
+        usage_ref = firestore_client.collection(PARROT_USAGE_COLLECTION).document(uid)
+
+        @firestore.transactional
+        def _txn(tx) -> Optional[str]:
+            usage = usage_ref.get(transaction=tx).to_dict() or {}
+            served = _to_int(usage.get("servedCount")) if usage.get("dayKey") == day_key else 0
+            refusal = _parrot_quota_refusal(served, paid_today, is_premium, AI_CHAT_HARD_DAILY_CAP)
+            if refusal is None:
+                tx.set(usage_ref, {
+                    "uid": uid,
+                    "dayKey": day_key,
+                    "servedCount": served + 1,
+                    "updatedAtIso": _now_iso(),
+                })
+            return refusal
+
+        try:
+            return _txn(firestore_client.transaction())
+        except (ValueError, google_exceptions.Aborted):
+            # Contention here means parallel requests from one user (the app sends one at a time),
+            # so refuse instead of failing open: otherwise a burst of requests skips the quota.
+            logger.warning("Parrot quota transaction contention uid=%s", uid)
+            return "busy"
+    except Exception:
+        # Fail open: a Firestore hiccup must not take the bot down.
+        logger.exception("Parrot quota reservation failed uid=%s", uid)
+        return None
+
+
+def _parrot_quota_reply(reason: str) -> str:
+    if reason == "busy":
+        return "Parrot is catching its breath 🦜 Please send that again in a moment."
+    if reason == "daily_cap":
+        return "That’s a lot of chatting for one day 🦜 Let’s continue tomorrow!"
+    return "You’re out of Parrot requests for today 🦜 Watch a short ad to unlock more, or get Parrot Plus for unlimited chats."
+
+
+# =========================
 # CHAT ENDPOINT
 # =========================
 @app.post("/ai-chat", response_model=AiChatResponse)
@@ -1413,37 +1675,45 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         reply = _topic_block_reply(user_text, locale)
         return AiChatResponse(reply_text=reply, blocked=True, reason="topic_blocked", thread_id=thread_id)
 
+    match_uid = _parse_match_command(user_text)
+    if match_uid and not _is_mutual_match(uid, match_uid):
+        # /match puts the other person's profile and birth data into the prompt: matches only.
+        return AiChatResponse(
+            reply_text="I can only break down people you’ve matched with 🦜 Pick one of your matches above.",
+            blocked=True, reason="not_a_match", thread_id=thread_id,
+        )
+
+    profile_raw, public_raw, user_raw = _load_user_docs(uid)
+    is_identity = _is_identity_question(user_text)
+
+    if not is_identity:
+        refusal = _reserve_parrot_reply(uid, user_raw, profile_raw)
+        if refusal:
+            logger.info("Parrot reply refused uid=%s reason=%s", uid, refusal)
+            return AiChatResponse(reply_text=_parrot_quota_reply(refusal), blocked=True, reason=refusal, thread_id=thread_id)
+
+    user_profile_raw = _merge_dicts_prefer_first(profile_raw, public_raw, user_raw)
+    user_profile = _safe_profile_dict(user_profile_raw)
+
     state = _load_chat_state(uid, thread_id)
     summary = _get_summary(state)
-    history = _load_chat_history(uid, thread_id, limit=24)
+    history = _load_chat_history(uid, thread_id, limit=HISTORY_FETCH_LIMIT, state=state)
 
     intent = _infer_intent_with_history(user_text, history)
 
-    user_profile: Dict[str, Any] = {}
-    try:
-        user_profile = asyncio.run(_load_user_profile(uid))
-    except Exception:
-        user_profile = _safe_profile_dict(_load_user_profile_raw(uid))
-
-    full_ctx = _load_user_all_context(uid)
-    if full_ctx:
-        user_profile = _merge_dicts_prefer_first(user_profile, full_ctx)
-
-    user_profile_raw = _load_user_all_context_raw(uid)
-
-    match_uid = None
     match_profile = None
     distance_km = None
 
     if intent == Intent.MATCH:
-        match_uid = _parse_match_command(user_text)
         if not match_uid:
             reply = "Use this format: /match <uid> 🦜"
             return AiChatResponse(reply_text=reply, blocked=False, reason=None, thread_id=thread_id)
 
-        match_profile = _load_user_all_context(match_uid)
-        match_profile_raw = _load_user_all_context_raw(match_uid)
+        match_profile_raw = _merge_dicts_prefer_first(*_load_user_docs(match_uid))
+        match_profile = _safe_profile_dict(match_profile_raw)
         distance_km = _distance_km_from_profiles(user_profile_raw, match_profile_raw)
+
+    repeated_question = _is_repeated_question(user_text, history)
 
     msgs = _build_llm_messages(
         locale=locale,
@@ -1454,27 +1724,30 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         distance_km=distance_km,
         user_text=user_text,
         history=history,
+        repeated_question=repeated_question,
     )
 
-    max_tokens = DS_MAX_TOKENS_DEFAULT
-    if intent == Intent.MATCH:
-        max_tokens = DS_MAX_TOKENS_MATCH
+    # Fold messages about to leave the prompt window into the memory, in parallel with the reply.
+    unsummarized = _unsummarized(history, state)
+    memory_job = None
+    if not is_identity and len(unsummarized) >= HISTORY_LIMIT:
+        memory_job = _memory_executor.submit(_summarize_memory, summary, unsummarized)
 
-    if _is_identity_question(user_text):
+    if is_identity:
         assistant_text = _identity_reply(locale)
     else:
-        assistant_text = _deepseek_chat(msgs, max_tokens=max_tokens)
-        assistant_text = _extract_reply_safe(assistant_text)
-        assistant_text = _fix_trailing_garbage(assistant_text)
+        max_tokens = _max_tokens_for_intent(intent)
+        assistant_text = _complete_reply(msgs, max_tokens, kind=f"chat:{intent}")
 
-        if _looks_repetitive_reply(assistant_text, history):
+        # A repeated question already asked for fresh wording above; otherwise retry once if
+        # the model still echoed its previous answer.
+        if not repeated_question and _looks_repetitive_reply(assistant_text, history):
             retry_msgs = list(msgs)
             retry_msgs.append({
                 "role": "system",
                 "content": "Previous draft repeats older assistant text. Rewrite with fresh wording and directly answer the latest user message. Do not copy previous paragraphs."
             })
-            retry_text = _deepseek_chat(retry_msgs, max_tokens=max_tokens)
-            retry_text = _fix_trailing_garbage(_extract_reply_safe(retry_text))
+            retry_text = _complete_reply(retry_msgs, max_tokens, kind="retry")
             if retry_text and not _looks_repetitive_reply(retry_text, history):
                 assistant_text = retry_text
 
@@ -1484,19 +1757,39 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     created_at_iso = _now_iso()
     _save_chat_message_batch(uid, thread_id, user_text, assistant_text, created_at_iso, created_at_ms)
 
-    try:
-        turns = int(state.get("turns") or 0)
-    except Exception:
-        turns = 0
-    turns += 1
-
-    if turns % max(1, SUMMARY_UPDATE_EVERY_TURNS) == 0:
-        new_summary = _update_summary_from_turn(summary, user_text, assistant_text, intent)
-        _save_chat_state(uid, thread_id, {"summary": new_summary, "turns": turns})
-    else:
-        _save_chat_state(uid, thread_id, {"turns": turns})
+    state_patch: Dict[str, Any] = {"turns": _to_int(state.get("turns")) + 1}
+    if memory_job is not None:
+        try:
+            new_summary = memory_job.result(timeout=DS_TIMEOUT_SEC)
+        except Exception:
+            logger.exception("Memory update failed uid=%s", uid)
+            new_summary = ""
+        if new_summary:
+            state_patch.update({
+                "summary": new_summary,
+                "summaryThroughMs": max(_to_int(m.get("ms")) for m in unsummarized),
+                "summaryUpdatedAtIso": _now_iso(),
+            })
+    _save_chat_state(uid, thread_id, state_patch)
 
     return AiChatResponse(reply_text=assistant_text, blocked=False, reason=None, thread_id=thread_id)
+
+
+def _complete_reply(msgs: List[Dict[str, str]], max_tokens: int, kind: str) -> str:
+    text, finish_reason = _deepseek_complete(msgs, max_tokens=max_tokens, kind=kind)
+    if finish_reason == "length":
+        text = _drop_cut_off_tail(text)
+    return _fix_trailing_garbage(_extract_reply_safe(text))
+
+
+def _is_mutual_match(uid: str, other_uid: str) -> bool:
+    if firestore_client is None:
+        return False
+    try:
+        return firestore_client.collection("users").document(uid).collection("matches").document(other_uid).get().exists
+    except Exception:
+        logger.exception("Match lookup failed uid=%s", uid)
+        return False
 
 
 # =========================
@@ -1524,5 +1817,228 @@ def reset_endpoint(thread_id: str = "default", authorization: Optional[str] = He
     tid = (thread_id or "default").strip() or "default"
 
     ms = _now_ms()
-    _save_chat_state(uid, tid, {"clearedAtMs": ms, "updatedAtMs": ms, "updatedAtIso": _now_iso()})
+    _save_chat_state(uid, tid, {
+        "clearedAtMs": ms, "updatedAtMs": ms, "updatedAtIso": _now_iso(),
+        # A fresh start forgets the rolling memory too.
+        "summary": "", "summaryThroughMs": ms,
+    })
     return ResetResponse(thread_id=tid, ok=True)
+
+
+# =========================
+# DAILY HOROSCOPE
+# =========================
+# One personal Jyotish reading per uid per local day (tz from the app, IST by default), cached in
+# dailyHoroscopes/{uid}__{dayKey} and added once to the user's Parrot chat. It does not use the Parrot quota:
+# it is a once-a-day engagement feature, and repeat requests the same day cost no tokens.
+HOROSCOPE_COLLECTION = "dailyHoroscopes"
+
+_WEEKDAY_LORDS = ["Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Sun"]  # datetime.weekday(): Monday=0
+_TITHIS = [
+    "Pratipada", "Dwitiya", "Tritiya", "Chaturthi", "Panchami", "Shashthi", "Saptami", "Ashtami",
+    "Navami", "Dashami", "Ekadashi", "Dwadashi", "Trayodashi", "Chaturdashi",
+]
+# Tara bala: nakshatra count from the birth star to today's Moon star, mod 9.
+_TARAS = [
+    ("Janma", "mixed: a sensitive day, go gently"),
+    ("Sampat", "supportive: good for gains and progress"),
+    ("Vipat", "tricky: avoid risky moves"),
+    ("Kshema", "supportive: steady wellbeing"),
+    ("Pratyak", "tricky: expect some friction"),
+    ("Sadhana", "supportive: effort pays off"),
+    ("Naidhana", "tricky: slow down and keep it simple"),
+    ("Mitra", "supportive: friendly, social energy"),
+    ("Parama Mitra", "very supportive: a warm, lucky day"),
+]
+# Chandra gochara: today's Moon counted from the natal Moon sign.
+_MOON_HOUSE_THEMES = {
+    1: "mood, self-care and fresh starts",
+    2: "money, family and how you speak",
+    3: "courage, messages and initiative",
+    4: "home, comfort and inner peace",
+    5: "romance, creativity and fun",
+    6: "work routines, health habits and small hurdles",
+    7: "partnerships and one-to-one connections",
+    8: "a sensitive day (Chandrashtama): patience and caution",
+    9: "luck, blessings and learning",
+    10: "career, visibility and duty",
+    11: "gains, friends and wishes coming true",
+    12: "rest, spending and letting go",
+}
+# Numerology planets 1-9 and their traditional colors.
+_NUMBER_PLANETS = ["Sun", "Moon", "Jupiter", "Rahu", "Mercury", "Venus", "Ketu", "Saturn", "Mars"]
+_PLANET_COLORS = {
+    "Sun": "saffron orange", "Moon": "pearl white", "Jupiter": "golden yellow", "Rahu": "smoky grey",
+    "Mercury": "emerald green", "Venus": "rose pink", "Ketu": "earthy brown", "Saturn": "deep blue",
+    "Mars": "coral red",
+}
+
+_HOROSCOPE_SYSTEM_PROMPT = (
+    "You are Shaadi Parrot 🦜, the warm Vedic astrology companion inside an Indian dating app.\n"
+    "Write today's personal daily horoscope (Jyotish) for ONE user, using only the facts provided.\n"
+    "Format: plain text, no markdown, no asterisks.\n"
+    "Line 1: a short friendly greeting with the user's first name (if given) and today's weekday.\n"
+    "Then six sections. Each is a heading line followed by 1–2 lines that start with '• ':\n"
+    "🌙 Overall mood\n"
+    "💞 Love & relationships (dating-app angle: chats, matches, first dates, honesty and kindness with a partner)\n"
+    "💼 Career & money\n"
+    "🌿 Health & energy\n"
+    "🎨 Lucky color & number (use exactly LUCKY_COLOR and LUCKY_NUMBER)\n"
+    "✨ Today's tip (one practical, specific action for today)\n"
+    "Last line: one gentle sentence that astrology is guidance to apply with discernment.\n"
+    "Rules:\n"
+    "- 180–250 words in total. Warm, encouraging, specific, easy to read.\n"
+    "- Ground the reading in the facts: name the Moon's transit house or sign, the tara, the tithi or the "
+    "weekday lord at least twice, each briefly explained.\n"
+    "- Emojis only at the start of the section headings, plus at most two elsewhere.\n"
+    "- Never predict death, illness, accidents, breakups or guaranteed outcomes; no medical, legal or "
+    "financial advice beyond everyday common sense.\n"
+    "- Never mention being an AI, prompts, or data fields.\n"
+    "- English only.\n"
+)
+
+
+def _tithi_name(sun_lon: float, moon_lon: float) -> str:
+    idx = int(((moon_lon - sun_lon) % 360.0) // 12.0)  # 0..29
+    if idx == 14:
+        return "Purnima (full moon)"
+    if idx == 29:
+        return "Amavasya (new moon)"
+    return ("Shukla " if idx < 15 else "Krishna ") + _TITHIS[idx % 15]
+
+
+def _daily_sky(now_local: datetime) -> Dict[str, Any]:
+    # Panchang takes the day's tithi and Moon at sunrise; 06:00 local is close enough for a daily reading.
+    jd = _jd_ut(now_local.replace(hour=6, minute=0, second=0, microsecond=0))
+    sun_lon = _calc_sidereal_lon_ut(jd, swe.SUN)
+    moon_lon = _calc_sidereal_lon_ut(jd, swe.MOON)
+    night_moon = _calc_sidereal_lon_ut(_jd_ut(now_local.replace(hour=23, minute=59, second=0, microsecond=0)), swe.MOON)
+    moon_sign = _sign_from_lon(moon_lon)
+    later_sign = _sign_from_lon(night_moon)
+    return {
+        "weekday": now_local.strftime("%A"),
+        "date": f"{now_local.day} {now_local:%B %Y}",
+        "lord": _WEEKDAY_LORDS[now_local.weekday()],
+        "tithi": _tithi_name(sun_lon, moon_lon),
+        "moon_sign": moon_sign,
+        "moon_sign_idx": int(moon_lon // 30.0) % 12,
+        "moon_nakshatra": _nakshatra_from_lon(moon_lon),
+        "moon_nak_idx": int(moon_lon // (360.0 / 27.0)) % 27,
+        "moon_sign_later": later_sign if later_sign != moon_sign else None,
+    }
+
+
+def _horoscope_facts(profile: Dict[str, Any], natal: Dict[str, Any], sky: Dict[str, Any]) -> str:
+    house = (sky["moon_sign_idx"] - natal["moon_sign_idx"]) % 12 + 1
+    tara_idx = ((sky["moon_nak_idx"] - natal["nakshatra_idx"]) % 27) % 9
+    tara_name, tara_quality = _TARAS[tara_idx]
+    lucky_planet = _NUMBER_PLANETS[tara_idx]
+
+    user_bits = []
+    for label, value in (
+        ("first_name", profile.get("firstName") or profile.get("name")),
+        ("gender", profile.get("gender")),
+        ("looking_for", profile.get("relationshipIntent")),
+    ):
+        val = _flatten_value(value, max_len=60)
+        if val:
+            user_bits.append(f"{label}={val}")
+
+    moon_line = f"MOON_TRANSIT: {sky['moon_sign']}, {sky['moon_nakshatra']} nakshatra"
+    if sky["moon_sign_later"]:
+        moon_line += f" (moves into {sky['moon_sign_later']} later today)"
+    natal_line = f"NATAL: Moon sign (Rashi)={natal['moon_sign']}; Nakshatra={natal['nakshatra']}; Sun sign={natal['sun_sign']}; "
+    natal_line += f"Lagna={natal['lagna']}" if natal["lagna"] else "Lagna unknown (no birth time or place)"
+
+    lines = [
+        "USER: " + ("; ".join(user_bits) or "unknown"),
+        f"TODAY: {sky['weekday']}, {sky['date']}",
+        f"WEEKDAY_LORD: {sky['lord']}",
+        f"TITHI: {sky['tithi']}",
+        moon_line,
+        natal_line,
+        f"MOON_FROM_NATAL_MOON: house {house}, theme: {_MOON_HOUSE_THEMES[house]}",
+        f"TARA: {tara_name}, {tara_quality}",
+        f"LUCKY_COLOR: {_PLANET_COLORS[lucky_planet]}",
+        f"LUCKY_NUMBER: {tara_idx + 1}",
+    ]
+    return "\n".join(lines)
+
+
+def _horoscope_ref(uid: str, day_key: str):
+    return firestore_client.collection(HOROSCOPE_COLLECTION).document(f"{uid}__{day_key}")
+
+
+def _store_daily_horoscope(uid: str, thread_id: str, day_key: str, tz_name: str, text: str) -> Tuple[str, bool]:
+    """Caches today's reading and adds it to the chat once. Returns (text, already_cached)."""
+    cache_ref = _horoscope_ref(uid, day_key)
+    ms = _now_ms()
+    iso = _now_iso()
+    msg_id = f"{ms}_a_{hashlib.md5(text.encode('utf-8')).hexdigest()[:8]}"
+
+    # create() makes the whole batch fail if today's reading already exists, so parallel taps
+    # end up with one reading and one chat message, without transaction lock contention.
+    batch = firestore_client.batch()
+    batch.create(cache_ref, {
+        "uid": uid, "dayKey": day_key, "text": text, "tz": tz_name, "threadId": thread_id, "createdAtIso": iso,
+    })
+    batch.set(_chat_msgs_col_ref(uid, thread_id).document(msg_id), {
+        "role": "assistant", "text": text, "createdAtIso": iso, "createdAtMs": ms,
+        "kind": "daily_horoscope", "dayKey": day_key,
+    })
+    batch.set(_chat_doc_ref(uid, thread_id), {"uid": uid, "threadId": thread_id, "updatedAtIso": iso, "updatedAtMs": ms}, merge=True)
+    try:
+        batch.commit()
+        return text, False
+    except google_exceptions.AlreadyExists:
+        existing = cache_ref.get().to_dict() or {}
+        return existing.get("text") or text, True
+
+
+@app.post("/daily-horoscope", response_model=DailyHoroscopeResponse, response_model_exclude_none=True)
+def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization: Optional[str] = Header(default=None)):
+    uid = _verify_firebase_token_or_401(authorization)
+    req = body or DailyHoroscopeRequest()
+    tz = _zone(req.tz)
+    now_local = datetime.now(tz)
+    day_key = now_local.date().isoformat()
+    thread_id = (req.thread_id or "").strip() or f"mobile_{uid}"
+    unavailable = DailyHoroscopeResponse(ok=False, error="temporarily_unavailable")
+
+    if firestore_client is None:
+        return unavailable
+
+    try:
+        cached = _horoscope_ref(uid, day_key).get().to_dict() or {}
+    except Exception:
+        logger.exception("Daily horoscope cache read failed uid=%s", uid)
+        return unavailable
+    if cached.get("text"):
+        return DailyHoroscopeResponse(ok=True, text=cached["text"], dayKey=day_key, cached=True)
+
+    profile = _merge_dicts_prefer_first(*_load_user_docs(uid))
+    if not _parse_birth_date(profile):
+        return DailyHoroscopeResponse(ok=False, error="missing_birth_data")
+
+    natal = _natal_chart(profile, fallback_tz=tz.key)
+    if not natal:
+        return unavailable
+
+    try:
+        msgs = [
+            {"role": "system", "content": _HOROSCOPE_SYSTEM_PROMPT},
+            {"role": "user", "content": _horoscope_facts(profile, natal, _daily_sky(now_local))},
+        ]
+        text = _complete_reply(msgs, HOROSCOPE_MAX_TOKENS, kind="horoscope")
+    except Exception:
+        logger.exception("Daily horoscope generation failed uid=%s", uid)
+        return unavailable
+    if not text or text == "…":
+        return unavailable
+
+    try:
+        text, was_cached = _store_daily_horoscope(uid, thread_id, day_key, tz.key, text)
+    except Exception:
+        logger.exception("Daily horoscope store failed uid=%s", uid)
+        was_cached = False
+    return DailyHoroscopeResponse(ok=True, text=text, dayKey=day_key, cached=was_cached)
