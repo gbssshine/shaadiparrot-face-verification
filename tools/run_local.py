@@ -16,6 +16,9 @@ requests.get = lambda url, *a, **k: _get(str(url).replace("://10.0.2.2:", "://12
 
 import main  # noqa: E402
 
+_session_get = main._HTTP.get
+main._HTTP.get = lambda url, *a, **k: _session_get(str(url).replace("://10.0.2.2:", "://127.0.0.1:"), *a, **k)
+
 # No Cloud Vision locally (the dummy credentials can't reach it): each selfie is read as a clear face doing
 # what the challenge asked (straight, turned, smiling), so the app's verification flow can be walked through.
 if os.getenv("LOCAL_FAKE_VISION", "1") == "1":

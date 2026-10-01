@@ -154,6 +154,27 @@ class ResetResponse(BaseModel):
 # =========================
 # STARTUP
 # =========================
+# One HTTP connection pool for DeepSeek and image downloads (a new TLS handshake per call was slow under load).
+from requests.adapters import HTTPAdapter  # noqa: E402
+
+_HTTP = requests.Session()
+_HTTP.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=64))
+_HTTP.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=16))
+
+# Every handler is sync and runs in AnyIO's thread pool (40 by default). Calls that wait on DeepSeek or Vision
+# hold a thread, so with a small pool one slow upstream made every other endpoint wait. More threads (waiting is
+# cheap: the GIL is released) plus a cap on parallel DeepSeek calls, so a slow DeepSeek can only take part of them.
+THREADPOOL_SIZE = int(os.getenv("THREADPOOL_SIZE") or "96")
+DEEPSEEK_MAX_PARALLEL = int(os.getenv("DEEPSEEK_MAX_PARALLEL") or "32")
+_deepseek_slots = threading.BoundedSemaphore(DEEPSEEK_MAX_PARALLEL)
+
+
+@app.on_event("startup")
+async def _bigger_thread_pool():
+    import anyio
+    anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
+
+
 @app.on_event("startup")
 def startup_event():
     global vision_client, firestore_client
@@ -1083,13 +1104,14 @@ def _own_gcs_photo(gcs_uri: str, uid: str) -> bool:
     return bool(m) and m.group(1).startswith(f"users/{uid}/") and ".." not in m.group(1)
 
 
-def _take_rate(uid: str, key: str, limit: int) -> bool:
-    """A per-day counter in serverRate/{uid} (no client can read or write that collection)."""
+def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """A counter in serverRate/{uid} (no client can read or write that collection), per day or per minute."""
     if firestore_client is None:
         return True
     from google.cloud import firestore as fs
     ref = firestore_client.collection("serverRate").document(uid)
-    day = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y-%m-%dT%H:%M") if per == "minute" else now.date().isoformat()
 
     @fs.transactional
     def take(tx) -> bool:
@@ -1130,7 +1152,7 @@ def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header
                 {"type_": vision.Feature.Type.SAFE_SEARCH_DETECTION},
                 {"type_": vision.Feature.Type.FACE_DETECTION},
             ],
-        })
+        }, timeout=20)
     except Exception as e:
         logger.exception("Vision annotate_image failed")
         raise HTTPException(status_code=502, detail=f"Vision API error: {type(e).__name__}")
@@ -1162,7 +1184,7 @@ def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header
 
 def _download_image_bytes(url: str, max_mb: int = 10) -> bytes:
     headers = {"User-Agent": "shaadiparrot-face-verification/1.0"}
-    r = requests.get(url, headers=headers, timeout=25, stream=True, allow_redirects=True)
+    r = _HTTP.get(url, headers=headers, timeout=(5, 20), stream=True, allow_redirects=True)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {r.status_code}")
 
@@ -1244,7 +1266,7 @@ def _detect_faces_and_safety_from_bytes(img_bytes: bytes):
                 {"type_": vision.Feature.Type.SAFE_SEARCH_DETECTION},
                 {"type_": vision.Feature.Type.FACE_DETECTION},
             ],
-        })
+        }, timeout=20)
     except Exception as e:
         logger.exception("Vision annotate_image failed")
         raise HTTPException(status_code=502, detail=f"Vision API error: {type(e).__name__}")
@@ -1287,11 +1309,18 @@ def _deepseek_complete(
         "Content-Type": "application/json",
     }
 
+    # A slot first: when DeepSeek is slow, at most DEEPSEEK_MAX_PARALLEL calls wait on it; the rest give up
+    # quickly (callers fall back to templates or "try again") instead of piling up threads.
+    if not _deepseek_slots.acquire(timeout=8):
+        logger.warning("DeepSeek busy: no free slot kind=%s", kind)
+        raise HTTPException(status_code=503, detail="DeepSeek busy")
     try:
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=timeout or DS_TIMEOUT_SEC)
+        r = _HTTP.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=(5, timeout or DS_TIMEOUT_SEC))
     except Exception as e:
         logger.exception("DeepSeek request failed")
         raise HTTPException(status_code=502, detail=f"DeepSeek request error: {type(e).__name__}")
+    finally:
+        _deepseek_slots.release()
 
     if r.status_code != 200:
         logger.error("DeepSeek non-200: %s %s", r.status_code, (r.text or "")[:500])
@@ -1627,6 +1656,9 @@ def _reserve_parrot_reply(uid: str, users_data: Dict[str, Any], profile_data: Di
         return None
 
 
+AI_CHAT_PER_MINUTE = int(os.getenv("AI_CHAT_PER_MINUTE") or "8")
+
+
 def _parrot_quota_reply(reason: str) -> str:
     if reason == "busy":
         return "Parrot is catching its breath 🦜 Please send that again in a moment."
@@ -1648,6 +1680,10 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
 
     if not user_text:
         raise HTTPException(status_code=400, detail="text required")
+
+    # A burst limit on top of the daily quota: a script (or a stuck retry loop) can't fire DeepSeek calls.
+    if not _take_rate(uid, "aiChatMinute", AI_CHAT_PER_MINUTE, per="minute"):
+        return AiChatResponse(reply_text=_parrot_quota_reply("busy"), blocked=True, reason="slow_down", thread_id=thread_id)
 
     if not _is_allowed_topic(user_text):
         reply = _topic_block_reply(user_text, locale)
@@ -1947,6 +1983,44 @@ def _horoscope_ref(uid: str, day_key: str):
     return firestore_client.collection(HOROSCOPE_COLLECTION).document(f"{uid}__{day_key}")
 
 
+HOROSCOPE_LEASE_SEC = 45
+
+
+def _take_lease(name: str, ttl_sec: float) -> bool:
+    """serverLeases/{name}: True for the one caller that may do the work now. A lease older than ttl_sec (its
+    holder died or gave up) can be taken over. Without Firestore everyone may (local tests)."""
+    if firestore_client is None:
+        return True
+    from google.cloud import firestore as fs
+    ref = firestore_client.collection("serverLeases").document(name)
+    now = time.time()
+
+    @fs.transactional
+    def take(tx) -> bool:
+        snap = ref.get(transaction=tx)
+        at = float((snap.to_dict() or {}).get("at") or 0)
+        if snap.exists and now - at < ttl_sec:
+            return False
+        tx.set(ref, {"at": now, "atIso": _now_iso()})
+        return True
+
+    try:
+        return take(firestore_client.transaction())
+    except Exception:
+        logger.exception("lease failed: %s", name)
+        return True
+
+
+def _release_lease(name: str) -> None:
+    """The work failed: the next caller may try at once."""
+    if firestore_client is None:
+        return
+    try:
+        firestore_client.collection("serverLeases").document(name).delete()
+    except Exception:
+        logger.warning("lease release failed: %s", name, exc_info=True)
+
+
 def _store_daily_horoscope(uid: str, thread_id: str, day_key: str, tz_name: str, text: str) -> Tuple[str, bool]:
     """Caches today's reading and adds it to the chat once. Returns (text, already_cached)."""
     cache_ref = _horoscope_ref(uid, day_key)
@@ -1998,8 +2072,23 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
     if not _parse_birth_date(profile):
         return DailyHoroscopeResponse(ok=False, error="missing_birth_data")
 
+    # Parallel calls (two taps, a retry) wrote one reading but each paid for a DeepSeek call. Now one request
+    # takes a lease and writes it; the others wait a little for that reading.
+    if not _take_lease(f"horoscope_{uid}_{day_key}", HOROSCOPE_LEASE_SEC):
+        for _ in range(24):
+            time.sleep(0.5)
+            try:
+                cached = _horoscope_ref(uid, day_key).get().to_dict() or {}
+            except Exception:
+                cached = {}
+            if cached.get("text"):
+                return DailyHoroscopeResponse(ok=True, text=cached["text"], dayKey=day_key, cached=True)
+        return unavailable
+
+    lease = f"horoscope_{uid}_{day_key}"
     natal = _natal_chart(profile, fallback_tz=tz.key)
     if not natal:
+        _release_lease(lease)
         return unavailable
 
     try:
@@ -2010,8 +2099,10 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         text = _complete_reply(msgs, HOROSCOPE_MAX_TOKENS, kind="horoscope")
     except Exception:
         logger.exception("Daily horoscope generation failed uid=%s", uid)
+        _release_lease(lease)
         return unavailable
     if not text or text == "…":
+        _release_lease(lease)
         return unavailable
 
     try:
