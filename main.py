@@ -2357,14 +2357,23 @@ def _judge_live(uid: str, steps: List[str], urls: List[str], issued_iso: str):
     record["pans"] = [round(p, 1) for p in pans]
     if not ok:
         return "failed", reason, record, None, None
-    selfie_faces = [face_match.face_features(face_match.decode(b)) for b in data]
-    if not selfie_faces[0]:
-        return "failed", "no_face_detected_1", record, None, None
-    front = selfie_faces[0][0]
+    images = [face_match.decode(b) for b in data]
     photos = _own_photos(uid)
-    record.update({"posesOk": True, "photos": photos})
-    ok, reason, scores = face_match.judge(front, [f[0] for f in selfie_faces[1:] if f], _photo_faces(photos),
-                                          _cohort_scores(uid, front))
+    photo_faces = _photo_faces(photos)
+    # The frames as the camera gave them and mirrored (front cameras mirror, profile photos may not): the
+    # better of the two judgements counts, all three frames always the same way round.
+    tries = []
+    for flip in (False, True):
+        faces = [face_match.face_features(face_match.mirror(im) if flip else im) for im in images]
+        if not faces[0]:
+            continue
+        front = faces[0][0]
+        ok, reason, scores = face_match.judge(front, [f[0] for f in faces[1:] if f], photo_faces, _cohort_scores(uid, front))
+        tries.append((face_match.outcome_rank(ok, reason, scores), flip, front, ok, reason, scores))
+    if not tries:
+        return "failed", "no_face_detected_1", record, None, None
+    _, flipped, front, ok, reason, scores = max(tries, key=lambda t: t[0])
+    record.update({"posesOk": True, "photos": photos, "mirrored": flipped})
     record["scores"] = scores
     if reason == "selfies_not_same_person":
         record["posesOk"] = False                       # nothing worth keeping for a re-check
@@ -2420,11 +2429,18 @@ def verify_face_recheck(authorization: Optional[str] = Header(default=None)):
         return {"ok": False, "reason": "selfies_needed"}
     if not _take_counter(uid, "faceRecheckAttempts", FACE_RECHECKS_PER_DAY):
         raise HTTPException(status_code=429, detail="too_many_attempts")
-    front = face_match.face_features(face_match.decode(_download_image_bytes(front_url, max_mb=10)))
-    if not front:
-        return {"ok": False, "reason": "selfies_needed"}
+    img = face_match.decode(_download_image_bytes(front_url, max_mb=10))
     photos = _own_photos(uid)
-    ok, reason, scores = face_match.judge(front[0], [], _photo_faces(photos), _cohort_scores(uid, front[0]))
+    photo_faces = _photo_faces(photos)
+    tries = []
+    for flip in (False, True):          # as taken and mirrored, like the first check
+        f = face_match.face_features(face_match.mirror(img) if flip else img)
+        if f:
+            ok, reason, scores = face_match.judge(f[0], [], photo_faces, _cohort_scores(uid, f[0]))
+            tries.append((face_match.outcome_rank(ok, reason, scores), f, ok, reason, scores))
+    if not tries:
+        return {"ok": False, "reason": "selfies_needed"}
+    _, front, ok, reason, scores = max(tries, key=lambda t: t[0])
     status = "ok" if ok else ("in_review" if face_match.needs_review(reason) else "failed")
     _save_face_result(uid, status, reason, photos, {"scores": scores, "photos": photos, "recheckedAtIso": _now_iso()},
                       {"kind": "photos", "frontSelfie": front_url, "photos": photos} if status == "in_review" else None)

@@ -80,6 +80,7 @@ def env():
     main._detect_faces_and_safety_from_bytes = vision
     face_match.available = lambda: True
     face_match.decode = lambda data: data.decode().split("|")[0]
+    face_match.mirror = lambda key: key                      # the fake faces look the same either way
     face_match.face_features = lambda key: [vec(key)] if key else []
     photos = {}
     main._own_photos = lambda uid: photos.get(uid, [])

@@ -142,6 +142,22 @@ def judge(front: Any, sides: Sequence[Any], photos: Sequence[Sequence[Any]],
     return True, "ok", meta
 
 
+def mirror(img):
+    """The image flipped left to right. Front cameras show (and some phones save) a mirror image, profile
+    photos may be either way, and SFace scores the same face up to ~0.06 apart between the two."""
+    if img is None:
+        return None
+    import cv2
+    return cv2.flip(img, 1)
+
+
+def outcome_rank(ok: bool, reason: str, meta: Dict[str, Any]) -> Tuple[int, float]:
+    """Which of two judgements (the frames as taken, or mirrored) to keep: a pass, then a "person looks",
+    then a fail; within those, the better main-photo score."""
+    best = [s for s in (meta.get("photos") or []) if s is not None]
+    return (2 if ok else 1 if needs_review(reason) else 0, max(best, default=-1.0))
+
+
 def needs_review(reason: str) -> bool:
     return reason.startswith("review_")
 

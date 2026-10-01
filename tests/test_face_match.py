@@ -90,3 +90,20 @@ def test_the_same_face_on_another_account_is_found():
     found = fm.duplicates(ME, {"me": ME, "twin": vec(10), "other": STRANGER, "close": vec(45)}, exclude="me")
     assert [u for u, _ in found] == ["twin", "close"]
     assert fm.duplicates(ME, {"other": STRANGER}) == []
+
+
+
+def test_the_better_way_round_counts():
+    ok = fm.outcome_rank(True, "ok", {"photos": [0.5]})
+    review = fm.outcome_rank(False, "review_main_photo", {"photos": [0.43]})
+    fail_hi = fm.outcome_rank(False, "photo_2_not_you", {"photos": [0.7, 0.2]})
+    fail_lo = fm.outcome_rank(False, "main_photo_not_you", {"photos": [0.2]})
+    assert ok > review > fail_hi > fail_lo
+    assert fm.outcome_rank(False, "no_face_in_photos", {"photos": [None]}) < fail_lo
+
+
+def test_mirror_flips_left_to_right():
+    import numpy as np
+    img = np.zeros((2, 3, 3), dtype=np.uint8)
+    img[0, 0] = 255
+    assert fm.mirror(img)[0, 2, 0] == 255 and fm.mirror(None) is None
