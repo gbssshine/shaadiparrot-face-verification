@@ -2279,25 +2279,44 @@ def _cohort_scores(uid: str, front: Any) -> List[float]:
 
 def _save_face_result(uid: str, status: str, reason: str, photos: List[str], record: Dict[str, Any],
                       review: Optional[Dict[str, Any]] = None) -> None:
-    """status: "ok", "failed" or "in_review" (a person on the team decides; not verified meanwhile).
+    """status: "ok" (verified), "failed" or "in_review" (on hold: only the same face as a banned account).
+    Verified first, looked at later: a pass that the server wasn't fully sure about is verified at once and
+    carries `review` + needsLook, so the team can look in the web admin and remove it if it's wrong.
     profiles: the flags + which photos were checked (the app can't write these); publicProfiles: the badge;
-    faceVerifications/{uid} (server only): the kept selfie, the scores and what a reviewer needs."""
+    faceVerifications/{uid} (server only): the kept frame, the scores and what a reviewer needs.
+    One batch, so the badge and the private flags never disagree."""
     if firestore_client is None:
         return
     from google.cloud import firestore as fs
     ok = status == "ok"
     now = _now_iso()
     try:
-        firestore_client.collection("profiles").document(uid).set({
+        batch = firestore_client.batch()
+        batch.set(firestore_client.collection("profiles").document(uid), {
             "faceVerified": ok, "isFaceVerified": ok, "faceVerifiedReason": reason,
             "faceVerifiedAtIso": now, "faceVerifiedMethod": FACE_METHOD,
             "faceVerifiedPhotos": photos if ok else [],
         }, merge=True)
-        firestore_client.collection("publicProfiles").document(uid).set({"isFaceVerified": ok}, merge=True)
-        _face_ref(uid).set({**record, "status": status, "reason": reason, "updatedAtIso": now,
-                            "review": ({**review, "requestedAtIso": now} if review else fs.DELETE_FIELD)}, merge=True)
+        batch.set(firestore_client.collection("publicProfiles").document(uid), {"isFaceVerified": ok}, merge=True)
+        batch.set(_face_ref(uid), {**record, "status": status, "reason": reason, "updatedAtIso": now,
+                                   "needsLook": bool(review),
+                                   "review": ({"requestedAtIso": now, **review} if review else fs.DELETE_FIELD)}, merge=True)
+        batch.commit()
     except Exception:
         logger.exception("face verification result write failed")
+
+
+def _restricted(uids: List[str]) -> List[str]:
+    """Which of these accounts are banned or suspended right now (moderationStates, written by the web admin)."""
+    out = []
+    for u in uids:
+        try:
+            st = (firestore_client.collection("moderationStates").document(u).get().to_dict() or {}).get("status")
+        except Exception:
+            st = None
+        if st in ("banned", "suspended"):
+            out.append(u)
+    return out
 
 
 def _take_counter(uid: str, field: str, limit: int) -> bool:
@@ -2377,22 +2396,29 @@ def _judge_live(uid: str, steps: List[str], urls: List[str], issued_iso: str):
     record["scores"] = scores
     if reason == "selfies_not_same_person":
         record["posesOk"] = False                       # nothing worth keeping for a re-check
+    review: Optional[Dict[str, Any]] = None
     if face_match.needs_review(reason):
-        return "in_review", reason, record, {"kind": "photos"}, front
-    if not ok:
+        review = {"kind": "photos", "reason": reason}   # a live face just under a bar: verified, the team looks
+    elif not ok:
         return "failed", reason, record, None, None
     dups = face_match.duplicates(front, _verified_templates(), exclude=uid)
     if dups:
         record["duplicates"] = [{"uid": u, "sim": round(s, 3)} for u, s in dups[:3]]
-        return "in_review", "review_duplicate", record, {"kind": "duplicate", "duplicateOf": record["duplicates"]}, front
-    return "ok", "ok", record, None, front
+        held = _restricted([d["uid"] for d in record["duplicates"]])
+        review = {"kind": "duplicate", "duplicateOf": record["duplicates"], **({"restricted": held} if held else {})}
+        if held:
+            # The same face as a banned or suspended account: no badge until a person looks.
+            return "in_review", "review_duplicate", record, review, front
+    return "ok", "ok", record, review, front
 
 
 @app.post("/verify-face-live")
 def verify_face_live(body: VerifyFaceLiveRequest, authorization: Optional[str] = Header(default=None)):
-    """The challenge's selfies. Passing marks the profile verified (the server writes it, never the app); just
-    under a bar, or the same face on another account, goes to a person on the team ("in_review").
-    Afterwards only the straight selfie is kept (for re-checks after a photo change); the rest is deleted."""
+    """The challenge's frames. A live face that matches the profile photos is verified at once (the server writes
+    it, never the app); if the server wasn't fully sure (just under a bar, the same face on another account, or
+    verified again after the team removed it) the team also gets it to look at and can remove it. Only the same
+    face as a banned account waits ("in_review"). Afterwards only the straight frame is kept (for re-checks
+    after a photo change); the rest is deleted."""
     uid = _verify_firebase_token_or_401(authorization)
     urls = [str(u or "").strip() for u in (body.selfies or [])]
     if len(urls) != 3 or len(set(urls)) != 3 or not all(face_live.selfie_url_ok(u, uid) for u in urls):
@@ -2406,6 +2432,8 @@ def verify_face_live(body: VerifyFaceLiveRequest, authorization: Optional[str] =
         raise HTTPException(status_code=429, detail="too_many_attempts")
     steps = [str(s) for s in (ch.get("steps") or [])]
     status, reason, record, review, front = _judge_live(uid, steps, urls, str(ch.get("issuedAtIso") or ""))
+    if status == "ok" and review is None and (_face_ref(uid).get().to_dict() or {}).get("revokedBefore"):
+        review = {"kind": "after_removal"}
     keep = urls[0] if record.get("posesOk") else None
     record.update({"frontSelfie": keep or "", "selfies": [keep] if keep else []})
     if front is not None:
@@ -2424,6 +2452,9 @@ def verify_face_recheck(authorization: Optional[str] = Header(default=None)):
     if firestore_client is None or not face_match.available():
         raise HTTPException(status_code=503, detail="face_match_unavailable")
     rec = firestore_client.collection("faceVerifications").document(uid).get().to_dict() or {}
+    if rec.get("status") == "in_review":
+        # On hold for a person (the same face as a banned account): new photos don't change that.
+        return {"ok": False, "status": "in_review", "reason": str(rec.get("reason") or "review_duplicate")}
     front_url = str(rec.get("frontSelfie") or "")
     if not rec.get("posesOk") or not face_live.selfie_url_ok(front_url, uid):
         return {"ok": False, "reason": "selfies_needed"}
@@ -2441,9 +2472,15 @@ def verify_face_recheck(authorization: Optional[str] = Header(default=None)):
     if not tries:
         return {"ok": False, "reason": "selfies_needed"}
     _, front, ok, reason, scores = max(tries, key=lambda t: t[0])
-    status = "ok" if ok else ("in_review" if face_match.needs_review(reason) else "failed")
+    review: Optional[Dict[str, Any]] = None
+    if face_match.needs_review(reason):
+        ok, review = True, {"kind": "photos", "reason": reason}     # verified, the team looks
+        reason = "ok"
+    elif ok and (rec.get("review") or {}).get("kind") not in (None, "photos"):
+        review = rec["review"]          # new photos don't settle "the same face on another account"
+    status = "ok" if ok else "failed"
     _save_face_result(uid, status, reason, photos, {"scores": scores, "photos": photos, "recheckedAtIso": _now_iso()},
-                      {"kind": "photos", "frontSelfie": front_url, "photos": photos} if status == "in_review" else None)
+                      {**review, "frontSelfie": front_url, "photos": photos} if review else None)
     if ok:
         tpl = firestore_client.collection("faceTemplates").document(uid).get().to_dict() or {}
         if tpl.get("status") != "verified":

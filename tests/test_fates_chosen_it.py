@@ -145,7 +145,8 @@ def test_an_unverified_viewer_is_asked_to_verify_first(env):
     assert body["needsVerification"] is True and body["paths"] == [] and body["verifiedNearby"] >= 1
     assert body["verifyReason"] == ""
     assert not db.document(f"dailyFates/{uid}__{body['dayKey']}").get().exists
-    assert env["client"].post("/fates/open", headers=h, json={"path": "heart"}).status_code == 404
+    opened = env["client"].post("/fates/open", headers=h, json={"path": "heart"})
+    assert opened.status_code == 403 and opened.json()["detail"] == "not_verified"
     db.document(f"profiles/{uid}").set({"faceVerified": True, "faceVerifiedPhotos": ["https://example.com/raj.jpg"]}, merge=True)
     after = env["client"].post("/fates/today", headers=h).json()                                     # the server verified them
     assert not after.get("needsVerification") and len(after["paths"]) >= 1

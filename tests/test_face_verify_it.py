@@ -177,24 +177,69 @@ def test_photos_that_are_someone_else_fail_but_keep_the_selfie_for_a_recheck(env
     assert rc["ok"] and env.db.document(f"profiles/{uid}").get().to_dict()["faceVerified"] is True
 
 
-def test_just_under_the_bar_goes_to_a_person(env):
+def test_just_under_the_bar_is_verified_and_the_team_looks(env):
     uid, h = env.user("almost", photo_face="almost~almost")
     r, _, urls = env.attempt(uid, h, "almost")
-    assert r.json() == {"ok": False, "status": "in_review", "reason": "review_main_photo"}
+    assert r.json() == {"ok": True, "status": "ok", "reason": "ok"}          # the badge and Daily Fates at once
+    prof = env.db.document(f"profiles/{uid}").get().to_dict()
+    assert prof["faceVerified"] is True and prof["faceVerifiedPhotos"] == env.photos[uid]
+    assert env.db.document(f"publicProfiles/{uid}").get().to_dict()["isFaceVerified"] is True
     rec = env.db.document(f"faceVerifications/{uid}").get().to_dict()
-    assert rec["review"]["kind"] == "photos" and rec["review"]["frontSelfie"] == urls[0]
-    assert env.db.document(f"profiles/{uid}").get().to_dict()["faceVerified"] is False
-    assert env.db.document(f"faceTemplates/{uid}").get().to_dict()["status"] == "pending"
+    assert rec["needsLook"] is True and rec["review"]["kind"] == "photos" and rec["review"]["reason"] == "review_main_photo"
+    assert rec["review"]["frontSelfie"] == urls[0]
+    assert env.db.document(f"faceTemplates/{uid}").get().to_dict()["status"] == "verified"
 
 
-def test_the_same_face_on_a_second_account_goes_to_a_person(env):
+def test_a_clean_pass_needs_no_look(env):
+    uid, h = env.user("clean")
+    env.attempt(uid, h, "clean")
+    rec = env.db.document(f"faceVerifications/{uid}").get().to_dict()
+    assert rec["needsLook"] is False and "review" not in rec
+
+
+def test_the_same_face_on_a_second_account_is_verified_and_flagged(env):
     first, h1 = env.user("original")
     assert env.attempt(first, h1, "original")[0].json()["status"] == "ok"
     second, h2 = env.user("copycat", photo_face="original")           # the same person, a second account
     r, _, _ = env.attempt(second, h2, "original")
-    assert r.json()["reason"] == "review_duplicate"
+    assert r.json()["status"] == "ok"
     rec = env.db.document(f"faceVerifications/{second}").get().to_dict()
-    assert rec["review"]["kind"] == "duplicate" and rec["review"]["duplicateOf"][0]["uid"] == first
+    assert rec["needsLook"] is True and rec["review"]["kind"] == "duplicate"
+    assert rec["review"]["duplicateOf"][0]["uid"] == first and "restricted" not in rec["review"]
+
+
+def test_the_same_face_as_a_banned_account_waits_for_a_person(env):
+    banned, hb = env.user("banned_one")
+    assert env.attempt(banned, hb, "banned_one")[0].json()["status"] == "ok"
+    env.db.document(f"moderationStates/{banned}").set({"status": "banned", "banType": "permanent"})
+    comeback, hc = env.user("comeback", photo_face="banned_one")
+    r, _, _ = env.attempt(comeback, hc, "banned_one")
+    assert r.json() == {"ok": False, "status": "in_review", "reason": "review_duplicate"}
+    assert env.db.document(f"profiles/{comeback}").get().to_dict()["faceVerified"] is False
+    rec = env.db.document(f"faceVerifications/{comeback}").get().to_dict()
+    assert rec["needsLook"] is True and rec["review"]["restricted"] == [banned]
+    # new photos don't lift the hold
+    assert env.client.post("/verify-face-recheck", headers=hc).json()["status"] == "in_review"
+
+
+def test_verified_again_after_a_removal_is_looked_at(env):
+    uid, h = env.user("again")
+    env.db.document(f"faceVerifications/{uid}").set({"status": "revoked", "revokedBefore": True, "posesOk": False})
+    r, _, _ = env.attempt(uid, h, "again")
+    assert r.json()["status"] == "ok"
+    rec = env.db.document(f"faceVerifications/{uid}").get().to_dict()
+    assert rec["needsLook"] is True and rec["review"]["kind"] == "after_removal"
+
+
+def test_a_recheck_just_under_the_bar_stays_verified(env):
+    uid, h = env.user("recheck_almost")
+    assert env.attempt(uid, h, "recheck_almost")[0].json()["status"] == "ok"
+    env.photos[uid] = [env.photos[uid][0].replace("recheck_almost.jpg", "recheck_almost~almost.jpg")]
+    rc = env.client.post("/verify-face-recheck", headers=h).json()
+    assert rc["ok"] and rc["status"] == "ok"
+    rec = env.db.document(f"faceVerifications/{uid}").get().to_dict()
+    assert rec["needsLook"] is True and rec["review"]["kind"] == "photos"
+    assert env.db.document(f"profiles/{uid}").get().to_dict()["faceVerifiedPhotos"] == env.photos[uid]
 
 
 def test_withdraw_removes_everything(env):

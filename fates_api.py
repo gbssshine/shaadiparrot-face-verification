@@ -578,12 +578,24 @@ def _pair_for(db, viewer: fe.Person, target_uid: str, now_ms: int) -> fe.Pair:
     return fe.evaluate_pair(viewer, cand, now_ms, _match_fn)
 
 
+def _require_verified(db, uid: str, viewer: Optional[fe.Person] = None) -> None:
+    """Opening, accepting and revealing need a verification that still holds: the team may have removed it
+    after today's paths were made (the app then shows the verify screen again)."""
+    if not fe.VERIFIED_ONLY:
+        return
+    if viewer is None:
+        viewer, _, _ = load_person(db, uid)
+    if not viewer.face_verified:
+        raise HTTPException(status_code=403, detail="not_verified")
+
+
 @router.post("/open")
 def fates_open(body: OpenRequest, authorization: Optional[str] = Header(default=None)):
     from google.cloud import firestore as fs
 
     uid = _d().verify_uid(authorization)
     db = _db()
+    _require_verified(db, uid)
     key = day_key()
     ref = db.document(f"dailyFates/{uid}__{key}")
     mem_ref = db.document(f"fatesMemory/{uid}")
@@ -715,6 +727,8 @@ def fates_decision(body: DecisionRequest, authorization: Optional[str] = Header(
     db = _db()
     if body.decision not in ("accepted", "skipped"):
         raise HTTPException(status_code=400, detail="bad_decision")
+    if body.decision == "accepted":
+        _require_verified(db, uid)
     key = day_key()
     ref = db.document(f"dailyFates/{uid}__{key}")
     doc = ref.get().to_dict() or {}
@@ -871,6 +885,7 @@ def fates_chosen_reveal(body: RevealRequest, authorization: Optional[str] = Head
     if c is None:
         raise HTTPException(status_code=404, detail="not_found")
     viewer, priv, usr = load_person(db, uid)
+    _require_verified(db, uid, viewer)
     premium = _d().is_premium(usr, priv, datetime.now(timezone.utc))
     mem_ref = db.document(f"fatesMemory/{uid}")
     profile_ref = db.document(f"profiles/{uid}")

@@ -179,3 +179,16 @@ def test_stats_are_counted(env):
     today = env["client"].post("/fates/today", headers=env["h"]).json()
     stats = env["db"].document(f"fatesStats/{today['dayKey']}").get().to_dict()
     assert stats["generated"] == 1 and stats["opens"] >= 1 and stats["aiPickOk"] == 1
+
+
+
+def test_a_removed_verification_stops_opening(env):
+    c, db, h, uid = env["client"], env["db"], env["h"], env["uid"]
+    db.document(f"profiles/{uid}").set({"faceVerified": False, "isFaceVerified": False, "faceVerifiedReason": "review_rejected"}, merge=True)
+    try:
+        r = c.post("/fates/open", headers=h, json={"path": "stars"})
+        assert r.status_code == 403 and r.json()["detail"] == "not_verified"
+        today = c.post("/fates/today", headers=h).json()
+        assert today["needsVerification"] is True and today["verifyReason"] == "review_rejected"
+    finally:
+        db.document(f"profiles/{uid}").set({"faceVerified": True, "isFaceVerified": True, "faceVerifiedReason": "ok"}, merge=True)
