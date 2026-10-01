@@ -9,7 +9,8 @@ import hashlib
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Literal, Dict, Any, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -93,6 +94,15 @@ if not firebase_admin._apps:
 class VerifyFaceRequest(BaseModel):
     user_id: str
     image_url: HttpUrl
+
+
+class VerifyFaceStartRequest(BaseModel):
+    consent: str = ""           # the version of the notice the person agreed to in the app (e.g. "face-2026-10")
+
+
+class VerifyFaceLiveRequest(BaseModel):
+    challengeId: str            # from /verify-face-start
+    selfies: List[str]          # one per challenge step, in order (the user's own Storage uploads)
 
 
 class VerifyPhotoRequest(BaseModel):
@@ -1292,6 +1302,7 @@ def _deepseek_complete(
     max_tokens: int,
     temperature: Optional[float] = None,
     kind: str = "chat",
+    timeout: Optional[int] = None,
 ) -> Tuple[str, str]:
     """Returns (text, finish_reason) and logs token usage, including prefix-cache hits."""
     if not DEEPSEEK_API_KEY:
@@ -1310,7 +1321,7 @@ def _deepseek_complete(
     }
 
     try:
-        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=DS_TIMEOUT_SEC)
+        r = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=timeout or DS_TIMEOUT_SEC)
     except Exception as e:
         logger.exception("DeepSeek request failed")
         raise HTTPException(status_code=502, detail=f"DeepSeek request error: {type(e).__name__}")
@@ -2042,3 +2053,419 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         logger.exception("Daily horoscope store failed uid=%s", uid)
         was_cached = False
     return DailyHoroscopeResponse(ok=True, text=text, dayKey=day_key, cached=was_cached)
+
+
+# =========================
+# DAILY FATES
+# =========================
+# Three paths a day (Stars, Heart, Home): picking, kundli matching and the AI verdict live in fates_*.py.
+import face_live  # noqa: E402
+import face_match  # noqa: E402
+
+FACE_VERIFY_DAILY_ATTEMPTS = int(os.getenv("FACE_VERIFY_DAILY_ATTEMPTS") or "6")
+
+
+def _take_face_attempt(uid: str) -> bool:
+    """Up to FACE_VERIFY_DAILY_ATTEMPTS tries a day (each costs three Vision calls)."""
+    return _take_counter(uid, "faceVerifyAttempts", FACE_VERIFY_DAILY_ATTEMPTS)
+
+
+FACE_RECHECKS_PER_DAY = 20
+FACE_CHALLENGE_TTL_SEC = 600
+FACE_METHOD = "challenge+photos"
+FACE_MODEL = "sface_2021dec"
+
+
+def _face_ref(uid: str):
+    return firestore_client.collection("faceVerifications").document(uid)
+
+
+def _counter_used(uid: str, field: str) -> int:
+    cur = ((firestore_client.collection("users").document(uid).get().to_dict() or {}).get(field) or {})
+    return int(cur.get("n") or 0) if cur.get("day") == datetime.now(timezone.utc).date().isoformat() else 0
+
+
+def _take_challenge(uid: str, challenge_id: str) -> Optional[Dict[str, Any]]:
+    """The challenge issued by /verify-face-start, if it's this one, unused and not expired. Used up here."""
+    from google.cloud import firestore as fs
+    ref = _face_ref(uid)
+
+    @fs.transactional
+    def take(tx) -> Optional[Dict[str, Any]]:
+        ch = (ref.get(transaction=tx).to_dict() or {}).get("challenge") or {}
+        if not challenge_id or ch.get("id") != challenge_id or ch.get("used"):
+            return None
+        try:
+            if datetime.fromisoformat(str(ch.get("expiresAtIso"))) < datetime.now(timezone.utc):
+                return None
+        except ValueError:
+            return None
+        tx.set(ref, {"challenge": {"used": True}}, merge=True)
+        return ch
+
+    return take(firestore_client.transaction())
+
+
+_gcs_client = None
+
+
+def _gcs():
+    """Cloud Storage (the local Storage emulator when FIREBASE_STORAGE_EMULATOR_HOST is set)."""
+    global _gcs_client
+    if _gcs_client is None:
+        from google.cloud import storage as gcs
+        emu = (os.getenv("FIREBASE_STORAGE_EMULATOR_HOST") or "").strip()
+        if emu:
+            os.environ.setdefault("STORAGE_EMULATOR_HOST", emu if "://" in emu else "http://" + emu)
+            from google.auth.credentials import AnonymousCredentials
+            _gcs_client = gcs.Client(project=os.getenv("GOOGLE_CLOUD_PROJECT") or "demo", credentials=AnonymousCredentials())
+        else:
+            _gcs_client = gcs.Client()
+    return _gcs_client
+
+
+def _verification_bucket(uid: str) -> Optional[str]:
+    rec = (_face_ref(uid).get().to_dict() or {}) if firestore_client else {}
+    for u in [rec.get("frontSelfie")] + list(rec.get("selfies") or []) + list(rec.get("photos") or []):
+        obj = face_live.storage_object(str(u or ""))
+        if obj:
+            return obj[0]
+    return os.getenv("FIREBASE_STORAGE_BUCKET") or None
+
+
+def _clean_selfies(uid: str, keep: Optional[str] = None, bucket: Optional[str] = None) -> int:
+    """Deletes everything in users/{uid}/verification/ except the selfie kept for re-checks. Returns how many."""
+    kept = face_live.storage_object(keep or "")
+    name = bucket or (kept[0] if kept else None) or _verification_bucket(uid)
+    if not name:
+        return 0
+    n = 0
+    try:
+        for blob in _gcs().bucket(name).list_blobs(prefix=f"users/{uid}/verification/"):
+            if kept and blob.name == kept[1]:
+                continue
+            blob.delete()
+            n += 1
+    except Exception:
+        logger.exception("selfie cleanup failed")
+    return n
+
+
+def _fresh_uploads(urls: List[str], issued_iso: str) -> bool:
+    """The selfies were uploaded after the challenge was issued (photos made before can't be replayed).
+    If Storage can't be asked, the check is skipped (logged)."""
+    try:
+        issued = datetime.fromisoformat(issued_iso) - timedelta(seconds=60)      # clock skew
+        for u in urls:
+            obj = face_live.storage_object(u)
+            blob = _gcs().bucket(obj[0]).get_blob(obj[1]) if obj else None
+            if blob is None or blob.time_created is None:
+                raise ValueError("no upload time")
+            if blob.time_created < issued:
+                return False
+        return True
+    except Exception:
+        logger.warning("selfie upload time not checked", exc_info=True)
+        return True
+
+
+_TEMPLATES_TTL_SEC = 600            # look for new or changed templates this often
+_TEMPLATES_FULL_SEC = 24 * 3600     # and read them all once a day (picks up deletions made on other instances)
+_templates: Dict[str, Any] = {"at": 0.0, "full": 0.0, "since": "", "v": {}}
+
+
+def _verified_templates() -> Dict[str, Any]:
+    """uid -> face template of every verified account, for the duplicate check. The whole set is read once a
+    day per instance; in between only templates changed since the last look (a few reads instead of all)."""
+    import numpy as np
+    now = time.time()
+    if now - _templates["at"] <= _TEMPLATES_TTL_SEC:
+        return _templates["v"]
+    full = now - _templates["full"] > _TEMPLATES_FULL_SEC
+    started = _now_iso()
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        col = firestore_client.collection("faceTemplates")
+        # A range on one field only (no composite index needed); the status is checked here.
+        q = col if full else col.where(filter=FieldFilter("updatedAtIso", ">=", _templates["since"]))
+        found: Dict[str, Any] = {} if full else dict(_templates["v"])
+        for d in q.select(["v", "status"]).stream():
+            x = d.to_dict() or {}
+            v = x.get("v")
+            if x.get("status") == "verified" and isinstance(v, list) and v:
+                found[d.id] = np.asarray(v, dtype=np.float32)
+            else:
+                found.pop(d.id, None)
+        _templates.update(at=now, since=started, v=found, **({"full": now} if full else {}))
+    except Exception:
+        logger.exception("face templates load failed")
+    return _templates["v"]
+
+
+def _store_template(uid: str, vec: Any, status: str) -> None:
+    import numpy as np
+    v = np.asarray(vec, dtype=np.float32).ravel()
+    try:
+        firestore_client.collection("faceTemplates").document(uid).set({
+            "v": [round(float(x), 6) for x in v], "status": status, "model": FACE_MODEL, "updatedAtIso": _now_iso()})
+        if status == "verified":
+            _templates["v"][uid] = v
+        else:
+            _templates["v"].pop(uid, None)
+    except Exception:
+        logger.exception("face template write failed")
+
+
+def _own_photos(uid: str) -> List[str]:
+    pub = (firestore_client.collection("publicProfiles").document(uid).get().to_dict() or {}) if firestore_client else {}
+    photos = [str(p) for p in (pub.get("photos") or []) if isinstance(p, str) and p.strip()][:6]
+    return [p for p in photos if face_live.own_photo_url(p, uid)]
+
+
+def _photo_faces(urls: List[str]) -> List[List[Any]]:
+    out = []
+    for u in urls:
+        try:
+            out.append(face_match.face_features(face_match.decode(_download_image_bytes(u, max_mb=12))))
+        except Exception:
+            logger.warning("face match: photo unreadable", exc_info=True)
+            out.append([])
+    return out
+
+
+_COHORT_TTL_SEC = 6 * 3600
+_COHORT_SIZE = 40
+_cohort_cache: Dict[str, Tuple[float, List[Tuple[str, Any]]]] = {}
+
+
+def _cohort(uid: str) -> List[Any]:
+    """Faces from the main photos of up to 40 other people of the same gender, for face_match's look-alike check.
+    Kept in this instance's memory only (never stored), refreshed every few hours."""
+    import time as _time
+    if firestore_client is None:
+        return []
+    me = firestore_client.collection("publicProfiles").document(uid).get().to_dict() or {}
+    gender = str(me.get("gender") or "").strip().lower()
+    hit = _cohort_cache.get(gender)
+    if not hit or _time.time() - hit[0] > _COHORT_TTL_SEC:
+        faces: List[Tuple[str, Any]] = []
+        try:
+            from google.cloud.firestore_v1.base_query import FieldFilter
+            q = firestore_client.collection("publicProfiles").where(filter=FieldFilter("isDiscoverable", "==", True))
+            if gender:
+                q = q.where(filter=FieldFilter("gender", "==", me.get("gender")))
+            for d in q.limit(_COHORT_SIZE * 2).stream():
+                if len(faces) >= _COHORT_SIZE:
+                    break
+                photos = [p for p in ((d.to_dict() or {}).get("photos") or []) if isinstance(p, str)]
+                if not photos or not face_live.own_photo_url(photos[0], d.id):
+                    continue
+                try:
+                    found = face_match.face_features(face_match.decode(_download_image_bytes(photos[0], max_mb=12)))
+                except Exception:
+                    continue
+                if found:
+                    faces.append((d.id, found[0]))
+        except Exception:
+            logger.exception("face cohort build failed")
+        hit = (_time.time(), faces)
+        _cohort_cache[gender] = hit
+    return [f for owner, f in hit[1] if owner != uid]
+
+
+def _cohort_scores(uid: str, front: Any) -> List[float]:
+    return [face_match.similarity(front, f) for f in _cohort(uid)]
+
+
+def _save_face_result(uid: str, status: str, reason: str, photos: List[str], record: Dict[str, Any],
+                      review: Optional[Dict[str, Any]] = None) -> None:
+    """status: "ok", "failed" or "in_review" (a person on the team decides; not verified meanwhile).
+    profiles: the flags + which photos were checked (the app can't write these); publicProfiles: the badge;
+    faceVerifications/{uid} (server only): the kept selfie, the scores and what a reviewer needs."""
+    if firestore_client is None:
+        return
+    from google.cloud import firestore as fs
+    ok = status == "ok"
+    now = _now_iso()
+    try:
+        firestore_client.collection("profiles").document(uid).set({
+            "faceVerified": ok, "isFaceVerified": ok, "faceVerifiedReason": reason,
+            "faceVerifiedAtIso": now, "faceVerifiedMethod": FACE_METHOD,
+            "faceVerifiedPhotos": photos if ok else [],
+        }, merge=True)
+        firestore_client.collection("publicProfiles").document(uid).set({"isFaceVerified": ok}, merge=True)
+        _face_ref(uid).set({**record, "status": status, "reason": reason, "updatedAtIso": now,
+                            "review": ({**review, "requestedAtIso": now} if review else fs.DELETE_FIELD)}, merge=True)
+    except Exception:
+        logger.exception("face verification result write failed")
+
+
+def _take_counter(uid: str, field: str, limit: int) -> bool:
+    if firestore_client is None:
+        return True
+    from google.cloud import firestore as fs
+    ref = firestore_client.collection("users").document(uid)
+    day = datetime.now(timezone.utc).date().isoformat()
+
+    @fs.transactional
+    def take(tx) -> bool:
+        cur = (ref.get(transaction=tx).to_dict() or {}).get(field) or {}
+        n = int(cur.get("n") or 0) if cur.get("day") == day else 0
+        if n >= limit:
+            return False
+        tx.set(ref, {field: {"day": day, "n": n + 1}}, merge=True)
+        return True
+
+    try:
+        return take(firestore_client.transaction())
+    except Exception:
+        logger.exception("face counter failed")
+        return True
+
+
+@app.post("/verify-face-start")
+def verify_face_start(body: Optional[VerifyFaceStartRequest] = None, authorization: Optional[str] = Header(default=None)):
+    """A new random challenge: a straight selfie, then two of "turn right", "turn left", "smile" in a random
+    order. Valid for 10 minutes and for one try. Needs the person's consent to the notice shown in the app
+    (DPDP: the selfies and face templates are personal data); which notice and when is kept as the record."""
+    uid = _verify_firebase_token_or_401(authorization)
+    consent = re.sub(r"[^A-Za-z0-9_.-]", "", str((body.consent if body else "") or ""))[:40]
+    if not consent:
+        raise HTTPException(status_code=400, detail="consent_needed")
+    if firestore_client is None or not face_match.available():
+        raise HTTPException(status_code=503, detail="face_match_unavailable")
+    if _counter_used(uid, "faceVerifyAttempts") >= FACE_VERIFY_DAILY_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+    now = datetime.now(timezone.utc)
+    ch = {"id": secrets.token_urlsafe(12), "steps": face_live.new_challenge(), "issuedAtIso": now.isoformat(),
+          "expiresAtIso": (now + timedelta(seconds=FACE_CHALLENGE_TTL_SEC)).isoformat(), "used": False}
+    _face_ref(uid).set({"challenge": ch, "consent": {"version": consent, "atIso": now.isoformat()}}, merge=True)
+    return {"challengeId": ch["id"], "steps": ch["steps"], "expiresInSec": FACE_CHALLENGE_TTL_SEC}
+
+
+def _judge_live(uid: str, steps: List[str], urls: List[str], issued_iso: str):
+    """-> (status, reason, record, review, template). Liveness first (Cloud Vision, the challenge), then the face
+    (OpenCV): the selfies are one person, that person is in the profile photos, and not on another account."""
+    data = [_download_image_bytes(u, max_mb=10) for u in urls]
+    record: Dict[str, Any] = {"steps": steps, "posesOk": False, "attemptAtIso": _now_iso()}
+    if len({hashlib.sha256(b).hexdigest() for b in data}) != len(data):
+        return "failed", "three_selfies_needed", record, None, None
+    if not _fresh_uploads(urls, issued_iso):
+        return "failed", "take_new_selfies", record, None, None
+    shots = [(*_detect_faces_and_safety_from_bytes(b),) for b in data]
+    ok, reason, pans = face_live.judge_challenge(steps, shots)
+    record["pans"] = [round(p, 1) for p in pans]
+    if not ok:
+        return "failed", reason, record, None, None
+    selfie_faces = [face_match.face_features(face_match.decode(b)) for b in data]
+    if not selfie_faces[0]:
+        return "failed", "no_face_detected_1", record, None, None
+    front = selfie_faces[0][0]
+    photos = _own_photos(uid)
+    record.update({"posesOk": True, "photos": photos})
+    ok, reason, scores = face_match.judge(front, [f[0] for f in selfie_faces[1:] if f], _photo_faces(photos),
+                                          _cohort_scores(uid, front))
+    record["scores"] = scores
+    if reason == "selfies_not_same_person":
+        record["posesOk"] = False                       # nothing worth keeping for a re-check
+    if face_match.needs_review(reason):
+        return "in_review", reason, record, {"kind": "photos"}, front
+    if not ok:
+        return "failed", reason, record, None, None
+    dups = face_match.duplicates(front, _verified_templates(), exclude=uid)
+    if dups:
+        record["duplicates"] = [{"uid": u, "sim": round(s, 3)} for u, s in dups[:3]]
+        return "in_review", "review_duplicate", record, {"kind": "duplicate", "duplicateOf": record["duplicates"]}, front
+    return "ok", "ok", record, None, front
+
+
+@app.post("/verify-face-live")
+def verify_face_live(body: VerifyFaceLiveRequest, authorization: Optional[str] = Header(default=None)):
+    """The challenge's selfies. Passing marks the profile verified (the server writes it, never the app); just
+    under a bar, or the same face on another account, goes to a person on the team ("in_review").
+    Afterwards only the straight selfie is kept (for re-checks after a photo change); the rest is deleted."""
+    uid = _verify_firebase_token_or_401(authorization)
+    urls = [str(u or "").strip() for u in (body.selfies or [])]
+    if len(urls) != 3 or len(set(urls)) != 3 or not all(face_live.selfie_url_ok(u, uid) for u in urls):
+        raise HTTPException(status_code=400, detail="bad_selfies")
+    if firestore_client is None or not face_match.available():
+        raise HTTPException(status_code=503, detail="face_match_unavailable")
+    ch = _take_challenge(uid, str(body.challengeId or ""))
+    if ch is None:
+        raise HTTPException(status_code=400, detail="challenge_expired")
+    if not _take_face_attempt(uid):
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+    steps = [str(s) for s in (ch.get("steps") or [])]
+    status, reason, record, review, front = _judge_live(uid, steps, urls, str(ch.get("issuedAtIso") or ""))
+    keep = urls[0] if record.get("posesOk") else None
+    record.update({"frontSelfie": keep or "", "selfies": [keep] if keep else []})
+    if front is not None:
+        _store_template(uid, front, "verified" if status == "ok" else "pending")
+    _save_face_result(uid, status, reason, record.get("photos") or [], record,
+                      {**review, "frontSelfie": keep, "photos": record.get("photos") or []} if review else None)
+    _clean_selfies(uid, keep, bucket=(face_live.storage_object(urls[0]) or (None,))[0])
+    return {"ok": status == "ok", "status": status, "reason": reason}
+
+
+@app.post("/verify-face-recheck")
+def verify_face_recheck(authorization: Optional[str] = Header(default=None)):
+    """After the photos changed: the new photos against the selfie kept from the last verification, no new
+    selfies needed. Restores (or removes) the verified flags."""
+    uid = _verify_firebase_token_or_401(authorization)
+    if firestore_client is None or not face_match.available():
+        raise HTTPException(status_code=503, detail="face_match_unavailable")
+    rec = firestore_client.collection("faceVerifications").document(uid).get().to_dict() or {}
+    front_url = str(rec.get("frontSelfie") or "")
+    if not rec.get("posesOk") or not face_live.selfie_url_ok(front_url, uid):
+        return {"ok": False, "reason": "selfies_needed"}
+    if not _take_counter(uid, "faceRecheckAttempts", FACE_RECHECKS_PER_DAY):
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+    front = face_match.face_features(face_match.decode(_download_image_bytes(front_url, max_mb=10)))
+    if not front:
+        return {"ok": False, "reason": "selfies_needed"}
+    photos = _own_photos(uid)
+    ok, reason, scores = face_match.judge(front[0], [], _photo_faces(photos), _cohort_scores(uid, front[0]))
+    status = "ok" if ok else ("in_review" if face_match.needs_review(reason) else "failed")
+    _save_face_result(uid, status, reason, photos, {"scores": scores, "photos": photos, "recheckedAtIso": _now_iso()},
+                      {"kind": "photos", "frontSelfie": front_url, "photos": photos} if status == "in_review" else None)
+    if ok:
+        tpl = firestore_client.collection("faceTemplates").document(uid).get().to_dict() or {}
+        if tpl.get("status") != "verified":
+            _store_template(uid, front[0], "verified")
+    return {"ok": ok, "status": status, "reason": reason}
+
+
+@app.post("/verify-face-withdraw")
+def verify_face_withdraw(authorization: Optional[str] = Header(default=None)):
+    """"Remove my verification": deletes the selfies, the face template and the scores; the badge goes. Only
+    the consent record stays (when it was given and withdrawn, no images), until the account is deleted."""
+    uid = _verify_firebase_token_or_401(authorization)
+    if firestore_client is None:
+        raise HTTPException(status_code=503, detail="unavailable")
+    bucket = _verification_bucket(uid)
+    _clean_selfies(uid, None, bucket=bucket)
+    firestore_client.collection("faceTemplates").document(uid).delete()
+    _templates["v"].pop(uid, None)
+    consent = (_face_ref(uid).get().to_dict() or {}).get("consent") or {}
+    _face_ref(uid).set({"status": "withdrawn", "reason": "withdrawn", "updatedAtIso": _now_iso(),
+                        "consent": {**consent, "withdrawnAtIso": _now_iso()}})
+    firestore_client.collection("profiles").document(uid).set({
+        "faceVerified": False, "isFaceVerified": False, "faceVerifiedReason": "withdrawn",
+        "faceVerifiedAtIso": _now_iso(), "faceVerifiedPhotos": []}, merge=True)
+    firestore_client.collection("publicProfiles").document(uid).set({"isFaceVerified": False}, merge=True)
+    return {"ok": True}
+
+
+import fates_api  # noqa: E402
+
+FATES_AI_TIMEOUT_SEC = int(os.getenv("FATES_AI_TIMEOUT_SEC") or "14")
+
+fates_api.configure(fates_api.Deps(
+    db=lambda: firestore_client,
+    verify_uid=_verify_firebase_token_or_401,
+    complete=lambda messages, max_tokens, temperature, kind: _deepseek_complete(
+        messages, max_tokens, temperature=temperature, kind=kind, timeout=FATES_AI_TIMEOUT_SEC),
+    resolve_place=_resolve_birth_place,
+    is_premium=_is_premium_like_client,
+))
+app.include_router(fates_api.router)

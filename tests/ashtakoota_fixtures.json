@@ -1,0 +1,536 @@
+{
+ "note": "Fixtures and research notes for fates_astro.py (compiled 2026-09-30 from AstroSage/Prokerala output and published tables).",
+ "confidence": {
+  "nakshatra_gana": "high",
+  "nakshatra_nadi": "high",
+  "nakshatra_yoni_animal": "high",
+  "nakshatra_yoni_gender": "high (only needed for display)",
+  "rashi_lords": "high",
+  "varna_mapping": "high (Saravali/PyJHora swap Vaishya/Shudra - minority)",
+  "vashya_sign_groups": "high",
+  "vashya_matrix": "medium-low (5 published variants; only 2 cells verified from software output)",
+  "tara_rule": "high",
+  "yoni_matrix": "medium (194/196 cells agree across software-family tables; 2 asymmetric cells disputed)",
+  "graha_maitri": "high",
+  "gana_matrix": "medium (values agree; boy/girl orientation of the two asymmetric cells disputed)",
+  "bhakoot": "high",
+  "nadi": "high"
+ },
+ "examples": [
+  {
+   "id": "astrosage_virat_anushka",
+   "source": "AstroSage Magazine (AstroSage software output table)",
+   "url": "https://www.astrosage.com/magazine/virat-kohli-anushka-sharma-marriage-prediction.asp",
+   "boy": {
+    "nakshatra": 4,
+    "name": "Rohini",
+    "pada": 3,
+    "rashi": 2,
+    "rashi_name": "Vrishabha (Taurus)"
+   },
+   "girl": {
+    "nakshatra": 3,
+    "name": "Krittika",
+    "pada": 1,
+    "rashi": 1,
+    "rashi_name": "Mesha (Aries)"
+   },
+   "published_attributes": {
+    "varna": [
+     "Vaishya",
+     "Kshatriya"
+    ],
+    "vashya": [
+     "Chatu",
+     "Chatu"
+    ],
+    "tara": [
+     "Janma",
+     "Vipat"
+    ],
+    "yoni": [
+     "Sarpa",
+     "Mesha"
+    ],
+    "graha_maitri": [
+     "Venus",
+     "Mars"
+    ],
+    "gana": [
+     "Manushya",
+     "Rakshas"
+    ],
+    "bhakoot": [
+     "Taurus",
+     "Aries"
+    ],
+    "nadi": [
+     "Antya",
+     "Antya"
+    ]
+   },
+   "expected": {
+    "varna": 0,
+    "vashya": 2,
+    "tara": 3,
+    "yoni": 2,
+    "graha_maitri": 3,
+    "gana": 0,
+    "bhakoot": 0,
+    "nadi": 0,
+    "total": 10
+   },
+   "notes": [
+    "AstroSage prints tara labels 'Janma'/'Vipat' but awards 3/3; by the standard count (girl->boy = 2 Sampat, boy->girl = 27 -> remainder 0 Parama Mitra) 3 is correct, so the labels on that page look like a display quirk - test the points, not the labels.",
+    "Nadi stays 0 although Rohini and Krittika are both on AstroSage's own 'exempt from Nadi dosha' list: the score is raw, exemptions are reported separately.",
+    "Discriminates variants: Maitreya8 yoni (Serpent-Sheep = 1) and Maitreya8 maitri (neutral-neutral = 2) fail."
+   ],
+   "variants_that_fail_this_fixture": {
+    "yoni:maitreya8": 1
+   }
+  },
+  {
+   "id": "prokerala_sample_report",
+   "source": "Prokerala 'Kundali Matching Mini' sample PDF (Prokerala software output)",
+   "url": "https://apiorigin.prokerala.com/reports/sample/guna-milan-en.pdf",
+   "boy": {
+    "nakshatra": 10,
+    "name": "Magha",
+    "pada": 3,
+    "rashi": 5,
+    "rashi_name": "Simha (Leo)"
+   },
+   "girl": {
+    "nakshatra": 1,
+    "name": "Ashwini",
+    "pada": 3,
+    "rashi": 1,
+    "rashi_name": "Mesha (Aries)"
+   },
+   "published_attributes": {
+    "varna": [
+     "Kshatriya",
+     "Kshatriya"
+    ],
+    "vashya": [
+     "Vanachara",
+     "Chatushpada"
+    ],
+    "tara": [
+     "Magha",
+     "Ashwini"
+    ],
+    "yoni": [
+     "Mushika",
+     "Ashwa"
+    ],
+    "graha_maitri": [
+     "Sun",
+     "Mars"
+    ],
+    "gana": [
+     "Rakshasa",
+     "Devata"
+    ],
+    "bhakoot": [
+     "Simha",
+     "Mesha"
+    ],
+    "nadi": [
+     "Antya",
+     "Adi"
+    ]
+   },
+   "expected": {
+    "varna": 1,
+    "vashya": 0,
+    "tara": 3,
+    "yoni": 2,
+    "graha_maitri": 5,
+    "gana": 1,
+    "bhakoot": 0,
+    "nadi": 8,
+    "total": 20
+   },
+   "notes": [
+    "Gana boy Rakshasa + girl Deva = 1 here: this is the orientation used by the recommended gana matrix. With the Maitreya/onlinejyotish/PyJHora orientation this pair gives 0 and the total becomes 19.",
+    "Bhakoot 5/9 (Leo-Aries) scored 0 even though the lords Sun and Mars are mutual friends, i.e. Prokerala does not add points back for Bhakoot cancellation; likewise gana is not upgraded despite friendly lords.",
+    "Vashya Vanachara(boy) x Chatushpada(girl) = 0 rules out the astroyogi table (1.5) and Maitreya8 (0.5).",
+    "Both natives shown Manglik: girl has Mars in 2nd from Lagna (Prokerala counts the 2nd house)."
+   ],
+   "variants_that_fail_this_fixture": {
+    "vashya:astroyogi": 1.5,
+    "vashya:maitreya_saravali": 0.5,
+    "yoni:maitreya8": 3,
+    "yoni:panchang_style_freehoroscopesonline": 3,
+    "gana:maitreya_onlinejyotish_pyjhora": 0
+   }
+  },
+  {
+   "id": "divineapi_same_nakshatra_bharani",
+   "source": "Divine API docs, Ashtakoot Milan sample response",
+   "url": "https://developers.divineapi.com/divine-api/indian-api/match-making-api/ashtakoot-milan",
+   "boy": {
+    "nakshatra": 2,
+    "name": "Bharani",
+    "pada": null,
+    "rashi": 1,
+    "rashi_name": "Mesha (Aries)"
+   },
+   "girl": {
+    "nakshatra": 2,
+    "name": "Bharani",
+    "pada": null,
+    "rashi": 1,
+    "rashi_name": "Mesha (Aries)"
+   },
+   "expected": {
+    "varna": 1,
+    "vashya": 2,
+    "tara": 3,
+    "yoni": 4,
+    "graha_maitri": 5,
+    "gana": 6,
+    "bhakoot": 7,
+    "nadi": 0,
+    "total": 28
+   },
+   "notes": [
+    "Same nakshatra, same sign: Tara counts 1 both ways (Janma) -> 3; Nadi 0 and flagged nadi_dosha=true.",
+    "Pada not published; any pada of Bharani is Aries, so the result is pada-independent. If padas differ, AstroSage's rules call the Nadi dosha cancelled but the score still shows 0."
+   ],
+   "variants_that_fail_this_fixture": {}
+  },
+  {
+   "id": "prokerala_api_same_nakshatra_uttara_bhadrapada",
+   "source": "Prokerala API v2 OpenAPI spec, /astrology/kundli-matching/advanced example",
+   "url": "http://apiorigin.prokerala.com/spec/astrology.v2.yaml",
+   "boy": {
+    "nakshatra": 26,
+    "name": "Uttara Bhadrapada",
+    "pada": 3,
+    "rashi": 12,
+    "rashi_name": "Meena (Pisces)"
+   },
+   "girl": {
+    "nakshatra": 26,
+    "name": "Uttara Bhadrapada",
+    "pada": 3,
+    "rashi": 12,
+    "rashi_name": "Meena (Pisces)"
+   },
+   "expected": {
+    "varna": 1,
+    "vashya": 2,
+    "tara": 3,
+    "yoni": 4,
+    "graha_maitri": 5,
+    "gana": 6,
+    "bhakoot": 7,
+    "nadi": 0,
+    "total": 28
+   },
+   "notes": [
+    "Prokerala's JSON uses 0-based ids (nakshatra id 25 = Uttara Bhadrapada, rasi id 11 = Meena).",
+    "Same nakshatra + same pada: 'Nadi Maha Dosha', union not recommended - no exception applies."
+   ],
+   "variants_that_fail_this_fixture": {}
+  },
+  {
+   "id": "astrosage_ekundali_partial_santosh_rakhi",
+   "source": "MyAstrology app test script, values it says were read from both AstroSage and EKundali reports (second-hand; only the kootas listed there are verified)",
+   "url": "https://github.com/MyAstrology/myastrology-app/blob/main/scripts/check-ashtakoota.js",
+   "boy": {
+    "nakshatra": 21,
+    "name": "Uttara Ashadha",
+    "pada": null,
+    "rashi": 10,
+    "rashi_name": "Makara (Capricorn)"
+   },
+   "girl": {
+    "nakshatra": 12,
+    "name": "Uttara Phalguni",
+    "pada": null,
+    "rashi": 5,
+    "rashi_name": "Simha (Leo)"
+   },
+   "expected_partial_verified": {
+    "varna": 0,
+    "tara": 3,
+    "graha_maitri": 0,
+    "gana": 6,
+    "nadi": 8
+   },
+   "computed_with_recommended_tables_unverified": {
+    "varna": 0,
+    "vashya": 0,
+    "tara": 3.0,
+    "yoni": 2,
+    "graha_maitri": 0,
+    "gana": 6,
+    "bhakoot": 0,
+    "nadi": 8,
+    "total": 19.0
+   },
+   "notes": [
+    "Use pada 2 for the boy (Capricorn) and pada 1 for the girl (Leo). Vashya/Yoni/Bhakoot were not published in that script; computed values are given for convenience only."
+   ],
+   "variants_that_fail_this_fixture": {}
+  }
+ ],
+ "manual_verification_checklist": {
+  "why": "These pairs separate the remaining variants; run them once on AstroSage (and Drik Panchang) by hand and pin the answers. Values are computed by the build script from the matrices in this file.",
+  "pairs": [
+   {
+    "koota": "gana",
+    "boy": "Magha pada 1 (Leo, Rakshasa)",
+    "girl": "Ashwini pada 1 (Aries, Deva)",
+    "points_by_variant": {
+     "recommended": 1,
+     "maitreya_onlinejyotish_pyjhora": 0
+    }
+   },
+   {
+    "koota": "gana",
+    "boy": "Ashwini pada 1 (Aries, Deva)",
+    "girl": "Bharani pada 1 (Aries, Manushya)",
+    "points_by_variant": {
+     "recommended": 6,
+     "maitreya_onlinejyotish_pyjhora": 5
+    }
+   },
+   {
+    "koota": "yoni",
+    "boy": "Jyeshtha pada 1 (Scorpio, Deer)",
+    "girl": "Ashwini pada 1 (Aries, Horse)",
+    "points_by_variant": {
+     "recommended": 3,
+     "symmetric_majority": 3,
+     "pyjhora": 1,
+     "maitreya8": 3,
+     "panchang_style_freehoroscopesonline": 3
+    }
+   },
+   {
+    "koota": "yoni",
+    "boy": "Ashwini pada 1 (Aries, Horse)",
+    "girl": "Anuradha pada 1 (Scorpio, Deer)",
+    "points_by_variant": {
+     "recommended": 1,
+     "symmetric_majority": 3,
+     "pyjhora": 1,
+     "maitreya8": 3,
+     "panchang_style_freehoroscopesonline": 3
+    }
+   },
+   {
+    "koota": "yoni",
+    "boy": "Swati pada 1 (Libra, Buffalo)",
+    "girl": "Dhanishta pada 1 (Capricorn, Lion)",
+    "points_by_variant": {
+     "recommended": 2,
+     "symmetric_majority": 1,
+     "pyjhora": 1,
+     "maitreya8": 1,
+     "panchang_style_freehoroscopesonline": 1
+    }
+   },
+   {
+    "koota": "vashya",
+    "boy": "Ardra pada 1 (Gemini, Manava)",
+    "girl": "Jyeshtha pada 1 (Scorpio, Keeta)",
+    "points_by_variant": {
+     "recommended": 1,
+     "onlinejyotish": 0,
+     "astroyogi": 1,
+     "pyjhora_default": 0,
+     "maitreya_saravali": 1
+    }
+   },
+   {
+    "koota": "vashya",
+    "boy": "Jyeshtha pada 1 (Scorpio, Keeta)",
+    "girl": "Ashwini pada 1 (Aries, Chatushpada)",
+    "points_by_variant": {
+     "recommended": 1,
+     "onlinejyotish": 1,
+     "astroyogi": 1,
+     "pyjhora_default": 2,
+     "maitreya_saravali": 0
+    }
+   },
+   {
+    "koota": "vashya",
+    "boy": "Magha pada 1 (Leo, Vanachara)",
+    "girl": "Pushya pada 1 (Cancer, Jalachara)",
+    "points_by_variant": {
+     "recommended": 1,
+     "onlinejyotish": 1,
+     "astroyogi": 1,
+     "pyjhora_default": 2,
+     "maitreya_saravali": 1
+    }
+   },
+   {
+    "koota": "vashya",
+    "boy": "Ardra pada 1 (Gemini, Manava)",
+    "girl": "Pushya pada 1 (Cancer, Jalachara)",
+    "points_by_variant": {
+     "recommended": 0.5,
+     "onlinejyotish": 0.5,
+     "astroyogi": 1.5,
+     "pyjhora_default": 0,
+     "maitreya_saravali": 1
+    }
+   },
+   {
+    "koota": "vashya",
+    "boy": "Ashwini pada 1 (Aries, Chatushpada)",
+    "girl": "Ardra pada 1 (Gemini, Manava)",
+    "points_by_variant": {
+     "recommended": 1,
+     "onlinejyotish": 1,
+     "astroyogi": 1,
+     "pyjhora_default": 0.5,
+     "maitreya_saravali": 1
+    }
+   }
+  ]
+ },
+ "disagreements_summary": [
+  "Vashya matrix: five published tables (classical symmetric, onlinejyotish, astroyogi with 1.5s, PyJHora/vedikastrologer, Maitreya/Saravali).",
+  "Yoni matrix: software family (Saravali/aadri/thevedichoroscope/PyJHora) vs Maitreya8 vs Hindi-panchang tables; inside the software family only Horse-Deer and Buffalo-Lion differ.",
+  "Gana: identical numbers but two orientations; Prokerala output supports boy-Rakshasa x girl-Deva = 1.",
+  "Varna: Saravali/PyJHora swap Vaishya and Shudra signs; AstroSage output supports the fire/earth/air/water = K/V/S/B mapping.",
+  "Graha Maitri: Maitreya8 uses 2/2/1 for NN/FE/NE; mainstream uses 3/1/0.5 (AstroSage output confirms NN = 3).",
+  "Tara: PyJHora's current code is inverted; everyone else marks remainders 3/5/7 as bad.",
+  "Manglik: 2nd house included or not; reference points Lagna/Moon/Venus; cancellation lists vary widely.",
+  "Nadi exemption nakshatra lists differ between AstroSage and Narada Samhita."
+ ],
+ "sources": [
+  {
+   "name": "PyJHora compatibility.py (open source, AGPL)",
+   "url": "https://github.com/naturalstupid/PyJHora/blob/main/src/jhora/horoscope/match/compatibility.py"
+  },
+  {
+   "name": "PyJHora const.py (planet friendships)",
+   "url": "https://github.com/naturalstupid/PyJHora/blob/main/src/jhora/const.py"
+  },
+  {
+   "name": "PyJHora utils.py (count_stars)",
+   "url": "https://github.com/naturalstupid/PyJHora/blob/main/src/jhora/utils.py"
+  },
+  {
+   "name": "Maitreya8 Partner.cpp (open source, GPL)",
+   "url": "https://github.com/martin-pe/maitreya8/blob/master/src/jyotish/Partner.cpp"
+  },
+  {
+   "name": "Maitreya8 Nakshatra.cpp (yoni/gana/nadi maps, yoni genders)",
+   "url": "https://github.com/martin-pe/maitreya8/blob/master/src/jyotish/Nakshatra.cpp"
+  },
+  {
+   "name": "Maitreya8 astrobase.cpp (varna, vashya half-signs)",
+   "url": "https://github.com/martin-pe/maitreya8/blob/master/src/jyotish/astrobase.cpp"
+  },
+  {
+   "name": "Saravali (Maitreya successor) koota pages",
+   "url": "https://saravali.github.io/astrology/astakoota.html"
+  },
+  {
+   "name": "NeeleshRoy/ashtakoot (JS, 2018)",
+   "url": "https://github.com/NeeleshRoy/ashtakoot/blob/master/lib/constants.js"
+  },
+  {
+   "name": "onlinejyotish marriage-matching series (with Sanskrit citations)",
+   "url": "https://www.onlinejyotish.com/articles/marriage-matching/english/"
+  },
+  {
+   "name": "AstroSage magazine, Virat-Anushka match table",
+   "url": "https://www.astrosage.com/magazine/virat-kohli-anushka-sharma-marriage-prediction.asp"
+  },
+  {
+   "name": "AstroSage matchmaking explainer",
+   "url": "https://www.astrosage.com/freechart/matchmaking.asp"
+  },
+  {
+   "name": "AstroSage Nadi dosha page",
+   "url": "https://www.astrosage.com/free/nadi-dosha-report.asp"
+  },
+  {
+   "name": "AstroSage Mangal dosha page",
+   "url": "https://www.astrosage.com/free/mangal-dosha-report.asp"
+  },
+  {
+   "name": "Punit Pandey (AstroSage) blog: Nadi dosha",
+   "url": "http://itzhoroscope.astrosage.com/2008/09/nadi-dosha-chart-matching.html"
+  },
+  {
+   "name": "Punit Pandey (AstroSage) blog: horoscope match",
+   "url": "http://itzhoroscope.astrosage.com/2008/08/horoscope-match-for-marriage.html"
+  },
+  {
+   "name": "Prokerala sample Guna Milan report (PDF)",
+   "url": "https://apiorigin.prokerala.com/reports/sample/guna-milan-en.pdf"
+  },
+  {
+   "name": "Prokerala API v2 spec",
+   "url": "http://apiorigin.prokerala.com/spec/astrology.v2.yaml"
+  },
+  {
+   "name": "Divine API Ashtakoot Milan docs",
+   "url": "https://developers.divineapi.com/divine-api/indian-api/match-making-api/ashtakoot-milan"
+  },
+  {
+   "name": "freehoroscopesonline koota pages",
+   "url": "https://freehoroscopesonline.in/vashyakoota.php"
+  },
+  {
+   "name": "astroyogi Vasya koota",
+   "url": "https://www.astroyogi.com/blog/vasya-koota-in-kundli-matching.aspx"
+  },
+  {
+   "name": "anytimeastro Dev gan",
+   "url": "https://www.anytimeastro.com/blog/astrology/dev-gan/"
+  },
+  {
+   "name": "ganeshmitra Vasya matching",
+   "url": "https://ganeshmitra.co.in/vasya-matching/"
+  },
+  {
+   "name": "vedikastrologer Vashya kuta",
+   "url": "https://vedikastrologer.com/varna-kuta-goona-milan-part-2/"
+  },
+  {
+   "name": "thevedichoroscope horoscope matching",
+   "url": "https://www.thevedichoroscope.com/marriage-astrology/horoscope-matching-marriage/"
+  },
+  {
+   "name": "aadri.in Match Making - an exhaustive review",
+   "url": "https://aadri.in/Blog/blog-details/49/Match-Making-%E2%80%93-An-exhaustive-review-"
+  },
+  {
+   "name": "gaurbrahmansamaj.com Hindi 36-gun tables",
+   "url": "https://gaurbrahmansamaj.com/vivah-36-gun-var-vadhu-kundali-milan/"
+  },
+  {
+   "name": "nppathak (Hindi) planetary friendship table",
+   "url": "https://nppathak.blogspot.com/2017/11/blog-post_72.html"
+  },
+  {
+   "name": "akashvaani blog (gana orientation M)",
+   "url": "https://akashvaani.com/blog/logic-behind-kundali-matching-while-getting-married"
+  },
+  {
+   "name": "astromedha Bhakoot dosha",
+   "url": "https://astromedha.in/insights/vedic/bhakoot-dosha-in-matching"
+  },
+  {
+   "name": "MyAstrology check-ashtakoota.js (AstroSage/EKundali partial fixture)",
+   "url": "https://github.com/MyAstrology/myastrology-app/blob/main/scripts/check-ashtakoota.js"
+  },
+  {
+   "name": "Drik Panchang Kundali match tutorial (weights, no tables)",
+   "url": "https://www.drikpanchang.com/tutorials/jyotisha/kundali-match/kundali-match.html"
+  }
+ ]
+}

@@ -1,0 +1,645 @@
+{
+ "categories": {
+  "personality": "Personality",
+  "love_style": "Love style",
+  "attachment": "Attachment",
+  "communication": "Communication",
+  "values": "Values",
+  "conflict": "Conflict style",
+  "jealousy": "Jealousy",
+  "family_focus": "Family focus",
+  "long_term": "Long-term match"
+ },
+ "tests": {
+  "personality_inner_fire": {
+   "category": "personality",
+   "title": "Inner Fire",
+   "measures": "how strongly you set your own direction and push toward your goals",
+   "lowPole": "Go-with-the-flow",
+   "highPole": "Burning drive"
+  },
+  "personality_calm_presence": {
+   "category": "personality",
+   "title": "Calm Presence",
+   "measures": "how steady, patient and grounded you stay under pressure",
+   "lowPole": "Quick to react",
+   "highPole": "Unshakably calm"
+  },
+  "personality_social_energy": {
+   "category": "personality",
+   "title": "Social Energy",
+   "measures": "how much energy you get from social interaction versus alone time",
+   "lowPole": "Deep introvert",
+   "highPole": "Social powerhouse"
+  },
+  "personality_openness": {
+   "category": "personality",
+   "title": "Openness",
+   "measures": "how curious and open you are to new ideas and experiences",
+   "lowPole": "Rooted in the familiar",
+   "highPole": "Explorer mind"
+  },
+  "personality_discipline": {
+   "category": "personality",
+   "title": "Discipline",
+   "measures": "how consistently you follow through on commitments and routines",
+   "lowPole": "Free-flow lifestyle",
+   "highPole": "Iron discipline"
+  },
+  "personality_creativity": {
+   "category": "personality",
+   "title": "Creative Spark",
+   "measures": "how much creative and imaginative energy you carry",
+   "lowPole": "Structured realist",
+   "highPole": "Creative visionary"
+  },
+  "personality_resilience": {
+   "category": "personality",
+   "title": "Resilience",
+   "measures": "how quickly you bounce back after setbacks and emotional difficulty",
+   "lowPole": "Fragile recovery",
+   "highPole": "Quickly resilient"
+  },
+  "personality_kindness": {
+   "category": "personality",
+   "title": "Kindness",
+   "measures": "how naturally warm, generous, and gentle you are in daily life",
+   "lowPole": "Emotionally guarded",
+   "highPole": "Deeply kind"
+  },
+  "personality_risk_taking": {
+   "category": "personality",
+   "title": "Risk Taking",
+   "measures": "how comfortable you are with bold decisions and uncertainty",
+   "lowPole": "Risk-averse",
+   "highPole": "Bold risk-taker"
+  },
+  "personality_humor_style": {
+   "category": "personality",
+   "title": "Humor Style",
+   "measures": "how much playful, light-hearted humor you bring to relationships",
+   "lowPole": "Serious at heart",
+   "highPole": "Playful entertainer"
+  },
+  "love_style_warmth": {
+   "category": "love_style",
+   "title": "Warmth & Care",
+   "measures": "how naturally you show affection, care, and emotional warmth",
+   "lowPole": "Emotionally cool",
+   "highPole": "Overflowing warmth"
+  },
+  "love_style_quality_time": {
+   "category": "love_style",
+   "title": "Quality Time",
+   "measures": "how much focused, shared time matters to your feeling of love",
+   "lowPole": "Space-first",
+   "highPole": "Time is everything"
+  },
+  "love_style_physical_touch": {
+   "category": "love_style",
+   "title": "Physical Touch",
+   "measures": "how important physical closeness and touch are for your feeling of love",
+   "lowPole": "Touch-minimal",
+   "highPole": "Touch is essential"
+  },
+  "love_style_words_affirmation": {
+   "category": "love_style",
+   "title": "Words of Affirmation",
+   "measures": "how much verbal reassurance and kind words affect your emotional security",
+   "lowPole": "Words feel empty",
+   "highPole": "Words heal you"
+  },
+  "love_style_acts_service": {
+   "category": "love_style",
+   "title": "Acts of Service",
+   "measures": "how much practical help and effort matter to your feeling of being loved",
+   "lowPole": "Prefers emotional over practical",
+   "highPole": "Actions are love"
+  },
+  "love_style_gift_giving": {
+   "category": "love_style",
+   "title": "Gift Giving",
+   "measures": "how much thoughtful gifts and symbolic gestures mean to you",
+   "lowPole": "Gifts feel meaningless",
+   "highPole": "Gifts touch your heart"
+  },
+  "love_style_support_style": {
+   "category": "love_style",
+   "title": "Support Style",
+   "measures": "how you support a partner during difficulty and stress",
+   "lowPole": "Keeps a distance",
+   "highPole": "Total supporter"
+  },
+  "love_style_romance_playfulness": {
+   "category": "love_style",
+   "title": "Romance & Play",
+   "measures": "how much surprise, romance, and creative love expression matter to you",
+   "lowPole": "Romance-indifferent",
+   "highPole": "Romance is essential"
+  },
+  "love_style_independence_closeness": {
+   "category": "love_style",
+   "title": "Independence vs Closeness",
+   "measures": "how much emotional availability and presence matter in how you feel loved",
+   "lowPole": "Emotionally self-sufficient",
+   "highPole": "Presence is everything"
+  },
+  "love_style_affection_pacing": {
+   "category": "love_style",
+   "title": "Affection Pacing",
+   "measures": "how quickly you express and deepen affection in relationships",
+   "lowPole": "Very cautious pacer",
+   "highPole": "Fast and intense"
+  },
+  "attach_bond_strength": {
+   "category": "attachment",
+   "title": "Bond Strength",
+   "measures": "how quickly and deeply you form emotional bonds",
+   "lowPole": "Slow-burn bonder",
+   "highPole": "Instant bonder"
+  },
+  "attach_closeness_comfort": {
+   "category": "attachment",
+   "title": "Closeness Comfort",
+   "measures": "how comfortable you are with emotional and physical closeness",
+   "lowPole": "Closeness feels risky",
+   "highPole": "Fully at ease with closeness"
+  },
+  "attach_reassurance_need": {
+   "category": "attachment",
+   "title": "Reassurance Need",
+   "measures": "how much verbal and emotional reassurance you need to feel secure",
+   "lowPole": "Fully self-secure",
+   "highPole": "High reassurance need"
+  },
+  "attach_space_need": {
+   "category": "attachment",
+   "title": "Space Need",
+   "measures": "how much personal space and autonomy you need in relationships",
+   "lowPole": "Deep togetherness",
+   "highPole": "Strongly independent"
+  },
+  "attach_fear_rejection": {
+   "category": "attachment",
+   "title": "Fear of Rejection",
+   "measures": "how much worry and anxiety you experience about relationships",
+   "lowPole": "Deeply secure",
+   "highPole": "High relationship anxiety"
+  },
+  "attach_trust_building": {
+   "category": "attachment",
+   "title": "Trust Building",
+   "measures": "how readily you let trust grow once someone shows they are reliable",
+   "lowPole": "Deeply guarded",
+   "highPole": "Open-hearted truster"
+  },
+  "attach_emotional_regulation": {
+   "category": "attachment",
+   "title": "Emotional Regulation",
+   "measures": "how well you manage your emotions when triggered in relationships",
+   "lowPole": "Emotionally volatile",
+   "highPole": "Emotionally unshakable"
+  },
+  "attach_consistency_need": {
+   "category": "attachment",
+   "title": "Consistency Need",
+   "measures": "how much routine contact and predictable behavior you need from a partner",
+   "lowPole": "Thrives on unpredictability",
+   "highPole": "Needs high consistency"
+  },
+  "attach_vulnerability": {
+   "category": "attachment",
+   "title": "Vulnerability",
+   "measures": "how easily you open up and let yourself be seen",
+   "lowPole": "Strong avoidant style",
+   "highPole": "Fully emotionally open"
+  },
+  "attach_autonomy_balance": {
+   "category": "attachment",
+   "title": "Autonomy Balance",
+   "measures": "how well you keep your own identity and give a partner freedom without fear or control",
+   "lowPole": "Fear-driven closeness",
+   "highPole": "Secure and free"
+  },
+  "communication_directness": {
+   "category": "communication",
+   "title": "Directness",
+   "measures": "how directly and clearly you express your needs and feelings",
+   "lowPole": "Silent communicator",
+   "highPole": "Radically direct"
+  },
+  "communication_emotional_tone": {
+   "category": "communication",
+   "title": "Emotional Tone",
+   "measures": "how warm or cold your tone becomes during serious conversations",
+   "lowPole": "Sharp under pressure",
+   "highPole": "Warm even under pressure"
+  },
+  "communication_listening": {
+   "category": "communication",
+   "title": "Listening",
+   "measures": "how well you truly hear and validate what your partner communicates",
+   "lowPole": "Distracted listener",
+   "highPole": "Deep listener"
+  },
+  "communication_conflict_talk": {
+   "category": "communication",
+   "title": "Conflict Talk",
+   "measures": "how well you discuss problems and disagreements directly",
+   "lowPole": "Conflict-silent",
+   "highPole": "Problem-talk master"
+  },
+  "communication_texting_style": {
+   "category": "communication",
+   "title": "Texting Style",
+   "measures": "how you use texting as a communication and connection tool",
+   "lowPole": "Texting-avoidant",
+   "highPole": "Warm, responsive texter"
+  },
+  "communication_boundaries": {
+   "category": "communication",
+   "title": "Boundaries Talk",
+   "measures": "how clearly and calmly you communicate personal boundaries",
+   "lowPole": "Boundary-avoidant",
+   "highPole": "Boundary master"
+  },
+  "communication_empathy_words": {
+   "category": "communication",
+   "title": "Empathy Words",
+   "measures": "how supportive and comforting your language is during emotional moments",
+   "lowPole": "Emotionally distant in words",
+   "highPole": "Natural comforter"
+  },
+  "communication_repair_language": {
+   "category": "communication",
+   "title": "Repair Language",
+   "measures": "how you reconnect and restore the relationship after tension",
+   "lowPole": "Repair-avoidant",
+   "highPole": "Repair-first person"
+  },
+  "communication_honesty_softness": {
+   "category": "communication",
+   "title": "Honesty & Softness",
+   "measures": "how you balance truth-telling with kindness",
+   "lowPole": "Harshly honest or dishonestly soft",
+   "highPole": "Honest and gentle"
+  },
+  "communication_feedback_style": {
+   "category": "communication",
+   "title": "Feedback Style",
+   "measures": "how you give and receive feedback in close relationships",
+   "lowPole": "Feedback-rejecting",
+   "highPole": "Feedback natural"
+  },
+  "values_tradition_modern": {
+   "category": "values",
+   "title": "Tradition vs Modern",
+   "measures": "where you stand between traditional and modern relationship values",
+   "lowPole": "Deeply traditional",
+   "highPole": "Fully modern"
+  },
+  "values_family_priority": {
+   "category": "values",
+   "title": "Family Priority",
+   "measures": "how central family is in your decisions and life priorities",
+   "lowPole": "Self-focused",
+   "highPole": "Family-first"
+  },
+  "values_spirituality": {
+   "category": "values",
+   "title": "Spirituality",
+   "measures": "how important spirituality or faith is in your life and relationships",
+   "lowPole": "Non-spiritual",
+   "highPole": "Deeply spiritual"
+  },
+  "values_ambition_balance": {
+   "category": "values",
+   "title": "Ambition Balance",
+   "measures": "how driven you are by goals, career, and personal achievement",
+   "lowPole": "Ambition-free",
+   "highPole": "Intensely ambitious"
+  },
+  "values_health_lifestyle": {
+   "category": "values",
+   "title": "Health & Lifestyle",
+   "measures": "how much healthy habits, self-care and a steady daily rhythm matter to you",
+   "lowPole": "Not health-focused",
+   "highPole": "Health-first"
+  },
+  "values_money_mindset": {
+   "category": "values",
+   "title": "Money Mindset",
+   "measures": "how you approach money, spending, and financial planning in relationships",
+   "lowPole": "Financially impulsive",
+   "highPole": "Financially disciplined"
+  },
+  "values_roles_expectations": {
+   "category": "values",
+   "title": "Roles & Expectations",
+   "measures": "how fair, flexible and open to discussion you are about sharing roles and duties",
+   "lowPole": "Rigid expectations",
+   "highPole": "Fair team player"
+  },
+  "values_loyalty": {
+   "category": "values",
+   "title": "Loyalty",
+   "measures": "how deeply you value loyalty, commitment, and privacy in relationships",
+   "lowPole": "Loyalty-skeptic",
+   "highPole": "Fiercely loyal"
+  },
+  "values_social_circle": {
+   "category": "values",
+   "title": "Social Circle",
+   "measures": "how important friends, community, and social life are to you",
+   "lowPole": "Socially minimal",
+   "highPole": "Deeply social"
+  },
+  "values_growth_learning": {
+   "category": "values",
+   "title": "Growth & Learning",
+   "measures": "how much you value personal growth, learning, and self-improvement",
+   "lowPole": "Growth-resistant",
+   "highPole": "Growth-obsessed"
+  },
+  "conflict_repair_speed": {
+   "category": "conflict",
+   "title": "Repair Speed",
+   "measures": "how quickly you calm down and reconnect after a conflict",
+   "lowPole": "Long-grudge holder",
+   "highPole": "Instant repairer"
+  },
+  "conflict_anger_expression": {
+   "category": "conflict",
+   "title": "Anger Expression",
+   "measures": "how you express anger — calmly, sharply, or explosively",
+   "lowPole": "Explosive anger",
+   "highPole": "Calm expresser"
+  },
+  "conflict_avoid_vs_engage": {
+   "category": "conflict",
+   "title": "Avoid vs Engage",
+   "measures": "whether you face conflict directly or try to escape it",
+   "lowPole": "Complete avoider",
+   "highPole": "Direct engager"
+  },
+  "conflict_blame_vs_own": {
+   "category": "conflict",
+   "title": "Blame vs Ownership",
+   "measures": "whether you take responsibility or default to blame during conflict",
+   "lowPole": "Refuses accountability",
+   "highPole": "Full ownership"
+  },
+  "conflict_compromise": {
+   "category": "conflict",
+   "title": "Compromise",
+   "measures": "how flexible and willing you are to find middle ground",
+   "lowPole": "My-way-only",
+   "highPole": "Natural compromiser"
+  },
+  "conflict_fairness": {
+   "category": "conflict",
+   "title": "Fairness",
+   "measures": "whether you fight fair — no cheap shots, no humiliation, no cruelty",
+   "lowPole": "Fights dirty",
+   "highPole": "Always fair fighter"
+  },
+  "conflict_escalation": {
+   "category": "conflict",
+   "title": "Escalation",
+   "measures": "how quickly your conflicts heat up and whether you can de-escalate",
+   "lowPole": "Rapid escalator",
+   "highPole": "Master de-escalator"
+  },
+  "conflict_apology_style": {
+   "category": "conflict",
+   "title": "Apology Style",
+   "measures": "how sincerely and effectively you apologize after mistakes",
+   "lowPole": "Apology-resistant",
+   "highPole": "Genuine apologizer"
+  },
+  "conflict_problem_solving": {
+   "category": "conflict",
+   "title": "Problem Solving",
+   "measures": "whether you focus on finding solutions or stay stuck in emotion and blame",
+   "lowPole": "Problem-looper",
+   "highPole": "Solution-focused"
+  },
+  "conflict_forgiveness": {
+   "category": "conflict",
+   "title": "Forgiveness",
+   "measures": "whether you can let go after repair or keep score",
+   "lowPole": "Score-keeper",
+   "highPole": "Genuine forgiver"
+  },
+  "jealousy_security": {
+   "category": "jealousy",
+   "title": "Security",
+   "measures": "how secure you feel in relationships and how easily jealousy is triggered",
+   "lowPole": "Chronically insecure",
+   "highPole": "Deeply secure"
+  },
+  "jealousy_comparison": {
+   "category": "jealousy",
+   "title": "Comparison",
+   "measures": "how much you compare yourself to others and how it affects jealousy",
+   "lowPole": "Comparison-free",
+   "highPole": "Constant comparer"
+  },
+  "jealousy_social_media": {
+   "category": "jealousy",
+   "title": "Social Media Triggers",
+   "measures": "how much digital behavior (social media, texts, follows) triggers jealousy",
+   "lowPole": "Digitally unbothered",
+   "highPole": "Highly tuned-in online"
+  },
+  "jealousy_possessiveness": {
+   "category": "jealousy",
+   "title": "Possessiveness",
+   "measures": "how controlling or possessive you become in relationships",
+   "lowPole": "Highly possessive",
+   "highPole": "Zero possessiveness"
+  },
+  "jealousy_trust_rebuild": {
+   "category": "jealousy",
+   "title": "Trust Rebuild",
+   "measures": "how quickly you rebuild trust after it's been damaged",
+   "lowPole": "Trust-shattered",
+   "highPole": "Quick trust rebuilder"
+  },
+  "jealousy_reassurance_style": {
+   "category": "jealousy",
+   "title": "Reassurance Style",
+   "measures": "how well reassurance calms you when jealousy or doubt shows up",
+   "lowPole": "Reassurance-resistant",
+   "highPole": "Easily reassured"
+  },
+  "jealousy_boundary_respect": {
+   "category": "jealousy",
+   "title": "Boundary Respect",
+   "measures": "how jealous you get about your partner's friendships and social interactions",
+   "lowPole": "Extremely territorial",
+   "highPole": "Completely trusting"
+  },
+  "jealousy_attention_need": {
+   "category": "jealousy",
+   "title": "Attention Need",
+   "measures": "how much attention and prioritization you need from a partner to feel secure",
+   "lowPole": "Low-maintenance",
+   "highPole": "Needs lots of attention"
+  },
+  "jealousy_past_wounds": {
+   "category": "jealousy",
+   "title": "Past Wounds",
+   "measures": "how much past relationship pain affects your current trust and jealousy",
+   "lowPole": "Deeply wounded",
+   "highPole": "Fully healed"
+  },
+  "jealousy_independence_trust": {
+   "category": "jealousy",
+   "title": "Independence & Trust",
+   "measures": "how well you balance giving your partner independence with trusting them",
+   "lowPole": "Cannot tolerate independence",
+   "highPole": "Completely trusting of independence"
+  },
+  "family_focus_readiness": {
+   "category": "family_focus",
+   "title": "Family Readiness",
+   "measures": "how ready and oriented you are toward building a family and home life",
+   "lowPole": "Not family-focused",
+   "highPole": "Fully family-oriented"
+  },
+  "family_focus_children_view": {
+   "category": "family_focus",
+   "title": "Kids & Parenting",
+   "measures": "how you feel about having children and what role parenthood plays in your future",
+   "lowPole": "Does not want kids",
+   "highPole": "Definitely wants kids"
+  },
+  "family_focus_in_laws": {
+   "category": "family_focus",
+   "title": "In-Laws Balance",
+   "measures": "how you handle family involvement and in-law relationships",
+   "lowPole": "Family-resistant",
+   "highPole": "Family-welcoming"
+  },
+  "family_focus_home_routines": {
+   "category": "family_focus",
+   "title": "Home Routines",
+   "measures": "how much you value shared domestic routines and home-building habits",
+   "lowPole": "Domestic-avoidant",
+   "highPole": "Domestic by nature"
+  },
+  "family_focus_caregiving": {
+   "category": "family_focus",
+   "title": "Caregiving Energy",
+   "measures": "how nurturing and caring you are in a domestic context",
+   "lowPole": "Non-nurturing",
+   "highPole": "Natural caregiver"
+  },
+  "family_focus_career_balance": {
+   "category": "family_focus",
+   "title": "Career vs Family",
+   "measures": "how you balance career ambition with family and home life",
+   "lowPole": "Career-first",
+   "highPole": "Family-centered"
+  },
+  "family_focus_traditions_holidays": {
+   "category": "family_focus",
+   "title": "Traditions & Holidays",
+   "measures": "how much value you place on traditions, holidays, and family rituals",
+   "lowPole": "Tradition-indifferent",
+   "highPole": "Tradition-devoted"
+  },
+  "family_focus_financial_planning": {
+   "category": "family_focus",
+   "title": "Financial Planning",
+   "measures": "how much you value financial planning and budgeting for family stability",
+   "lowPole": "Financially careless",
+   "highPole": "Financial planner"
+  },
+  "family_focus_stability_need": {
+   "category": "family_focus",
+   "title": "Stability Need",
+   "measures": "how much you need consistency, predictability, and calm in your home life",
+   "lowPole": "Chaos-comfortable",
+   "highPole": "Stability-centered"
+  },
+  "family_focus_relocation_flex": {
+   "category": "family_focus",
+   "title": "Relocation Flex",
+   "measures": "how willing you are to relocate for family, career, or opportunity",
+   "lowPole": "Immovable",
+   "highPole": "Highly mobile"
+  },
+  "long_term_commitment": {
+   "category": "long_term",
+   "title": "Commitment Style",
+   "measures": "how steady and reliable your commitment is over time",
+   "lowPole": "Restless heart",
+   "highPole": "Rock-steady committer"
+  },
+  "long_term_marriage_view": {
+   "category": "long_term",
+   "title": "Marriage View",
+   "measures": "how you view marriage as a life goal",
+   "lowPole": "Anti-marriage",
+   "highPole": "Marriage is essential"
+  },
+  "long_term_goals_alignment": {
+   "category": "long_term",
+   "title": "Goals Alignment",
+   "measures": "how much shared life goals and future alignment matter to you",
+   "lowPole": "Goes with the flow",
+   "highPole": "Alignment is essential"
+  },
+  "long_term_growth_partner": {
+   "category": "long_term",
+   "title": "Growth Partner",
+   "measures": "how much you value mutual growth and building each other up in a relationship",
+   "lowPole": "Growth-indifferent",
+   "highPole": "Growth-focused partner"
+  },
+  "long_term_patience_stability": {
+   "category": "long_term",
+   "title": "Patience & Stability",
+   "measures": "how comfortable you are with the calm, steady side of a long relationship",
+   "lowPole": "Craves intensity",
+   "highPole": "Thrives in steady love"
+  },
+  "long_term_future_planning": {
+   "category": "long_term",
+   "title": "Future Planning",
+   "measures": "how much you plan for the future versus living day-to-day",
+   "lowPole": "No future planning",
+   "highPole": "Long-term planner"
+  },
+  "long_term_monogamy_values": {
+   "category": "long_term",
+   "title": "Monogamy Values",
+   "measures": "how strongly you value exclusivity and monogamy in relationships",
+   "lowPole": "Non-monogamous",
+   "highPole": "Strictly monogamous"
+  },
+  "long_term_conflict_tolerance": {
+   "category": "long_term",
+   "title": "Conflict Tolerance",
+   "measures": "how well you handle difficult seasons and repeated conflict in long-term relationships",
+   "lowPole": "Quick to walk away",
+   "highPole": "Conflict-resilient"
+  },
+  "long_term_adventure_settle": {
+   "category": "long_term",
+   "title": "Adventure vs Settle",
+   "measures": "whether you prefer a settled or an adventurous lifestyle long-term",
+   "lowPole": "Adventure-seeker",
+   "highPole": "Fully settled"
+  },
+  "long_term_legacy_build": {
+   "category": "long_term",
+   "title": "Legacy Build",
+   "measures": "how much you think about building something lasting together",
+   "lowPole": "No legacy interest",
+   "highPole": "Legacy builder"
+  }
+ }
+}

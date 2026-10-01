@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# Face models are downloaded and checked when the image is built (Dockerfile)
+models/
