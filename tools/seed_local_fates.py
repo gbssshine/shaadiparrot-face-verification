@@ -57,7 +57,8 @@ for uid, p in PEOPLE.items():
             doc[f"tests_{tid}_categoryId"] = c
             doc[f"tests_{tid}_resultKey"] = "low" if pct <= 35 else ("high" if pct >= 65 else "mid")
     pub.update({"interests": p["interests"], "languages": p["languages"], "smoking": p["smoking"], "drinking": p["drinking"],
-                "bio": p["bio"], "religion": "Hindu", "cityName": "Bengaluru", "lat": 12.97, "lon": 77.60})
+                "bio": p["bio"], "religion": "Hindu", "cityName": "Bengaluru", "lat": 12.97, "lon": 77.60,
+                "isFaceVerified": True})   # the public badge, as the server writes it together with the profile flags
     db.document(f"publicProfiles/{uid}").set(pub, merge=True)
     current = (db.document(f"publicProfiles/{uid}").get().to_dict() or {}).get("photos") or []
     priv["faceVerifiedPhotos"] = [p for p in current if isinstance(p, str)]

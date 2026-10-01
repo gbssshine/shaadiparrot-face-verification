@@ -46,7 +46,7 @@ def env():
 
     def person(uid, **pub):
         base = {"uid": uid, "firstName": uid.title(), "age": 26, "gender": "Female", "lookingForGender": "Male",
-                "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True,
+                "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True, "isFaceVerified": True,
                 "photos": [f"https://example.com/{uid}.jpg"], "relationshipIntent": "Serious long-term partner",
                 "religion": "Hindu", "community": "Kannada", "languages": ["Hindi", "English"],
                 "interests": ["Trekking", "Coffee"], "smoking": "Never", "drinking": "Socially"}

@@ -79,3 +79,13 @@ def test_storage_object_from_a_download_url():
     assert fl.storage_object("http://127.0.0.1:9199/v0/b/demo.appspot.com/o/users%2Fu1%2Fx.jpg") == ("demo.appspot.com", "users/u1/x.jpg")
     assert fl.storage_object("https://example.com/a.jpg") is None
     assert fl.storage_object("https://firebasestorage.googleapis.com/v0/b/app/o/users%2F..%2Fx") is None
+
+
+
+def test_photo_checks_only_read_the_callers_own_uploads():
+    import main
+    assert main._own_gcs_photo("gs://shaadiparrot.firebasestorage.app/users/u1/photos/a.jpg", "u1")
+    assert not main._own_gcs_photo("gs://shaadiparrot.firebasestorage.app/users/u2/photos/a.jpg", "u1")
+    assert not main._own_gcs_photo("gs://shaadiparrot.firebasestorage.app/users/u1/../u2/a.jpg", "u1")
+    assert not main._own_gcs_photo("gs://other-bucket/private/a.jpg", "u1")
+    assert not main._own_gcs_photo("https://example.com/users/u1/a.jpg", "u1")

@@ -91,11 +91,6 @@ if not firebase_admin._apps:
 # =========================
 # MODELS
 # =========================
-class VerifyFaceRequest(BaseModel):
-    user_id: str
-    image_url: HttpUrl
-
-
 class VerifyFaceStartRequest(BaseModel):
     consent: str = ""           # the version of the notice the person agreed to in the app (e.g. "face-2026-10")
 
@@ -1079,9 +1074,42 @@ _LIKELIHOOD = {
 }
 
 
+PHOTO_CHECKS_PER_DAY = int(os.getenv("PHOTO_CHECKS_PER_DAY") or "60")
+
+
+def _own_gcs_photo(gcs_uri: str, uid: str) -> bool:
+    """gs://{bucket}/users/{uid}/... only: a caller can't have someone else's (or any other) object read."""
+    m = re.match(r"^gs://[a-z0-9][a-z0-9._-]{1,220}/(.+)$", gcs_uri)
+    return bool(m) and m.group(1).startswith(f"users/{uid}/") and ".." not in m.group(1)
+
+
+def _take_rate(uid: str, key: str, limit: int) -> bool:
+    """A per-day counter in serverRate/{uid} (no client can read or write that collection)."""
+    if firestore_client is None:
+        return True
+    from google.cloud import firestore as fs
+    ref = firestore_client.collection("serverRate").document(uid)
+    day = datetime.now(timezone.utc).date().isoformat()
+
+    @fs.transactional
+    def take(tx) -> bool:
+        cur = (ref.get(transaction=tx).to_dict() or {}).get(key) or {}
+        n = int(cur.get("n") or 0) if cur.get("day") == day else 0
+        if n >= limit:
+            return False
+        tx.set(ref, {key: {"day": day, "n": n + 1}}, merge=True)
+        return True
+
+    try:
+        return take(firestore_client.transaction())
+    except Exception:
+        logger.exception("rate counter failed")
+        return True
+
+
 @app.post("/verify-photo")
 def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header(default=None)):
-    _ = _verify_firebase_token_or_401(authorization)
+    uid = _verify_firebase_token_or_401(authorization)
 
     if vision_client is None:
         raise HTTPException(status_code=503, detail="Vision client not available")
@@ -1089,6 +1117,10 @@ def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header
     gcs_uri = (body.gcs_uri or "").strip()
     if not gcs_uri.startswith("gs://"):
         raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
+    if not _own_gcs_photo(gcs_uri, uid):
+        raise HTTPException(status_code=403, detail="not_your_photo")
+    if not _take_rate(uid, "photoChecks", PHOTO_CHECKS_PER_DAY):
+        raise HTTPException(status_code=429, detail="too_many_photo_checks")
 
     try:
         image = vision.Image(source=vision.ImageSource(gcs_image_uri=gcs_uri))
@@ -1227,71 +1259,6 @@ def _detect_faces_and_safety_from_bytes(img_bytes: bytes):
     faces = list(resp.face_annotations or [])
 
     return adult, racy, violence, faces
-
-
-def _store_face_verified(uid: str, ok: bool, reason: str, meta: Dict[str, Any]) -> None:
-    if firestore_client is None:
-        return
-    try:
-        patch = {
-            "faceVerified": bool(ok),
-            "faceVerifiedReason": (reason or "").strip(),
-            "faceVerifiedAtIso": _now_iso(),
-            "faceVerifiedMeta": meta or {},
-        }
-        firestore_client.collection("profiles").document(uid).set(patch, merge=True)
-    except Exception:
-        logger.exception("Failed to store face verification outcome")
-
-
-@app.post("/verify-face")
-def verify_face(body: VerifyFaceRequest, authorization: Optional[str] = Header(default=None)):
-    uid = _verify_firebase_token_or_401(authorization)
-
-    target_uid = (body.user_id or "").strip()
-    if not target_uid or target_uid != uid:
-        raise HTTPException(status_code=403, detail="user_id must match auth uid")
-
-    url = (str(body.image_url) or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="image_url required")
-
-    img_bytes = _download_image_bytes(url, max_mb=10)
-    adult, racy, violence, faces = _detect_faces_and_safety_from_bytes(img_bytes)
-
-    if _LIKELIHOOD.get(adult, 0) >= _LIKELIHOOD["LIKELY"]:
-        _store_face_verified(uid, False, "adult_content", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
-        return {"ok": False, "reason": "adult_content", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
-
-    if _LIKELIHOOD.get(racy, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
-        _store_face_verified(uid, False, "highly_racy", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
-        return {"ok": False, "reason": "highly_racy", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
-
-    if _LIKELIHOOD.get(violence, 0) >= _LIKELIHOOD["VERY_LIKELY"]:
-        _store_face_verified(uid, False, "high_violence", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
-        return {"ok": False, "reason": "high_violence", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
-
-    if len(faces) == 0:
-        _store_face_verified(uid, False, "no_face_detected", {"adult": adult, "racy": racy, "violence": violence, "faces": 0})
-        return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": 0}
-
-    best = _pick_largest_face(faces)
-    if best is None:
-        _store_face_verified(uid, False, "no_face_detected", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces)})
-        return {"ok": False, "reason": "no_face_detected", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
-
-    area = _face_area_proxy(best)
-    if area < 18_000:
-        _store_face_verified(uid, False, "face_too_small", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
-        return {"ok": False, "reason": "face_too_small", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
-
-    ok_quality, q_reason = _face_quality_checks(best)
-    if not ok_quality:
-        _store_face_verified(uid, False, q_reason, {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
-        return {"ok": False, "reason": q_reason, "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
-
-    _store_face_verified(uid, True, "ok", {"adult": adult, "racy": racy, "violence": violence, "faces": len(faces), "area": int(area)})
-    return {"ok": True, "reason": "ok", "adult": adult, "racy": racy, "violence": violence, "faces": len(faces)}
 
 
 # =========================

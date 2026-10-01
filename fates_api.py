@@ -11,7 +11,9 @@ A fate day starts at 07:30 IST, when the morning push goes out.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
+import random
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -47,13 +49,50 @@ CHOSEN_LIST_LIMIT = 20
 CHOOSER_MAX_BRINGS = 2
 
 
+STAT_SHARDS = 10
+EXPOSURE_SHARDS = 16
+
+
 def _stat(db, key: str, **counts: int) -> None:
-    """Best-effort daily counters in fatesStats/{dayKey}; never fails a request."""
+    """Best-effort daily counters in fatesStats/{dayKey}/shards/{0..9} (one document per day would be written by
+    everyone at 07:30 IST and stall); sum the shards to read them. Never fails a request."""
     try:
         from google.cloud import firestore as fs
-        db.document(f"fatesStats/{key}").set({k: fs.Increment(v) for k, v in counts.items() if v}, merge=True)
+        db.document(f"fatesStats/{key}/shards/{random.randrange(STAT_SHARDS)}").set(
+            {k: fs.Increment(v) for k, v in counts.items() if v}, merge=True)
     except Exception:
         logger.warning("fates stat write failed", exc_info=True)
+
+
+def _exposure_shard(uid: str) -> int:
+    return int(hashlib.md5(uid.encode("utf-8")).hexdigest(), 16) % EXPOSURE_SHARDS
+
+
+def _exposure_counts(db, key: str) -> Dict[str, int]:
+    """How many people got each person as a fate today: fateExposure/{dayKey}/shards/{n}, a person always in the
+    same shard, so the morning's writes spread over 16 documents."""
+    counts: Dict[str, int] = {}
+    try:
+        refs = [db.document(f"fateExposure/{key}/shards/{i}") for i in range(EXPOSURE_SHARDS)]
+        for snap in db.get_all(refs):
+            for uid, n in ((snap.to_dict() or {}).get("counts") or {}).items():
+                counts[uid] = counts.get(uid, 0) + int(n or 0)
+    except Exception:
+        logger.warning("fates exposure read failed", exc_info=True)
+    return counts
+
+
+def _add_exposure(db, key: str, uids: List[str]) -> None:
+    """Best effort, after the day's paths are stored: a busy counter must never fail someone's fates."""
+    from google.cloud import firestore as fs
+    by_shard: Dict[int, Dict[str, Any]] = {}
+    for u in uids:
+        by_shard.setdefault(_exposure_shard(u), {})[u] = fs.Increment(1)
+    for shard, inc in by_shard.items():
+        try:
+            db.document(f"fateExposure/{key}/shards/{shard}").set({"counts": inc}, merge=True)
+        except Exception:
+            logger.warning("fates exposure write failed", exc_info=True)
 
 
 def _ai_allowed(db, uid: str, key: str) -> bool:
@@ -182,6 +221,9 @@ def _candidates(db, viewer: fe.Person, now_ms: int, memory: Dict[str, Any]) -> L
         # Equality filters on two fields need no composite index (Firestore merges single-field indexes).
         if viewer.looking_for in ("male", "female"):
             q = q.where(filter=FieldFilter("gender", "==", viewer.looking_for.capitalize()))
+        if fe.VERIFIED_ONLY:
+            # Only verified people can be a fate: asking for them keeps the pool from filling up with the others.
+            q = q.where(filter=FieldFilter("isFaceVerified", "==", True))
         snaps = list(q.limit(CANDIDATE_POOL_LIMIT).stream())
     except Exception:
         logger.exception("fates pool query failed")
@@ -324,7 +366,7 @@ def _viewer_facts(v: fe.Person) -> Dict[str, Any]:
 
 def generate(db, viewer: fe.Person, memory: Dict[str, Any], key: str, now_ms: int) -> Dict[str, Any]:
     pool = _candidates(db, viewer, now_ms, memory)
-    exposure = (_doc(db, f"fateExposure/{key}").get("counts") or {})
+    exposure = _exposure_counts(db, key)
     pool = [p for p in pool if int(exposure.get(p.uid, 0)) < fe.exposure_cap(p, EXPOSURE_CAP)]
 
     learned = memory.get("learned") or {}
@@ -416,10 +458,9 @@ def _store_generation(db, doc: Dict[str, Any], key: str) -> Dict[str, Any]:
     if seen_patch:
         batch.set(db.document(f"fatesMemory/{uid}"), {"uid": uid}, merge=True)
         batch.update(db.document(f"fatesMemory/{uid}"), seen_patch)
-        batch.set(db.document(f"fateExposure/{key}"),
-                  {"counts": {p["targetUid"]: fs.Increment(1) for p in doc["paths"].values()}}, merge=True)
     try:
         batch.commit()
+        _add_exposure(db, key, [p["targetUid"] for p in doc["paths"].values()])
         return doc
     except gexc.AlreadyExists:
         return ref.get().to_dict() or doc
@@ -503,6 +544,7 @@ class DecisionRequest(BaseModel):
     path: str
     decision: str            # "accepted" | "skipped"
     reason: Optional[str] = None
+    dayKey: Optional[str] = None   # the day the path belongs to (a decision sent just after 07:30 IST is yesterday's)
 
 
 @router.post("/today")
@@ -730,6 +772,9 @@ def fates_decision(body: DecisionRequest, authorization: Optional[str] = Header(
     if body.decision == "accepted":
         _require_verified(db, uid)
     key = day_key()
+    yesterday = day_key(datetime.now(timezone.utc) - timedelta(days=1))
+    if body.dayKey in (key, yesterday):
+        key = body.dayKey
     ref = db.document(f"dailyFates/{uid}__{key}")
     doc = ref.get().to_dict() or {}
     p = (doc.get("paths") or {}).get(body.path)

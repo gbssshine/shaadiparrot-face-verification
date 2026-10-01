@@ -67,7 +67,7 @@ def env():
 
     def person(uid, **pub):
         base = {"uid": uid, "firstName": uid.title(), "age": 26, "gender": "Female", "lookingForGender": "Male",
-                "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True,
+                "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True, "isFaceVerified": True,
                 "photos": [f"https://example.com/{uid}.jpg"], "relationshipIntent": "Serious long-term partner",
                 "religion": "Hindu", "community": "Kannada", "languages": ["Hindi", "English"],
                 "interests": ["Trekking", "Coffee"], "smoking": "Never", "drinking": "Socially", "bio": f"I am {uid}."}
@@ -177,7 +177,10 @@ def test_requires_auth(env):
 
 def test_stats_are_counted(env):
     today = env["client"].post("/fates/today", headers=env["h"]).json()
-    stats = env["db"].document(f"fatesStats/{today['dayKey']}").get().to_dict()
+    stats: dict = {}
+    for shard in env["db"].collection(f"fatesStats/{today['dayKey']}/shards").stream():
+        for k, v in (shard.to_dict() or {}).items():
+            stats[k] = stats.get(k, 0) + v
     assert stats["generated"] == 1 and stats["opens"] >= 1 and stats["aiPickOk"] == 1
 
 
