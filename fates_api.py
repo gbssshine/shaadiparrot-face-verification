@@ -211,6 +211,8 @@ def _candidates(db, viewer: fe.Person, now_ms: int, memory: Dict[str, Any]) -> L
     excluded = set()
     for sub in ("blocks", "matches", "outgoing", "passes"):
         excluded |= _ids(db, f"users/{viewer.uid}/{sub}")
+    # Reported by several people and waiting for a moderator (the functions' report hold): no fates until then.
+    excluded |= _ids(db, "reportHolds")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=SEEN_COOLDOWN_DAYS)).date().isoformat()
     seen = memory.get("seen") or {}
     excluded |= {u for u, v in seen.items() if str((v or {}).get("day", "")) >= cutoff}
