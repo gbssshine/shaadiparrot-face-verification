@@ -169,3 +169,11 @@ def test_question_without_db(client):
 
 def test_auth_required(client):
     assert client.post("/astro/today", json={}).status_code == 401
+
+
+def test_places_search(client):
+    r = client.post("/astro/places", json={"q": "benga"}, headers=H)
+    assert r.status_code == 200
+    names = [p["name"] for p in r.json()["places"]]
+    assert names[0] == "Bengaluru"
+    assert client.post("/astro/places", json={"q": "b"}, headers=H).json()["places"] == []

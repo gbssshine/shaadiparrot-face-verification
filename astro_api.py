@@ -6,6 +6,7 @@
   POST /astro/match/report Mithu's full written match reading (Parrot+), kept so it is never charged twice
   POST /astro/good-days   dates that suit an event (wedding, griha pravesh, naming...) by the panchang
   POST /astro/question    Mithu's question of the day: vote once, then see your city and India
+  POST /astro/places      city search for the panchang place and for birth places (India first)
 
 Data (server-only): dailyQuestions/{dayKey} vote counts, dailyQuestionVotes/{dayKey}__{uid},
 astroReports/{uid}__{hash} written readings. Birth details sent for other people are used for the
@@ -135,6 +136,11 @@ class GoodDaysReq(BaseModel):
 class QuestionReq(BaseModel):
     vote: Optional[int] = None
     place: Optional[PlaceIn] = None
+
+
+class PlacesReq(BaseModel):
+    q: str = Field(default="", max_length=60)
+    countryIso2: Optional[str] = "IN"
 
 
 # ------------------------------------------------------------------ places
@@ -478,3 +484,33 @@ def question(body: QuestionReq, authorization: Optional[str] = Header(default=No
     except Exception:
         logger.warning("question vote failed", exc_info=True)
     return out
+
+
+# ------------------------------------------------------------------ /places
+@router.post("/places")
+def places(body: PlacesReq, authorization: Optional[str] = Header(default=None)):
+    _auth(authorization)
+    q = " ".join(str(body.q or "").casefold().split())
+    if len(q) < 2:
+        return {"ok": True, "places": []}
+    cc = (body.countryIso2 or "IN").strip().upper()[:2]
+    sql = ("SELECT c.city, s.state, c.cc, c.lat, c.lon, c.tz, c.pop FROM cities c LEFT JOIN states s ON s.id = c.state_id "
+           "WHERE {where} AND c.city LIKE ? ORDER BY (c.city = ?) DESC, COALESCE(c.pop, 0) DESC LIMIT 12")
+    try:
+        rows = _d().places_query(sql.format(where="c.cc = ?"), (cc, q + "%", q))
+        if len(rows) < 5:
+            more = _d().places_query(sql.format(where="c.cc <> ?"), (cc, q + "%", q))
+            rows = list(rows) + list(more)[: 12 - len(rows)]
+    except Exception:
+        logger.warning("places search failed", exc_info=True)
+        rows = []
+    seen = set()
+    out = []
+    for city, state, ccode, lat, lon, tz, _ in rows:
+        key = (city, state, ccode)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": _title(city), "state": _title(state or ""), "countryIso2": ccode,
+                    "lat": lat, "lon": lon, "tz": tz or "Asia/Kolkata"})
+    return {"ok": True, "places": out}
