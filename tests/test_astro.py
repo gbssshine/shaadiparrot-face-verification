@@ -98,10 +98,10 @@ def test_kshaya_tithis_are_not_lost():
 
 
 def test_festival_list_runs_ahead():
+    # astro_core.FESTIVALS is no longer served (Today reads astro_festivals, whose own 60-day guard is in
+    # tests/test_festivals.py); this old table stays only as the reference legacy_merged is checked against.
     days = [f["date"] for f in ac.FESTIVALS]
     assert days == sorted(days)
-    # Today's festival feed goes quiet when the list runs out: extend astro_core.FESTIVALS before this fails.
-    assert date.fromisoformat(days[-1]) - date.today() >= timedelta(days=60)
     ahead = ac.upcoming(date(2027, 8, 1), 40, *DELHI, limit=20)
     assert [i["name"] for i in ahead if i["type"] == "festival"] == [
         "Hariyali Teej", "Independence Day", "Raksha Bandhan", "Janmashtami", "Ganesh Chaturthi"]
@@ -333,9 +333,9 @@ def test_today_falls_back_to_the_profile_city():
     prof.update({"cityName": "Mumbai", "stateName": "Maharashtra"})
     c = make_client(profile=prof, public={"firstName": "Asha"}, user={})
     body = c.post("/astro/today", json={"place": None}, headers=H).json()
-    assert body["place"] == {"name": "Mumbai", "tz": "Asia/Kolkata"}
+    assert body["place"] == {"name": "Mumbai", "tz": "Asia/Kolkata", "source": "profile"}
     nothing = make_client(profile={}, public={}, user={}).post("/astro/today", json={}, headers=H).json()
-    assert nothing["place"]["name"] == "New Delhi"
+    assert nothing["place"] == {"name": "New Delhi", "tz": "Asia/Kolkata", "source": "default"}
 
 
 def test_today_takes_odd_input(client):
@@ -443,6 +443,81 @@ def test_chart_and_match_give_one_manglik_status(client):
         chart, from_match = _chart_and_match_manglik(client, p)
         assert chart["manglik"] == from_match, p
         assert (chart["manglik"]["status"] == "check") == (not p["birthTime"]), p
+
+
+def _mangal(chart):
+    lines = [l for l in chart["lines"] if l["title"].startswith("Mangal:")]
+    assert len(lines) == 1, chart["lines"]
+    return lines[0]
+
+
+def test_chart_reads_manglik_with_jupiter_and_words_the_line_by_status():
+    """Integrator decision 5: astro_core.birth_chart reads Manglik with Jupiter (the same C3 status as
+    fates_astro.chart_from_birth) and words the Mangal line from that one status."""
+    import fates_astro as fa
+    mumbai = {"lat": 19.076, "lon": 72.8777, "tz": "Asia/Kolkata", "precision": "city"}
+    rng = random.Random(511)
+    seen = set()
+    for _ in range(60):
+        d = (rng.randint(1970, 2005), rng.randint(1, 12), rng.randint(1, 28))
+        t = (rng.randint(0, 23), rng.randint(0, 59)) if rng.random() < 0.8 else None
+        c = ac.birth_chart(d, t, mumbai, now=datetime(2026, 10, 10, tzinfo=timezone.utc))
+        assert c["manglik"] == fa.manglik_status(fa.chart_from_birth(d, t, mumbai)), (d, t)
+        line = _mangal(c)
+        status = c["manglik"]["status"]
+        seen.add(status)
+        assert line["status"] == status
+        assert line["title"] == {"yes": "Mangal: Manglik", "partial": "Mangal: Partial (Anshik)",
+                                 "no": "Mangal: not Manglik", "check": "Mangal: Check (needs birth time)"}[status]
+        if status == "no" and c["manglik"].get("cancelledBy"):
+            assert "cancelled (" in line["text"] and c["manglik"]["cancelledBy"] in line["text"]
+    assert seen == {"yes", "partial", "no", "check"}
+
+
+def test_a_chart_without_a_time_is_a_check_never_manglik():
+    # 5 Dec 1997 without a time: Mars sits in a Manglik house from the Moon and Venus. 1.0.7 read "Mangal: Manglik".
+    c = ac.birth_chart((1997, 12, 5), None, None)
+    assert c["manglik"]["manglik"] is True and c["manglik"]["status"] == "check"
+    line = _mangal(c)
+    assert line["title"] == "Mangal: Check (needs birth time)" and line["status"] == "check"
+    assert "Manglik house from your" not in line["text"] and "check, not a verdict" in line["text"]
+    # A time but no city: still no Lagna, so still a check, now waiting for the place.
+    timed = ac.birth_chart((1997, 12, 5), (10, 30), None)
+    assert timed["manglik"]["status"] == "check" and _mangal(timed)["title"] == "Mangal: Check (needs birth place)"
+    # An approximate part of the day never makes a Lagna either.
+    approx = ac.birth_chart((1997, 12, 5), None, None, approx="morning")
+    assert approx["lagna"] is None and _mangal(approx)["title"] == "Mangal: Check (needs birth time)"
+    banned = ("danger", "death", "widow", "curse", "remed", "puja", "bad luck")
+    for ch in (c, timed, approx):
+        assert not any(b in _mangal(ch)["text"].lower() for b in banned)
+
+
+def test_chart_lines_for_each_status():
+    ds = {"current": None}
+    moon, sun = {"rashi": 0, "nak": 0}, {"rashi": 1}
+    yes = ac.chart_lines(0, moon, sun, ds, {"status": "yes", "from": ["Lagna", "Moon"]}, True)[-1]
+    assert yes["title"] == "Mangal: Manglik" and "from your Lagna and Moon" in yes["text"]
+    part = ac.chart_lines(0, moon, sun, ds, {"status": "partial", "from": ["Moon"]}, True)[-1]
+    assert part["title"] == "Mangal: Partial (Anshik)" and "from your Moon" in part["text"]
+    clear = ac.chart_lines(0, moon, sun, ds, {"status": "no", "from": [], "cancelReasons": []}, True)[-1]
+    assert clear == {"title": "Mangal: not Manglik", "status": "no", "text": "No Mangal dosha in your chart."}
+    # The old flags never decide the line any more: a check stays a check even with manglik True.
+    old = ac.chart_lines(None, moon, sun, ds, {"status": "check", "manglik": True, "mild": False,
+                                               "from": ["Moon", "Venus"]}, False)[-1]
+    assert old["title"] == "Mangal: Check (needs birth time)"
+
+
+def test_my_own_chart_uses_my_approximate_birth_time():
+    prof = {**PROFILE, "birthTime": "", "birthTimeApprox": "night"}
+    c = make_client(profile=prof, user={**USER, "birthTimeApprox": "night"})
+    mine = c.post("/astro/chart", json={}, headers=H).json()["chart"]
+    assert mine["precision"] == "approximate" and mine["timeApprox"] == "night" and mine["lagna"] is None
+    assert _mangal(mine)["status"] == "check"
+    assert "transits" in mine and mine["moon"]["options"] and "vh" in mine["moon"]
+    # Someone typed in never gets my approximate time.
+    other = c.post("/astro/chart", json={"person": {"name": "Riya", "birthDate": PROFILE["birthDate"]}},
+                   headers=H).json()["chart"]
+    assert other["precision"] == "date" and "timeApprox" not in other
 
 
 def test_report_needs_parrot_plus(client):

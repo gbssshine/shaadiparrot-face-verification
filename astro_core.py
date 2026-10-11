@@ -569,7 +569,10 @@ def birth_chart(date: Tuple[int, int, int], time: Optional[Tuple[int, int]], pla
         p["rashiName"] = RASHIS[p["rashi"]][0]
         p["nakName"] = NAKSHATRAS[p["nak"]][0]
 
-    chart_like = {"marsRashi": planets[2]["rashi"], "venusRashi": planets[5]["rashi"], "rashi": moon["rashi"], "lagna": lagna}
+    # Jupiter too, so the chart gives the same Manglik status (C3) as /match, /scores and Fates: Jupiter with or
+    # aspecting Mars cancels it (fates_astro.chart_from_birth reads Jupiter at the same moment).
+    chart_like = {"marsRashi": planets[2]["rashi"], "venusRashi": planets[5]["rashi"], "rashi": moon["rashi"],
+                  "lagna": lagna, "jupiterRashi": planets[4]["rashi"]}
     mang = manglik_status(chart_like)
     now = now or datetime.now(timezone.utc)
     ds = dashas(moon["lon"], born, now)
@@ -653,15 +656,36 @@ def chart_lines(lagna: Optional[int], moon: Dict[str, Any], sun: Dict[str, Any],
         if antar:
             t += f" Inside it, {antar['lord']} until {_month_year(antar['end'])}: {DASHA_THEME[antar['lord']]}."
         lines.append({"title": f"Now: {cur['lord']} mahadasha", "text": t})
-    if mang.get("manglik"):
-        frm = " and ".join(mang.get("from") or [])
-        lines.append({"title": "Mangal: Manglik" + (" (mild)" if mang.get("mild") else ""),
-                      "text": f"Mars sits in a Manglik house from your {frm}. Families look at this when matching; "
-                              "two Manglik charts cancel it out."})
-    else:
-        lines.append({"title": "Mangal: not Manglik", "text": "No Mangal dosha in your chart" +
-                      ("." if time_known else " (from Moon and Venus; a birth time adds the Lagna check).")})
+    lines.append(mangal_line(mang, time_known))
     return lines
+
+
+def mangal_line(mang: Dict[str, Any], time_known: bool) -> Dict[str, str]:
+    """The chart's Mangal line, worded from the one C3 status (fates_astro.manglik_status), never from the old
+    manglik/mild flags: without the Lagna (no birth time or place) it is a check, never "Manglik", even when Mars
+    sits in a Manglik house from the Moon or Venus. The app shows "check" in the careful tone, never in red."""
+    status = str(mang.get("status") or "")
+    frm = " and ".join(mang.get("from") or [])
+    if status == "yes":
+        return {"title": "Mangal: Manglik", "status": status,
+                "text": f"Mars sits in a Manglik house from your {frm}. Families look at this when matching; "
+                        "two Manglik charts cancel it out."}
+    if status == "partial":
+        return {"title": "Mangal: Partial (Anshik)", "status": status,
+                "text": f"Mars sits in a milder Manglik place from your {frm}. Many families don't count a partial "
+                        "placement as a dosha."}
+    if status == "no":
+        reasons = [r for r in (mang.get("cancelReasons") or []) if r]
+        if mang.get("cancelledBy") or reasons:
+            why = "; ".join(reasons) or str(mang.get("cancelledBy"))
+            return {"title": "Mangal: not Manglik", "status": status,
+                    "text": f"No Mangal dosha in your chart. Mars sits in a Manglik house, but it is cancelled ({why})."}
+        return {"title": "Mangal: not Manglik", "status": status, "text": "No Mangal dosha in your chart."}
+    # "check" (and anything unknown): the Lagna isn't known, so no verdict either way.
+    need = "birth place" if time_known else "birth time"
+    return {"title": f"Mangal: Check (needs {need})", "status": "check",
+            "text": "The Manglik check counts Mars from the Lagna, which needs the time and city of birth. "
+                    "Until then it is a check, not a verdict."}
 
 
 # ------------------------------------------------------------------ family lines

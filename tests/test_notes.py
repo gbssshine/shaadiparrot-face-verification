@@ -101,11 +101,17 @@ def _note(day, festivals=None, members=None, me=ME, prefs=HINDU, place=DELHI, **
     return an.compose(me, place, day, members, prefs, festivals, **kw)
 
 
+def _tagged(row, faiths=("hindu",), tier="faith"):
+    """A made-up day with the tags astro_festivals rows carry: notes wish only the reader's own days (own_days), and
+    a row that says nothing about who keeps it (and isn't in the table) is never wished."""
+    return {"faiths": list(faiths), "communities": [], "states": [], "tier": tier, **row}
+
+
 # ------------------------------------------------------------------ priority
 def test_priority_p1_over_p2_over_p3():
     day = date(2026, 10, 29)   # Jupiter moves into Simha the day after tomorrow
     kid = [{"id": "m1", "name": "Aarav", "relation": "Son", "birthDate": "2019-10-30"}]
-    fest = [{"date": "2026-10-29", "id": "x_fest", "name": "Test Festival", "greeting": "Happy Test"}]
+    fest = [_tagged({"date": "2026-10-29", "id": "x_fest", "name": "Test Festival", "greeting": "Happy Test"})]
     assert _note(day, fest, kid)["topic"] == "festival"
     assert _note(day, None, kid)["topic"] == "birthday"
     sky = _note(day)
@@ -137,7 +143,7 @@ def test_p5_on_dev_uthani_for_singles_and_families():
     # A birthday or another festival today still comes first.
     kid = [{"id": "m1", "name": "Aarav", "relation": "son", "birthDate": "2019-11-21"}]
     assert _note(day, [DEV_UTHANI], kid)["topic"] == "birthday"
-    other = {"date": "2026-11-20", "id": "x", "name": "Another Day", "greeting": "Happy day"}
+    other = _tagged({"date": "2026-11-20", "id": "x", "name": "Another Day", "greeting": "Happy day"})
     assert _note(day, [DEV_UTHANI, other])["title"] == "Another Day is today"
 
 
@@ -164,14 +170,18 @@ def test_nothing_qualifies():
 
 # ------------------------------------------------------------------ P1 festivals
 def test_festival_tomorrow_with_the_city_moonrise():
-    note = _note(date(2026, 10, 28), [KARVA], place=JAIPUR)
+    # Karva Chauth is a North Indian day: a Hindu family in Rajasthan keeps it (astro_festivals tags).
+    rajasthan = {**HINDU, "stateName": "Rajasthan"}
+    note = _note(date(2026, 10, 28), [KARVA], place=JAIPUR, prefs=rajasthan)
     mr = ac.panchang(date(2026, 10, 29), JAIPUR["lat"], JAIPUR["lon"], JAIPUR["tz"])["moonrise"]
     assert note["title"] == "Karva Chauth is tomorrow"
     assert note["text"] == f"Karva Chauth is tomorrow. Moonrise in Jaipur: {mr}. I'll keep the time on Today for you."
     assert [a["type"] for a in note["actions"]] == ["open_panchang", "share_greeting"]
     assert note["actions"][1]["arg"] == "Happy Karva Chauth! Wishing you and your family joy and blessings."
+    # A Hindu family in Bengaluru doesn't keep it: their lists never show it, and no note wishes it either.
+    assert _note(date(2026, 10, 28), [KARVA], place=JAIPUR, prefs={**HINDU, "stateName": "Karnataka"}) is None
     # Without the table's greeting there is nothing to send: no made-up "Happy …" line, only the times.
-    bare = _note(date(2026, 10, 28), [{**KARVA, "greeting": ""}], place=JAIPUR)
+    bare = _note(date(2026, 10, 28), [{**KARVA, "greeting": ""}], place=JAIPUR, prefs=rajasthan)
     assert bare["text"] == note["text"]
     assert [a["type"] for a in bare["actions"]] == ["open_panchang"]
 
@@ -400,8 +410,8 @@ def test_a_parallel_request_that_stored_first_wins():
 
 def test_at_most_four_in_seven_days():
     db = Db()
-    fest = [{"date": (date(2026, 12, 1) + timedelta(days=i)).isoformat(), "id": f"f{i}", "name": f"Day {i}",
-             "greeting": "Hello"} for i in range(12)]
+    fest = [_tagged({"date": (date(2026, 12, 1) + timedelta(days=i)).isoformat(), "id": f"f{i}", "name": f"Day {i}",
+                     "greeting": "Hello"}) for i in range(12)]
     got = [an.note_for("u1", ME, DELHI, date(2026, 12, 1) + timedelta(days=i), [], HINDU, festivals=fest, db=db)
            for i in range(12)]
     # 1-4 Dec, then nothing while four sit in the last 7 days; the window rolls from 8 Dec.
@@ -433,3 +443,73 @@ def test_without_a_db_the_note_is_only_composed():
 @pytest.mark.parametrize("thread", ["mobile_u1", "default", "some thread"])
 def test_chat_doc_id_matches_main(thread):
     assert an.chat_doc_id("u1", thread) == main._chat_doc_id("u1", thread)
+
+
+# ------------------------------------------------------------------ own days only (integrator decision 6)
+import astro_festivals as afest  # noqa: E402
+
+NO_BIRTH = {**ME, "birthDate": ""}   # no sky note can come in between
+
+
+def _rows(day, prefs):
+    """Today's and tomorrow's rows exactly as /astro/today hands them to the note."""
+    lists = afest.upcoming(day, afest.FESTIVAL_DAYS, DELHI["lat"], DELHI["lon"], DELHI["tz"], prefs, vrats=None)
+    return lists["festivals"] + ([lists["bigDay"]] if lists["bigDay"] else [])
+
+
+@pytest.mark.parametrize("religion", ["Prefer not to say", "No religion / Spiritual", ""])
+@pytest.mark.parametrize("day", [date(2026, 11, 8), date(2026, 12, 25), date(2027, 3, 10), date(2027, 3, 9)])
+def test_an_unknown_faith_is_never_wished_another_faiths_day(religion, day):
+    """The lists show an unknown faith every faith's big days, but Mithu never wishes them Eid Mubarak, Merry
+    Christmas or Shubh Deepavali."""
+    me = {**NO_BIRTH, "religion": religion}
+    prefs = {"celebrates": [], "astroMode": "full"}
+    rows = _rows(day, {**prefs, "religion": religion})
+    soon = (day.isoformat(), (day + timedelta(days=1)).isoformat())
+    assert any(r["tier"] == "major" and r["date"] in soon for r in rows)   # the lists do show them
+    assert _note(day, rows, me=me, prefs=prefs) is None
+
+
+def test_another_faith_is_never_wished_and_their_own_day_is():
+    muslim = {**NO_BIRTH, "religion": "Muslim"}
+    prefs = {"celebrates": ["muslim"], "astroMode": "fun"}
+    # Diwali and Christmas rows (as the lists show them to an unknown faith) never reach a Muslim reader's note.
+    for day in (date(2026, 11, 8), date(2026, 12, 25)):
+        assert _note(day, _rows(day, {}), me=muslim, prefs=prefs) is None
+    eid = _note(date(2027, 3, 10), _rows(date(2027, 3, 10), prefs), me=muslim, prefs=prefs)
+    assert eid["title"] == "Eid ul-Fitr is today" and "Eid Mubarak" in eid["text"]
+    assert _note(date(2027, 3, 10), _rows(date(2027, 3, 10), {}), me=NO_BIRTH, prefs=HINDU) is None
+    # The reader's own faith comes from their religion when the prefs don't say.
+    own = _note(date(2027, 3, 10), _rows(date(2027, 3, 10), {}), me=muslim, prefs={"astroMode": "fun"})
+    assert own["topic"] == "festival"
+
+
+def test_all_of_india_keeps_every_faiths_big_days():
+    allin = {"celebrates": ["all"], "astroMode": "full"}
+    note = _note(date(2026, 12, 25), _rows(date(2026, 12, 25), allin), me=NO_BIRTH, prefs=allin)
+    assert note["title"] == "Christmas is today" and note["text"].startswith("Merry Christmas!")
+
+
+def test_a_row_is_judged_by_its_tags_or_the_table():
+    # No tags and not in the table: nothing says who keeps it, so it is never wished.
+    assert _note(date(2026, 10, 29), [{"date": "2026-10-29", "id": "x_fest", "name": "Test Festival",
+                                       "greeting": "Happy Test"}], me=NO_BIRTH) is None
+    # No tags, but the table has it (Diwali, a Hindu and Jain day): the table's tags decide.
+    assert _note(date(2026, 11, 8), [DIWALI], me=NO_BIRTH)["title"] == "Diwali is today"
+    assert _note(date(2026, 11, 8), [DIWALI], me={**NO_BIRTH, "religion": "Christian"},
+                 prefs={"celebrates": ["christian"]}) is None
+    # A row carrying its own tags is read by them.
+    assert _note(date(2026, 11, 8), [_tagged(DIWALI, faiths=("christian",))], me=NO_BIRTH) is None
+
+
+def test_starts_a_period_lists_every_day_named_begins():
+    """STARTS_A_PERIOD is keyed by id (CR5); every id whose name ends in "begins" has to be in it."""
+    table = afest.FESTIVALS + afest.AWAITING_CONFIRMATION
+    begins = {e["id"] for e in table if e["name"].strip().endswith("begins")}
+    assert begins and begins <= an.STARTS_A_PERIOD
+    assert an.STARTS_A_PERIOD <= {e["id"] for e in table}   # no stale ids
+
+
+def test_the_wedding_season_day_comes_from_the_served_table():
+    assert an.DEV_UTHANI_DAYS == {e["date"] for e in afest.FESTIVALS if e["id"] == "dev_uthani"}
+    assert "2026-11-20" in an.DEV_UTHANI_DAYS

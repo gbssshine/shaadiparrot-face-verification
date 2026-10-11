@@ -491,6 +491,9 @@ POOL_VECTORS = [
     # C1 `todayDay >= feedQuickFromDay`: a missing or null day compares false in JS, so the age gate stays shut.
     ("quick without feedQuickFromDay", {"gender": "Male", "age": 19, "feedQuick": True}, TODAY, 21, False, False),
     ("quick with a null feedQuickFromDay", {"gender": "Male", "age": 19, "feedQuick": True, "feedQuickFromDay": None}, TODAY, 21, False, False),
+    # Integrator decision 4: a non-string day (a number, a bool) never opens quick, in TS and Python alike.
+    ("quick with a non-string feedQuickFromDay", {"gender": "Female", "age": 30, "feedQuick": True, "feedQuickFromDay": 20200101}, TODAY, 21, False, False),
+    ("quick with feedQuickFromDay true", {"gender": "Female", "age": 30, "feedQuick": True, "feedQuickFromDay": True}, TODAY, 21, False, False),
 ]
 
 
@@ -1079,7 +1082,28 @@ def test_quick_male_min_age_is_read_and_cached(api, monkeypatch):
     db.data["serverState/pools"] = {"quickMaleMinAge": 5}
     assert api.quick_male_min_age(db) == fe.QUICK_MALE_MIN_AGE  # out of range: the default
     monkeypatch.setattr(api, "_pools_config", {"at": 0.0, "quickMaleMinAge": 21})
+    db.data["serverState/pools"] = {"quickMaleMinAge": 35}     # 18..30 like feed.ts (it used to take up to 99)
+    assert api.quick_male_min_age(db) == fe.QUICK_MALE_MIN_AGE
+    monkeypatch.setattr(api, "_pools_config", {"at": 0.0, "quickMaleMinAge": 21})
     assert api.quick_male_min_age(FakeDb({})) == 21
+
+
+# serverState/pools.quickMaleMinAge -> what feed.ts parseQuickMaleMinAge gives (toInt: numbers and numeric strings,
+# Math.round half up; 18..30, else 21). Integrator decision 4: TS and Python use the same bounds.
+QUICK_MIN_AGE_VECTORS = [
+    (18, 18), (21, 21), (25, 25), (30, 30), (17, 21), (31, 21), (99, 21), (5, 21), (0, 21), (-20, 21),
+    (18.0, 18), (20.4, 20), (20.5, 21), (17.5, 18), (30.4, 30), (30.5, 21), (17.4, 21),
+    ("19", 19), (" 22 ", 22), ("19.5", 20), ("", 21), ("   ", 21), ("abc", 21), ("0x14", 20), ("1_9", 21),
+    (None, 21), (True, 21), (False, 21), ({"v": 19}, 21),
+    (float("nan"), 21), (float("inf"), 21), ("Infinity", 21),
+]
+
+
+@pytest.mark.parametrize("raw, want", QUICK_MIN_AGE_VECTORS)
+def test_quick_male_min_age_bounds_match_feed_ts(api, raw, want):
+    assert api.parse_quick_male_min_age(raw) == want
+    assert api.QUICK_MALE_MIN_AGE_BOUNDS == (18, 30)
+    assert api.quick_male_min_age(FakeDb({"serverState/pools": {"quickMaleMinAge": raw}})) == want
 
 
 def test_request_mode_and_viewer_rules(api):

@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import math
 import random
 import os
 import time
@@ -227,16 +228,41 @@ def load_person(db, uid: str, public: Optional[Dict[str, Any]] = None) -> Tuple[
     return person, priv, usr
 
 
+QUICK_MALE_MIN_AGE_BOUNDS = (18, 30)   # the same bounds as feed.ts parseQuickMaleMinAge
+
+
+def parse_quick_male_min_age(v: Any) -> int:
+    """serverState/pools.quickMaleMinAge as feed.ts parseQuickMaleMinAge reads it, so Python and the functions agree
+    on every value: a number, or a string that is one, rounded like JS Math.round (half up); 18..30, else the
+    default 21. Booleans, empty or odd values give the default."""
+    n: Optional[float] = None
+    if isinstance(v, bool) or v is None:
+        n = None
+    elif isinstance(v, (int, float)):
+        n = float(v)
+    elif isinstance(v, str) and v.strip() and "_" not in v:
+        s = v.strip()
+        try:
+            n = float(int(s, 0)) if s[:2].lower() in ("0x", "0o", "0b") else float(s)
+        except ValueError:
+            n = None
+    if n is None or not math.isfinite(n):
+        return fe.QUICK_MALE_MIN_AGE
+    r = math.floor(n + 0.5)
+    lo, hi = QUICK_MALE_MIN_AGE_BOUNDS
+    return int(r) if lo <= r <= hi else fe.QUICK_MALE_MIN_AGE
+
+
 def quick_male_min_age(db) -> int:
     """serverState/pools.quickMaleMinAge: from what age men are in the quick pool (default 21; the owner may set
-    18..99). Cached for 10 minutes; after a failed read the last value is kept and the read is tried a minute later."""
+    18..30, the bounds feed.ts uses). Cached for 10 minutes; after a failed read the last value is kept and the read
+    is tried a minute later."""
     now = time.time()
     if now - float(_pools_config["at"]) < POOLS_CONFIG_TTL_SEC:
         return int(_pools_config["quickMaleMinAge"])
     try:
         v = (db.document("serverState/pools").get().to_dict() or {}).get("quickMaleMinAge")
-        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and 18 <= v <= 99
-        _pools_config.update(at=now, quickMaleMinAge=int(v) if ok else fe.QUICK_MALE_MIN_AGE)
+        _pools_config.update(at=now, quickMaleMinAge=parse_quick_male_min_age(v))
     except Exception:
         logger.warning("fates pools config read failed", exc_info=True)
         _pools_config["at"] = now - POOLS_CONFIG_TTL_SEC + 60

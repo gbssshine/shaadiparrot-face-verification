@@ -485,3 +485,73 @@ def test_observance_line_takes_todays_vrat_only_for_hindu_days():
     assert line.startswith("Karva Chauth") and "Sankashti" not in line
     assert "Sankashti" in af.observance_for(kc, ["hindu"], "Tamil", fasts=vr)
     assert len(af.observance_for(date(2026, 11, 8), ["hindu", "jain", "sikh"], "Bengali", state="WB")) <= 400
+
+
+# ------------------------------------------------------------------ own_days (what may be wished)
+def _ids(rows):
+    return [r["id"] for r in rows]
+
+
+def test_own_days_never_hands_an_unknown_faith_another_faiths_big_day():
+    """The lists show an unknown faith every faith's big days; own_days keeps only national days and their region's
+    days that belong to no faith, so notes never wish "Prefer not to say" Eid Mubarak or Merry Christmas."""
+    for prefs in ({}, {"religion": "Prefer not to say"}, {"religion": "No religion / Spiritual"},
+                  {"celebrates": [], "religion": ""}):
+        for start in (date(2026, 11, 1), date(2026, 12, 20), date(2027, 3, 5), date(2027, 8, 10)):
+            rows = up(start, prefs)["festivals"]
+            assert any(r["tier"] == "major" and r["faiths"] for r in rows), (prefs, start)   # the lists show them
+            own = af.own_days(rows, prefs)
+            assert all(r["tier"] == "national" or not r["faiths"] for r in own), (prefs, start, _ids(own))
+    # Independence Day 2027 stays for everyone; Milad-un-Nabi and Parsi New Year the same day do not.
+    own = af.own_days(up(date(2027, 8, 14), {})["festivals"], {})
+    assert "independence_day" in _ids(own) and not {"milad_un_nabi", "parsi_navroz"} & set(_ids(own))
+    # A Bengali with no faith given keeps Poila Boishakh (a day of no faith in particular), never Kali Puja.
+    bengali = {"community": "Bengali"}
+    assert "poila_boishakh" in _ids(af.own_days(up(date(2027, 4, 10), bengali)["festivals"], bengali))
+    assert "kali_puja" not in _ids(af.own_days([e for e in af.FESTIVALS if e["id"] == "kali_puja"], bengali))
+
+
+def test_own_days_keeps_a_faiths_own_days_and_drops_the_rest():
+    hindu_rows = up(date(2026, 11, 1), HINDU_DELHI)["festivals"]
+    assert af.own_days(hindu_rows, HINDU_DELHI) == hindu_rows          # their lists are their own days
+    every = up(date(2026, 12, 20), {})["festivals"] + up(date(2027, 3, 5), {})["festivals"]
+    assert "christmas" in _ids(af.own_days(every, {"religion": "Christian"}))
+    assert "christmas" not in _ids(af.own_days(every, MUSLIM))
+    assert "eid_ul_fitr" in _ids(af.own_days(every, MUSLIM))
+    assert "eid_ul_fitr" not in _ids(af.own_days(every, {"celebrates": ["hindu"]}))
+    # An explicit All of India choice keeps every faith's big days.
+    assert {"christmas", "eid_ul_fitr"} <= set(_ids(af.own_days(every, {"celebrates": ["all"]})))
+    # Read through the same Prefs object too, and in the order given.
+    me = af.read_prefs({"celebrates": ["all"]})
+    assert _ids(af.own_days(every, me)) == [i for i in _ids(every) if i in set(_ids(af.own_days(every, me)))]
+
+
+def test_own_days_reads_untagged_rows_by_the_table_and_vrats_by_faith():
+    diwali = {"date": "2026-11-08", "id": "diwali", "name": "Diwali"}
+    assert _ids(af.own_days([diwali], HINDU_DELHI)) == ["diwali"]
+    assert af.own_days([diwali], MUSLIM) == []
+    assert af.own_days([{"date": "2026-11-09", "id": "diwali", "name": "Diwali"}], HINDU_DELHI) == []   # wrong day
+    assert af.own_days([{"date": "2026-11-08", "id": "made_up", "name": "X"}], {"celebrates": ["all"]}) == []
+    assert af.own_days([None, "x", 3], HINDU_DELHI) == [] and af.own_days(None, HINDU_DELHI) == []
+    vrat = {"date": "2026-10-22", "id": "ekadashi", "kind": "ekadashi", "type": "vrat", "name": "Ekadashi vrat"}
+    assert af.own_days([vrat], HINDU_DELHI) == [vrat] and af.own_days([vrat], {"celebrates": ["jain"]}) == []
+    out = af.own_days([diwali], HINDU_DELHI)
+    out[0]["name"] = "changed"
+    assert diwali["name"] == "Diwali"   # copies, never the caller's rows
+
+
+@pytest.mark.parametrize("prefs", [HINDU_DELHI, BENGALI, MUSLIM, {"religion": "Prefer not to say"},
+                                   {"celebrates": ["all"]}, {"religion": "Sikh", "community": "Punjabi"}])
+def test_own_days_agree_with_the_observance_line(prefs):
+    """Mithu's note (own_days over the Today rows) and the horoscope's TODAY_OBSERVANCE wish the same days."""
+    day = date(2026, 10, 11)
+    while day < date(2027, 4, 1):
+        own = af.own_days(af.upcoming(day, 1, *DELHI, prefs, vrats=None)["festivals"], prefs)
+        line = af.observance_for(day, prefs.get("celebrates"), prefs.get("community"), religion=prefs.get("religion"),
+                                 state=prefs.get("stateName"))
+        if own:
+            parts = line.split(" | ")
+            assert [p.split(":")[0].split(". Greeting")[0] for p in parts] == [r["name"] for r in own], (day, line)
+        else:
+            assert line == "none", (day, line)
+        day += timedelta(days=1)

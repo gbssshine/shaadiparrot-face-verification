@@ -1,13 +1,19 @@
 """Today / Kundli / Family HTTP API (Cloud Run). main.py wires the shared helpers in with configure().
 
-  POST /astro/today       city panchang, festivals and vrats ahead, a day line for each family member
-  POST /astro/chart       a birth chart (planets by house, Lagna or Moon based), Vimshottari dashas
+  POST /astro/today       city panchang, a day line for each family member, the old merged festival list (1.0.7)
+                          and, from 1.0.8, the reader's own festivals and fasts, the next big day, other faiths' big
+                          days as a greeting, what the lists are picked by, where the place came from and Mithu's
+                          note of the day (engagement N3, N5)
+  POST /astro/forecast    the week ahead (N4): the day strip, best days, events and Mithu's short text
+  POST /astro/chart       a birth chart (planets by house, Lagna or Moon based), Vimshottari dashas, transits
   POST /astro/match       36-guna match and the 10 South Indian poruthams of any two people (me, someone typed in,
                           or a rishta member), doshas with the Manglik status
-  POST /astro/match/report Mithu's full written match reading (Parrot+), in gunas or (system "porutham") in
-                          poruthams, kept so it is never charged twice
+  POST /astro/match/report Mithu's full written match reading, in gunas or (system "porutham") in poruthams, kept
+                          so it is never charged twice: Parrot+ (legacy, promo), a pair already unlocked, a reading
+                          credit (useCredit) or REPORTS_OPEN=1; otherwise 402 {credits} (money §7 phase 1)
   POST /astro/good-days   dates that suit an event (wedding, griha pravesh, naming...) by the panchang
-  POST /astro/question    Mithu's question of the day: vote once, then see your city and India
+  POST /astro/question    Mithu's question of the day: vote once, then see your city and India; yesterday's answers
+                          once enough people voted (N6)
   POST /astro/places      city search for the panchang place and for birth places (India first)
   POST /astro/scores      36-guna score of me with each rishta card in my list, and the porutham count (only the
                           scores leave the server)
@@ -17,28 +23,35 @@ reach the phone. Only people the caller could see in the list are matched: a pub
 banned or suspended, and no block either way.
 
 Data (server-only): dailyQuestions/{dayKey} vote counts, dailyQuestionVotes/{dayKey}__{uid},
-astroReports/{uid}__{hash} written readings, users/{uid}/feedState/moon (the Moon keys getRishtas scores the
-36 gunas with, written for me and for rishta cards charted fresh in /scores). Birth details sent for other
-people are used for the answer and not stored.
+astroReports/{uid}__{hash} written readings, users/{uid}/kundliUnlocks/{pairKey} unlocked readings and
+users/{uid}.reportCredits (spent here, bought through the functions), users/{uid}/feedState/moon (the Moon keys
+getRishtas scores the 36 gunas with, written for me and for rishta cards charted fresh in /scores),
+forecasts/{uid}__self__week__{periodKey} (astro_forecast), mithuNotes and mithuNotesState (astro_notes). Birth
+details sent for other people are used for the answer and not stored.
 """
 from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date as Date, datetime, timezone
+from datetime import date as Date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Annotated, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, Field
 
 import astro_content
 import astro_core as ac
+import astro_festivals as afest
+import astro_forecast
+import astro_notes
 import fates_astro
 import fates_astro_chart as fc
 import porutham
@@ -50,6 +63,10 @@ DEFAULT_PLACE = {"name": "New Delhi", "lat": 28.6139, "lon": 77.209, "tz": "Asia
 PER_MINUTE = 40
 REPORTS_PER_DAY = 12
 SCORES_PER_DAY = 300   # /scores calls a day that need fresh work (cached scores don't count)
+FORECASTS_PER_DAY = 6  # /forecast calls a day that need Mithu's weekly text written (a kept text doesn't count)
+LEGACY_UPCOMING_DAYS, LEGACY_UPCOMING_LIMIT = 40, 8   # the old merged list 1.0.7 apps read
+YESTERDAY_MIN_INDIA = 20   # yesterday's answers only once India has this many votes (one vote must not be shown)...
+YESTERDAY_MIN_CITY = 15    # ...and the city view only with this many in the city
 
 
 @dataclass
@@ -62,6 +79,10 @@ class Deps:
     is_premium: Callable[[Dict[str, Any], Dict[str, Any], datetime], bool]
     complete: Callable[..., Tuple[str, str]]
     take_rate: Callable[[str, str, int, str], bool]
+    # serverLeases (main._take_lease / main._release_lease): one AI call per uid and week for /forecast while
+    # parallel requests wait for it. None (older wiring, tests): the forecast still works, without a lease.
+    take_lease: Optional[Callable[[str, float], bool]] = None
+    release_lease: Optional[Callable[[str], None]] = None
 
 
 _deps: Optional[Deps] = None
@@ -161,6 +182,13 @@ class MatchReq(BaseModel):
     b: PersonIn
     # /match/report only: "porutham" writes the reading in the 10 South Indian poruthams instead of 36 gunas.
     system: Text20 = None
+    # /match/report only: spend one of users.reportCredits when the pair isn't unlocked yet (money §7 phase 1).
+    useCredit: bool = False
+
+
+class ForecastReq(BaseModel):
+    span: Text20 = "week"
+    place: Optional[PlaceIn] = None
 
 
 class GoodDaysReq(BaseModel):
@@ -270,50 +298,55 @@ def _city_place(city: str, state: str, iso2: str, country_name: str) -> Optional
 def _place(p: Optional[PlaceIn], own: Optional[Callable[[], Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Where the panchang is for: the place the app sent (coordinates, else a city name), else the caller's own
     profile (its coordinates, else its city), else New Delhi. Coordinates are rounded to ~1 km: plenty for
-    sunrise, and people nearby share the cached day frames. own() is only called when it is needed."""
+    sunrise, and people nearby share the cached day frames. own() is only called when it is needed.
+    source says which it was ('app' | 'profile' | 'default'): the app asks for the home city only on 'default'."""
     try:
         if p and _num(p.lat) and _num(p.lon) and -90 <= p.lat <= 90 and -180 <= p.lon <= 180:
             lat, lon = round(p.lat, 2), round(p.lon, 2)
             near = _nearest_city(lat, lon)
             name = (p.city or "").strip()[:60]
             if near:
-                return {**near, "name": name or near["name"]}
+                return {**near, "name": name or near["name"], "source": "app"}
             return {"name": name or "Your city", "lat": lat, "lon": lon, "tz": ac.zone(p.tz).key,
-                    "key": _city_key(name) if name else "india"}
+                    "key": _city_key(name) if name else "india", "source": "app"}
         if p and p.city:
             found = _city_place(p.city, p.state or "", p.countryIso2 or "IN", "")
             if found:
-                return found
+                return {**found, "source": "app"}
         doc = own() if own else None
         if doc:
             lat, lon = doc.get("lat"), doc.get("lon")
             if _num(lat) and _num(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
                 near = _nearest_city(round(float(lat), 2), round(float(lon), 2))
                 if near:
-                    return near
+                    return {**near, "source": "profile"}
             city = str(doc.get("cityName") or doc.get("city") or "").strip()
             if city:
                 found = _city_place(city, str(doc.get("stateName") or ""), str(doc.get("countryIso2") or ""),
                                     str(doc.get("countryName") or ""))
                 if found:
-                    return found
+                    return {**found, "source": "profile"}
     except HTTPException:
         raise
     except Exception:
         logger.warning("place resolve failed", exc_info=True)
-    return dict(DEFAULT_PLACE)
+    return {**DEFAULT_PLACE, "source": "default"}
+
+
+def _real_today(tz: str) -> Date:
+    """Today's date where the place is (the one clock every route reads, so tests can set it)."""
+    return datetime.now(ac.zone(tz)).date()
 
 
 def _local_day(tz: str, raw: Optional[str] = None) -> Date:
     if raw:
         try:
             d = Date.fromisoformat(raw[:10])
-            today = datetime.now(ac.zone(tz)).date()
-            if abs((d - today).days) <= 400:
+            if abs((d - _real_today(tz)).days) <= 400:
                 return d
         except ValueError:
             pass
-    return datetime.now(ac.zone(tz)).date()
+    return _real_today(tz)
 
 
 # ------------------------------------------------------------------ members (rishta cards)
@@ -451,14 +484,88 @@ def _chart_for(profile: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[s
 
 
 # ------------------------------------------------------------------ /today
+_PREF_KEYS = ("celebrates", "community", "stateName", "astroMode")
+
+
+def _prefs_of(merged: Dict[str, Any]) -> Dict[str, Any]:
+    """What festivals, notes and the astro mode are picked by (N3): users.celebrates, community, stateName and
+    astroMode, with the merged docs behind them (religion, birthStateName) read by astro_festivals itself."""
+    return {k: merged.get(k) for k in _PREF_KEYS}
+
+
+def _festival_lists(day: Date, place: Dict[str, Any], merged: Dict[str, Any]) -> Dict[str, Any]:
+    """N3 lists for Today: {festivals, fasts, bigDay, alsoInIndia, showing}. Additive fields: a failure here leaves
+    them empty and never takes Today down."""
+    try:
+        return afest.upcoming(day, afest.FESTIVAL_DAYS, place["lat"], place["lon"], place["tz"], merged,
+                              vrats=ac.vrats_between)
+    except Exception:
+        logger.exception("festival lists failed")
+        return {"festivals": [], "fasts": [], "bigDay": None, "alsoInIndia": [], "showing": None}
+
+
+def _natal_moon(profile: Dict[str, Any]) -> Optional[Tuple[int, int, str]]:
+    """(Moon rashi, nakshatra, precision) of the caller's own birth: the time, else their approximate part of the
+    day (birthTimeApprox, never a Lagna), else noon; precision is 'exact' only with a time and a city. None without
+    a birth date."""
+    date = fc._parse_date(profile.get("birthDate"))
+    if not date:
+        return None
+    time_ = fc._parse_time(profile.get("birthTime"))
+    place = None
+    try:
+        place = _d().resolve_place(profile)
+    except Exception:
+        place = None
+    born = ac.birth_moment(date, time_ or ac.approx_time(profile.get("birthTimeApprox")), place)
+    lon = ac.moon_lon(ac.jd_of(born))
+    exact = bool(time_ and place and place.get("precision") == "city")
+    return int(lon // 30.0) % 12, int(lon // ac.NAK_SPAN) % 27, "exact" if exact else "approximate"
+
+
+def _soon_rows(lists: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Festival rows (and the big day) for the note: today's and tomorrow's are what it reads; each day once."""
+    rows, seen = [], set()
+    for r in list(lists.get("festivals") or []) + ([lists["bigDay"]] if lists.get("bigDay") else []):
+        k = (r.get("date"), r.get("id"))
+        if k not in seen:
+            seen.add(k)
+            rows.append(r)
+    return rows
+
+
+def _mithu_note(uid: str, merged: Dict[str, Any], place: Dict[str, Any], day: Date, members: List[PersonIn],
+                lists: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Mithu writes first (N5): today's note or None. Only for the place's real today (a day sent from far away
+    never makes or stores a note), and a failure never takes Today down."""
+    try:
+        if abs((day - _real_today(place["tz"])).days) > 1:
+            return None
+        prefs = _prefs_of(merged)
+        natal = None
+        if astro_notes.astro_mode_of(prefs, merged) == "full":
+            moon = _natal_moon(merged)
+            natal = {"rashi": moon[0]} if moon else None
+        return astro_notes.note_for(uid, merged, place, day, members, prefs, festivals=_soon_rows(lists),
+                                    db=_d().db(), natal=natal)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("mithu note failed")
+        return None
+
+
 @router.post("/today")
 def today(body: TodayReq, authorization: Optional[str] = Header(default=None)):
     uid = _auth(authorization)
-    place = _place(body.place, _Me(uid).merged)
+    me = _Me(uid)
+    place = _place(body.place, me.merged)
     day = _local_day(place["tz"], body.date)
     try:
         p = ac.panchang(day, place["lat"], place["lon"], place["tz"])
-        ahead = ac.upcoming(day, 40, place["lat"], place["lon"], place["tz"], limit=8)
+        # The old merged list (1.0.7 apps) from the all-India table, in exactly the old shape.
+        ahead = afest.legacy_merged(day, LEGACY_UPCOMING_DAYS, place["lat"], place["lon"], place["tz"],
+                                    limit=LEGACY_UPCOMING_LIMIT, vrats=ac.vrats_between)
     except Exception:
         logger.exception("panchang failed")
         raise HTTPException(status_code=503, detail="temporarily_unavailable")
@@ -478,8 +585,86 @@ def today(body: TodayReq, authorization: Optional[str] = Header(default=None)):
                            "moonSign": fates_astro.RASHIS[chart["rashi"]][0]})
         except Exception:
             logger.warning("family line failed", exc_info=True)
-    return {"ok": True, "place": {"name": place["name"], "tz": place["tz"]}, "dayKey": day.isoformat(),
-            "panchang": p, "upcoming": ahead, "family": family}
+    merged = me.merged()
+    lists = _festival_lists(day, place, merged)
+    return {"ok": True, "place": {"name": place["name"], "tz": place["tz"], "source": place.get("source") or "default"},
+            "dayKey": day.isoformat(), "panchang": p, "upcoming": ahead, "family": family,
+            "festivals": lists.get("festivals") or [], "fasts": lists.get("fasts") or [],
+            "bigDay": lists.get("bigDay"), "alsoInIndia": lists.get("alsoInIndia") or [],
+            "showing": lists.get("showing"),
+            "mithu": _mithu_note(uid, merged, place, day, body.members, lists)}
+
+
+# ------------------------------------------------------------------ /forecast (engagement N4)
+class _OverForecastCap(Exception):
+    """Today's FORECASTS_PER_DAY weekly texts are used up: the strip is served without new text."""
+
+
+def _forecast_complete(uid: str) -> Callable[..., Tuple[str, str]]:
+    """Deps.complete for the weekly text, counted in the 'forecast' rate (FORECASTS_PER_DAY a day) the first time a
+    request needs the AI: a kept text costs nothing, and a refused text can't be asked for over and over."""
+    state: Dict[str, bool] = {}
+
+    def complete(*args: Any, **kwargs: Any) -> Tuple[str, str]:
+        if "ok" not in state:
+            state["ok"] = bool(_d().take_rate(uid, "forecast", FORECASTS_PER_DAY, "day"))
+        if not state["ok"]:
+            raise _OverForecastCap()
+        return _d().complete(*args, **kwargs)
+
+    return complete
+
+
+def _first_name(doc: Dict[str, Any]) -> str:
+    return str(doc.get("firstName") or doc.get("name") or "").strip().split(" ")[0][:30]
+
+
+@router.post("/forecast")
+def forecast(body: ForecastReq, authorization: Optional[str] = Header(default=None)):
+    """The week ahead for the account's own profile (N4): Monday to Sunday holding today (next week on Saturday and
+    Sunday). astroMode 'off' answers {ok: false, error: 'astro_off'}; no birth date is 422 missing_birth_data."""
+    uid = _auth(authorization)
+    span = (body.span or "week").strip().lower()
+    if span != "week":
+        raise HTTPException(status_code=400, detail="bad_span")
+    me = _Me(uid)
+    merged = me.merged()
+    mode = astro_notes.astro_mode_of(_prefs_of(merged), merged)
+    if mode == "off":
+        return {"ok": False, "error": "astro_off", "span": span}
+    if not fc._parse_date(merged.get("birthDate")):
+        raise HTTPException(status_code=422, detail="missing_birth_data")
+    place = _place(body.place, me.merged)
+    today_ = _local_day(place["tz"])
+    managed = str(merged.get("profileFor") or "").strip().lower() in astro_notes.MANAGED
+    name = (_first_name(merged) or None) if managed else None
+    try:
+        rashi, nak, precision = _natal_moon(merged)
+        monday, _ = astro_forecast.week_period(today_)
+        # Events: the reader's own festivals of the week (never another faith's day as theirs) and big sky events.
+        week_rows = afest.upcoming(monday, 7, place["lat"], place["lon"], place["tz"], merged, limit=20,
+                                   vrats=None)["festivals"]
+        festivals = afest.own_days(week_rows, merged)
+        week = astro_forecast.build_week(rashi, nak, today_, place, name=name,
+                                         relation=str(merged.get("profileFor") or ""), precision=precision,
+                                         festivals=festivals)
+        facts = astro_forecast.week_facts(week, natal_rashi=rashi, natal_nak=nak, name=name, astro_mode=mode)
+    except Exception:
+        logger.exception("forecast failed")
+        raise HTTPException(status_code=503, detail="temporarily_unavailable")
+    sig = astro_forecast.birth_sig(merged.get("birthDate"), merged.get("birthTime"), merged.get("birthCityName"),
+                                   merged.get("birthTimeApprox"))
+    deps = _d()
+    try:
+        text, _cached = astro_forecast.cached_week_text(
+            deps.db(), uid, week["periodKey"], facts, sig, _forecast_complete(uid),
+            take_lease=deps.take_lease or (lambda name_, ttl: True),
+            release_lease=deps.release_lease or (lambda name_: None),
+            take_rate=deps.take_rate)
+    except Exception:
+        logger.exception("forecast text failed")
+        text = None   # the strip still shows
+    return {"ok": True, **week, "text": text}
 
 
 # ------------------------------------------------------------------ /chart
@@ -491,7 +676,8 @@ def chart(body: ChartReq, authorization: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=403, detail="not_allowed")
     me = _Me(uid)
     profile, name, _ = _resolve_person(me, body.person)
-    if body.person is None or body.person.me:
+    own = body.person is None or body.person.me
+    if own:
         _remember_me(me)   # never for someone typed in or a family member
     date = fc._parse_date(profile.get("birthDate"))
     time_ = fc._parse_time(profile.get("birthTime"))
@@ -501,12 +687,10 @@ def chart(body: ChartReq, authorization: Optional[str] = Header(default=None)):
     except Exception:
         place = None
     try:
-        out = ac.birth_chart(date, time_, place)
-        # One Manglik status per chart (C3): the reading /match, /scores and Fates give, Jupiter's cancellation
-        # included (birth_chart reads Manglik without Jupiter), and the Mangal line rebuilt to go with it.
-        out["manglik"] = fates_astro.manglik_status(fates_astro.chart_from_birth(date, time_, place))
-        out["lines"] = ac.chart_lines(out["lagna"], out["moon"], out["sun"], out["dasha"], out["manglik"],
-                                      out["timeKnown"])
+        # My own "I don't know the time" answer (users.birthTimeApprox) sharpens my Moon chart, never a Lagna;
+        # people typed in and family members have no such answer. birth_chart reads Manglik with Jupiter, so the
+        # status (C3) and the Mangal line are the ones /match, /scores and Fates give for the same birth.
+        out = ac.birth_chart(date, time_, place, approx=profile.get("birthTimeApprox") if own else None)
     except Exception:
         logger.exception("chart failed")
         raise HTTPException(status_code=503, detail="temporarily_unavailable")
@@ -633,13 +817,109 @@ def _report_slot(uid: str) -> bool:
     return True
 
 
+# ------------------------------------------------------------------ reading credits (money §7 phase 1)
+UNLOCKS = "kundliUnlocks"
+
+
+def _reports_open() -> bool:
+    """REPORTS_OPEN=1 (Cloud Run env, an owner step): every reading is free, and the pair is unlocked via 'open'."""
+    return (os.getenv("REPORTS_OPEN") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _credit_count(user: Dict[str, Any]) -> int:
+    """users/{uid}.reportCredits (server-written by the functions), never below 0; anything odd is 0."""
+    v = user.get("reportCredits")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return 0
+    return max(0, int(v))
+
+
+def _person_key(me: _Me, p: Optional[PersonIn]) -> str:
+    """money §3.6 personKey: the uid for members (the caller included); 'dob|time|lat4|lon4' for someone typed in
+    (a typed key always has '|', a uid never does)."""
+    if p is None or p.me:
+        return me.uid
+    if p.uid:
+        return p.uid.strip()
+    prof = _person_profile(p)
+    y, m, d = fc._parse_date(prof["birthDate"]) or (0, 0, 0)
+    t = fc._parse_time(prof["birthTime"])
+    place = None
+    try:
+        place = _d().resolve_place(prof)
+    except Exception:
+        place = None
+    lat = f"{float(place['lat']):.4f}" if place and _num(place.get("lat")) else ""
+    lon = f"{float(place['lon']):.4f}" if place and _num(place.get("lon")) else ""
+    return f"{y:04d}-{m:02d}-{d:02d}|{'%02d:%02d' % t if t else ''}|{lat}|{lon}"
+
+
+def pair_key(key_a: str, key_b: str) -> str:
+    """sha256 of the two person keys in sorted order: the same pair in either order is one unlock."""
+    return hashlib.sha256("\n".join(sorted((key_a, key_b))).encode("utf-8")).hexdigest()
+
+
+def _run_transaction(db: Any, work: Callable[[Any], Any]) -> Any:
+    """work(transaction) in a Firestore transaction (retried on contention); its result."""
+    from google.cloud import firestore as fs
+    return fs.transactional(work)(db.transaction())
+
+
+def _unlocked(ref: Any) -> bool:
+    """A server-written unlock doc (by == 'server'); anything else is ignored."""
+    if ref is None:
+        return False
+    try:
+        snap = ref.get()
+        return bool(snap.exists) and (snap.to_dict() or {}).get("by") == "server"
+    except Exception:
+        logger.warning("unlock read failed", exc_info=True)
+        return False
+
+
+def _write_unlock(ref: Any, via: str) -> None:
+    """The pair stays unlocked forever (money §3.6): best effort, the reading never waits on it."""
+    if ref is None:
+        return
+    try:
+        ref.set({"by": "server", "via": via, "atIso": datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        logger.warning("unlock write failed", exc_info=True)
+
+
+def _spend_credit(db: Any, uid: str, pair: str) -> Optional[int]:
+    """One credit for this pair, in one transaction with its unlock doc, before anything is written: the credits
+    left; the count unchanged when the pair was unlocked meanwhile (nothing spent); None when none are left."""
+    user_ref = db.collection("users").document(uid)
+    unlock_ref = user_ref.collection(UNLOCKS).document(pair)
+    at = datetime.now(timezone.utc).isoformat()
+
+    def work(tx: Any) -> Optional[int]:
+        unlock = unlock_ref.get(transaction=tx)
+        snap = user_ref.get(transaction=tx)
+        n = _credit_count((snap.to_dict() or {}) if snap.exists else {})
+        if unlock.exists and (unlock.to_dict() or {}).get("by") == "server":
+            return n
+        if n <= 0:
+            return None
+        tx.update(user_ref, {"reportCredits": n - 1})
+        tx.set(unlock_ref, {"by": "server", "via": "credit", "atIso": at})
+        return n - 1
+
+    return _run_transaction(db, work)
+
+
+def _locked(credits: int) -> JSONResponse:
+    """402 with the reading credits left: n > 0 "Use 1 of your n readings", 0 "Read for ₹99". Top level, as money §7
+    says; the app also reads it inside detail."""
+    return JSONResponse(status_code=402, content={"detail": "credits_needed", "credits": max(0, int(credits))})
+
+
 @router.post("/match/report")
 def match_report(body: MatchReq, authorization: Optional[str] = Header(default=None)):
     uid = _auth(authorization)
     me = _Me(uid)
     merged, _, user = me.docs()
-    if not _d().is_premium(user, merged, datetime.now(timezone.utc)):
-        raise HTTPException(status_code=402, detail="premium_required")
     try:
         res = _match(me, body)
     except HTTPException:
@@ -652,15 +932,48 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
     key = hashlib.sha256(repr(sorted(facts.items())).encode("utf-8")).hexdigest()[:24]
     db = _d().db()
     ref = db.collection("astroReports").document(f"{uid}__{key}") if db else None
+    credits = _credit_count(user)
     if ref is not None:
         try:
             snap = ref.get()
             if snap.exists and (snap.to_dict() or {}).get("text"):
-                return {"ok": True, "match": res, "report": snap.to_dict()["text"], "cached": True}
+                # A reading this account already has: it was paid for (or free) once, so it is never charged again.
+                return {"ok": True, "match": res, "report": snap.to_dict()["text"], "cached": True, "credits": credits}
         except Exception:
             logger.warning("report cache read failed", exc_info=True)
+
+    # Who may read it (money §7 phase 1): a pair already unlocked, Parrot+ or a running promo (the legacy promise),
+    # REPORTS_OPEN=1, or one of the account's reading credits when the app asks to spend it.
+    pair = pair_key(_person_key(me, body.a), _person_key(me, body.b))
+    unlock_ref = (db.collection("users").document(uid).collection(UNLOCKS).document(pair)
+                  if db is not None else None)
+    if _unlocked(unlock_ref):
+        via: Optional[str] = None
+    elif _d().is_premium(user, merged, datetime.now(timezone.utc)):
+        via = "legacy"
+    elif _reports_open():
+        via = "open"
+    elif body.useCredit and credits > 0:
+        via = "credit"
+    else:
+        return _locked(credits)
+    # The daily caps come before a credit is spent.
     if not _report_slot(uid) or not _d().take_rate(uid, "astroReport", REPORTS_PER_DAY, "day"):
         raise HTTPException(status_code=429, detail="daily_cap")
+    if via == "credit":
+        if db is None:
+            raise HTTPException(status_code=503, detail="temporarily_unavailable")
+        try:
+            left = _spend_credit(db, uid, pair)
+        except Exception:
+            logger.exception("credit spend failed")
+            raise HTTPException(status_code=503, detail="temporarily_unavailable")
+        if left is None:
+            return _locked(0)
+        credits = left
+    elif via:
+        _write_unlock(unlock_ref, via)
+    # From here the pair is unlocked: a failed reading below is asked for again without another credit.
     msgs = [{"role": "system", "content": _report_system(porutham_mode)}, {"role": "user", "content": f"FACTS: {facts}"}]
     try:
         text, _ = _d().complete(msgs, 700, 0.6, "astro_match_report")
@@ -679,7 +992,7 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
                      "createdAtIso": datetime.now(timezone.utc).isoformat()})
         except Exception:
             logger.warning("report cache write failed", exc_info=True)
-    return {"ok": True, "match": res, "report": text, "cached": False}
+    return {"ok": True, "match": res, "report": text, "cached": False, "credits": credits}
 
 
 # ------------------------------------------------------------------ /good-days
@@ -723,14 +1036,41 @@ def _results(doc: Dict[str, Any], n: int, city_key: str, city_name: str) -> Dict
             "city": {"name": city_name, "total": sum(city_counts), "counts": city_counts}}
 
 
+def _yesterday(db: Any, uid: str, day: Date, city_key: str, city_name: str) -> Optional[Dict[str, Any]]:
+    """Yesterday's question with India's answers (N6): only once India has YESTERDAY_MIN_INDIA votes, and the
+    city view only with YESTERDAY_MIN_CITY there, so nobody's single answer can be read off a small count.
+    voted: this account's own answer yesterday, or None. Never raises."""
+    try:
+        yday = day - timedelta(days=1)
+        q = astro_content.question_for(yday)
+        qref = db.collection("dailyQuestions").document(yday.isoformat())
+        vref = db.collection("dailyQuestionVotes").document(f"{yday.isoformat()}__{uid}")
+        got = _get_docs(db, [qref, vref])
+        doc = got.get(qref.path) or {}
+        if doc.get("qid") and doc.get("qid") != q["id"]:
+            return None   # the counts are for another question
+        n = len(q["options"])
+        res = _results(doc, n, city_key, city_name)
+        if res["total"] < YESTERDAY_MIN_INDIA:
+            return None
+        city = res["city"] if city_key != "india" and res["city"]["total"] >= YESTERDAY_MIN_CITY else None
+        mine = (got.get(vref.path) or {}).get("option")
+        voted = mine if isinstance(mine, int) and not isinstance(mine, bool) and 0 <= mine < n else None
+        return {"id": q["id"], "day": yday.isoformat(), "text": q["text"], "options": q["options"],
+                "counts": res["counts"], "total": res["total"], "city": city, "voted": voted}
+    except Exception:
+        logger.warning("yesterday's question failed", exc_info=True)
+        return None
+
+
 @router.post("/question")
 def question(body: QuestionReq, authorization: Optional[str] = Header(default=None)):
     uid = _auth(authorization)
     place = _place(body.place, _Me(uid).merged)
-    day = datetime.now(ac.zone(place["tz"])).date()
+    day = _real_today(place["tz"])
     q = astro_content.question_for(day)
     out = {"ok": True, "question": {"id": q["id"], "day": day.isoformat(), "text": q["text"], "options": q["options"]},
-           "voted": None, "results": None}
+           "voted": None, "results": None, "yesterday": None}
     db = _d().db()
     if db is None:
         return out
@@ -767,6 +1107,7 @@ def question(body: QuestionReq, authorization: Optional[str] = Header(default=No
             out["results"] = _results(qref.get().to_dict() or {}, len(q["options"]), ck, city_name)
     except Exception:
         logger.warning("question vote failed", exc_info=True)
+    out["yesterday"] = _yesterday(db, uid, day, ck, city_name)
     return out
 
 

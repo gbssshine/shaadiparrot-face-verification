@@ -1,8 +1,8 @@
 """Mithu writes first (engagement N5): one short note a day inside the app, from templates (no AI, no push).
 
 The highest priority that qualifies wins:
-  P1  an own-faith festival today or tomorrow (the caller passes the festivals, already filtered for the
-      reader's faith and region by astro_festivals), with the city time when the festival has one;
+  P1  an own-faith festival today or tomorrow (the caller passes astro_festivals.upcoming rows; only the reader's
+      own days among them are used, astro_festivals.own_days), with the city time when the festival has one;
   P2  a birthday today or tomorrow: a family member, the person a managed profile is for, or the reader;
   P3  a big sky event (a Jupiter, Saturn or Rahu sign change) within 2 days, astroMode 'full' with a birth date;
   P5  the wedding season opens (Dev Uthani Ekadashi), for single and managed accounts, 'full' or 'fun'.
@@ -22,6 +22,7 @@ from datetime import date as Date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import astro_core as ac
+import astro_festivals as afest
 import fates_astro_chart as fc
 
 logger = logging.getLogger("shaadiparrot-cloudrun.notes")
@@ -37,9 +38,10 @@ MARRIED_STAGES = frozenset({"newly_married", "relationship", "married", "married
 ASK_FIRST = frozenset({"muslim", "christian", "sikh", "parsi", "jewish", "buddhist", "spiritual"})
 # The wedding season (muhurats) is a Hindu, Jain and Sikh family custom; unknown faith counts as "All of India".
 WEDDING_SEASON_FAITHS = frozenset({"hindu", "jain", "sikh"})
-DEV_UTHANI_DAYS = frozenset(f["date"] for f in ac.FESTIVALS if f["id"] == "dev_uthani")
+DEV_UTHANI_DAYS = frozenset(f["date"] for f in afest.FESTIVALS if f["id"] == "dev_uthani")
 # Festival ids whose name is the start of a period ("Sharad Navratri begins", "Ramzan begins"): the title reads
-# "<name> tomorrow", not "<name> is tomorrow". Keyed by id, never by the displayed name (CR5).
+# "<name> tomorrow", not "<name> is tomorrow". Keyed by id, never by the displayed name (CR5). Every id in
+# astro_festivals whose name ends in "begins" must be here (tests/test_notes.py checks the table).
 STARTS_A_PERIOD = frozenset({"navratri", "ramzan_start"})
 
 
@@ -71,6 +73,19 @@ def _celebrates(prefs: Dict[str, Any], me: Dict[str, Any]) -> List[str]:
         k = faith_key(me.get("religion"))
         keys = [k] if k else []
     return keys
+
+
+def festival_prefs(prefs: Dict[str, Any], me: Dict[str, Any]) -> Dict[str, Any]:
+    """What astro_festivals reads the reader's own days by: the prefs given (celebrates, community, stateName,
+    astroMode), with the reader's own docs filling what they leave out (celebrates, religion, community, state)."""
+    out = dict(prefs or {})
+    me = me or {}
+    if out.get("celebrates") is None and me.get("celebrates") is not None:
+        out["celebrates"] = me.get("celebrates")
+    for key in ("religion", "community", "stateName", "birthStateName"):
+        if not out.get(key) and me.get(key):
+            out[key] = me.get(key)
+    return out
 
 
 def astro_mode_of(prefs: Dict[str, Any], me: Dict[str, Any]) -> str:
@@ -317,14 +332,18 @@ def compose(me: Dict[str, Any], place: Dict[str, Any], day: Date, members: Optio
             natal: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Today's note by priority (P1 > P2 > P3 > P5), or None. Pure: no storage, no caps.
     me: the caller's merged docs; place: the /astro/today place; prefs: {celebrates, community, stateName,
-    astroMode}; festivals: own-faith festivals from astro_festivals.upcoming (today and tomorrow are used);
+    astroMode}; festivals: rows from astro_festivals.upcoming (festivals / bigDay; today and tomorrow are used,
+    and only the reader's own days among them: astro_festivals.own_days, untagged rows by the table's entry);
     natal: {'rashi': birth Moon sign} when the caller already has the chart."""
     me = me or {}
     prefs = prefs or {}
     mode = astro_mode_of(prefs, me)
     p5 = _p5_applies(me, prefs, day, mode)
+    # Only the reader's own days are wished (astro_festivals.own_days): the lists show an unknown faith every
+    # faith's big days, but "Prefer not to say" or another faith never gets "Eid Mubarak" or "Merry Christmas".
+    own = afest.own_days(festivals, festival_prefs(prefs, me))
     # On Dev Uthani itself the wedding-season note says more than the festival line to singles and families.
-    note = _p1(festivals, day, place, mode, frozenset({"dev_uthani"}) if p5 else frozenset())
+    note = _p1(own, day, place, mode, frozenset({"dev_uthani"}) if p5 else frozenset())
     if note is None:
         note = _p2(me, day, members)
     if note is None and mode == "full" and fc._parse_date(me.get("birthDate")):

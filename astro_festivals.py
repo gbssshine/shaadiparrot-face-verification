@@ -733,6 +733,44 @@ def _own_day(e: Mapping[str, Any], me: Prefs) -> bool:
             or (not e["faiths"] and _region_hit(e, me)) or (me.all_india and e["tier"] == "major"))
 
 
+_TAGS = ("tier", "faiths", "communities", "states")
+_BY_DAY_ID: Dict[Tuple[str, str], Dict[str, Any]] = {(e["date"], e["id"]): e for e in FESTIVALS}
+
+
+def _tagged(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    """The row's own tags when it carries them (a table entry, an upcoming() row), else the table entry of the same
+    day and id, else None (nothing says who keeps it)."""
+    if isinstance(row.get("tier"), str) and all(isinstance(row.get(k), (list, tuple)) for k in _TAGS[1:]):
+        return row
+    return _BY_DAY_ID.get((str(row.get("date") or "")[:10], str(row.get("id") or "")))
+
+
+def own_days(rows: Optional[Iterable[Any]], prefs: Any = None) -> List[Dict[str, Any]]:
+    """The rows that are the person's own days, for anything that wishes them (Mithu's notes, the week's events):
+    a day their lists show (shown) that is also their own (_own_day). Other faiths' big days, which the lists show
+    to an unknown faith ("Prefer not to say", "No religion / Spiritual") and as greetings, are left out, so
+    nobody is wished another faith's festival; an explicit All of India choice keeps every faith's big days.
+
+    rows: upcoming() festival / bigDay rows or table entries, in their order; a row without tags is judged by the
+    table entry of the same date and id, and left out when there is none. Vrat rows count only for people who keep
+    Hindu days. prefs: as read_prefs (the caller's merged profile) or a Prefs."""
+    me = _as_prefs(prefs)
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        if not isinstance(r, Mapping):
+            continue
+        if str(r.get("type") or "") == "vrat":
+            if "hindu" in me.faiths:
+                out.append(dict(r))
+            continue
+        e = _tagged(r)
+        if e is None or e["tier"] not in TIERS:
+            continue
+        if shown(e, me) and _own_day(e, me):
+            out.append(dict(r))
+    return out
+
+
 def observance_for(day: Date, celebrates: Any = None, community: Any = None, *, religion: Any = None,
                    state: Any = None, fasts: Optional[Iterable[Mapping[str, Any]]] = None) -> str:
     """Today's observance line for the TODAY_OBSERVANCE fact: the person's own festivals today (the upcoming
