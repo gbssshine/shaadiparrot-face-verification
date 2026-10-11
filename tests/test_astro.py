@@ -384,13 +384,16 @@ def test_match_any_pair(client):
                                               "rasi_adhipathi", "vasya", "rajju", "vedha"]
     assert 0 <= p["countMin"] <= p["count"] <= p["countMax"] <= 10 and p["verdict"]["word"]
     assert all(i["level"] in ("good", "fair", "no") for i in p["items"])
-    # Manglik (C3): without Neha's birth time her side is a check, unless a cancellation holds whatever the
-    # Lagna is (here one does); the row is never "present" while a side is a check.
+    # Manglik (C3): without Neha's birth time her side is a check, even when a cancellation would hold whatever
+    # the Lagna is (here one does: it is listed, but no verdict); the row is a check while a side is a check.
     mang = next(d for d in m["doshas"] if d["name"] == "Manglik")
     sa, sb = m["a"]["manglik"]["status"], m["b"]["manglik"]["status"]
     assert m["b"]["manglik"]["sure"] is False and m["a"]["manglik"]["sure"] is True
-    assert (sa, sb, mang["status"]) == ("no", "no", "clear")   # 22 Jul 1997: Jupiter aspects her Mars
-    assert m["b"]["manglik"]["cancelledBy"] == "Jupiter with or aspecting Mars"
+    assert (sa, sb, mang["status"]) == ("no", "check", "check")   # 22 Jul 1997: Jupiter aspects her Mars
+    assert "cancelledBy" not in m["b"]["manglik"]
+    assert m["b"]["manglik"]["cancelReasons"] == ["Jupiter with or aspecting Mars",
+                                                  "Mars's sign is an accepted exception for its house from Venus"]
+    assert "stays a check, not a verdict" in mang["why"]
     # 5 Dec 1997, no time: Mars is Manglik from her Moon and Venus. 1.0.7 used to show a red "present" here.
     r2 = client.post("/astro/match", json={
         "a": {"name": "Rahul", "gender": "male", "birthDate": "1995-01-10", "birthTime": "06:30", "birthCity": "Delhi"},
@@ -810,6 +813,9 @@ def test_moon_keys_shape():
     assert fa.moon_keys(exact)["exact"] is True and fa.moon_keys(exact)["manglik"] == "yes"
     assert fa.moon_keys({**exact, "lagna": (4 - 2 + 1) % 12})["manglik"] == "mild"        # 2nd only: partial -> mild
     assert fa.moon_keys({**exact, "marsRashi": 0, "lagna": 0})["manglik"] == "no"          # Mars in its own sign
+    # The same cancellation without a birth time: unknown, never a confirmed "no" for pref_manglik.
+    assert fa.moon_keys({**dhanu_late, "marsRashi": 0})["manglik"] == "unknown"
+    assert fa.moon_keys({**dhanu_late, "marsRashi": 0, "jupiterRashi": 0})["manglik"] == "unknown"
     assert fa.moon_keys({"rashi": 1, "nak": 3})["options"] == [[1, 3]]
 
 

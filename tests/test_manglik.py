@@ -61,11 +61,18 @@ def test_check_without_a_birth_time():
     assert moon_only["manglik"] is True and moon_only["from"] == ["Moon"]  # 1.0.7 apps keep the old reading
     nothing = fa.manglik_status(chart(mars))
     assert nothing["status"] == "check" and not nothing["manglik"]
-    # A cancellation that holds whatever the Lagna is still answers "no" without a time.
+    # Without a time even a cancellation that would hold whatever the Lagna is stays a check (C3 row 1): its
+    # reason is listed, but there is no verdict, so no cancelledBy.
     own = fa.manglik_status(chart(SIGN["Vrischika"], moon=ref_for(SIGN["Vrischika"], 7)))
-    assert own["status"] == "no" and own["cancelledBy"] == "Mars in its own or exalted sign"
+    assert own["status"] == "check" and own["sure"] is False and "cancelledBy" not in own
+    assert own["cancelReasons"] == ["Mars in its own or exalted sign"] and not own["manglik"]
     jup = fa.manglik_status(chart(mars, jupiter=mars))
-    assert jup["status"] == "no" and jup["cancelReasons"] == ["Jupiter with or aspecting Mars"]
+    assert jup["status"] == "check" and jup["cancelReasons"] == ["Jupiter with or aspecting Mars"]
+    assert "cancelledBy" not in jup
+    # A house-sign exception from the Moon without a time: listed, still a check.
+    exc = fa.manglik_status(chart(SIGN["Karka"], moon=ref_for(SIGN["Karka"], 7)))
+    assert exc["status"] == "check" and "cancelledBy" not in exc
+    assert exc["cancelReasons"] == ["Mars's sign is an accepted exception for its house from the Moon"]
     # No Mars at all (an old cached chart): check, never a verdict.
     assert fa.manglik_status({"rashi": 3})["status"] == "check"
 
@@ -120,8 +127,9 @@ def test_reasons_never_name_a_sign_or_a_house():
         assert s["status"] in ("yes", "partial", "no", "check")
         for r in s["cancelReasons"]:
             assert not re.search(r"\d", r) and not any(n in r for n in names), r
+        assert (s["status"] == "check") == (c["lagna"] is None)    # no Lagna: always a check, never a verdict
         if s["status"] == "check":
-            assert c["lagna"] is None
+            assert "cancelledBy" not in s and s["sure"] is False
         if s["status"] in ("yes", "partial"):
             assert s["manglik"] and s["sure"]
 
@@ -144,9 +152,11 @@ def test_dosha_statuses():
     assert present["status"] == "present" and present["present"] and not present["cancelled"]
     assert present["why"] == "You are Manglik and the other isn’t. Worth knowing: many families talk it over with a pandit."
     assert fa.manglik_dosha(no, yes)["why"].startswith("They are Manglik")
-    for a, b in ((check, yes), (yes, check), (check, no), (check, check)):
+    cancelled_no_time = chart(SIGN["Mesha"], moon=ref_for(SIGN["Mesha"], 7))   # own sign, no Lagna
+    for a, b in ((check, yes), (yes, check), (check, no), (check, check), (cancelled_no_time, no),
+                 (no, cancelled_no_time), (cancelled_no_time, yes)):
         d = fa.manglik_dosha(a, b)
-        assert d["status"] == "check" and d["why"] == fa.MANGLIK_CHECK_WHY   # never "present" without both Lagnas
+        assert d["status"] == "check" and d["why"] == fa.MANGLIK_CHECK_WHY   # never a verdict without both Lagnas
     # The names go in for a match between two other people.
     assert astro_api._named(present["why"], "Rahul", "Neha").startswith("Rahul is Manglik and the other isn")
     assert astro_api._named(fa.manglik_dosha(no, yes)["why"], "Rahul", "Neha").startswith("Neha is Manglik")
@@ -171,7 +181,7 @@ def test_charts_carry_jupiter():
     assert c["marsRashi"] == next(p for p in full["planets"] if p["code"] == "Ma")["rashi"]
     no_time = fa.chart_from_birth((1990, 5, 15), None, None)
     assert 0 <= no_time["jupiterRashi"] < 12 and no_time["lagna"] is None
-    assert fa.manglik_status(no_time)["status"] in ("check", "no")
+    assert fa.manglik_status(no_time)["status"] == "check"
     assert fa.chart_for_profile({"birthDate": "1990-05-15"}, lambda p: None)["jupiterRashi"] == no_time["jupiterRashi"]
     assert fa.chart_for_profile({"birthDate": "1990-02-30"}, lambda p: None) is None
 
@@ -225,4 +235,4 @@ def test_full_manglik_is_at_most_40_percent_with_a_known_time():
     print("known time:", share, "| no time:", dict(unknown), "| old flag manglik:", dict(legacy))
     assert known["yes"] / total <= 0.40, share
     assert known["check"] == 0
-    assert set(unknown) <= {"check", "no"}                 # without a time: never a verdict of yes or partial
+    assert set(unknown) == {"check"}                       # without a time: never a verdict, not even "no"

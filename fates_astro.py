@@ -7,7 +7,8 @@ separately and never change the 36-point total.
 
 Manglik (audit 9, plan C3): a status per chart, "yes" | "partial" | "no" | "check". Only the Lagna gives a
 full "yes"; Mars counted from the Moon or Venus alone is "partial"; without the Lagna (no birth time or
-place) it stays "check", never a verdict; the common cancellations make it "no".
+place) it stays "check", never a verdict, even when a cancellation applies (its reason is still listed);
+with the Lagna known, the common cancellations make it "no".
 """
 from __future__ import annotations
 
@@ -186,9 +187,10 @@ def manglik_status(chart: Dict[str, Any]) -> Dict[str, Any]:
 
     - Mars in a Manglik house from the Lagna (1, 4, 7, 8, 12): "yes"; the 2nd house from the Lagna: "partial".
     - Only from the Moon or Venus: "partial".
-    - No Lagna (no birth time or place): "check", whatever the Moon and Venus say.
-    - Cancellations make it "no": Mars in its own or exalted sign, Jupiter with or aspecting Mars, and the
-      house-sign exceptions (MANGLIK_SIGN_EXCEPTIONS), which drop the house they apply to.
+    - No Lagna (no birth time or place): "check", whatever the Moon, Venus and the cancellations say. The
+      cancellations that apply are listed in cancelReasons, but there is no cancelledBy (no verdict).
+    - With the Lagna known, cancellations make it "no": Mars in its own or exalted sign, Jupiter with or
+      aspecting Mars, and the house-sign exceptions (MANGLIK_SIGN_EXCEPTIONS), which drop the house they apply to.
     The reasons never name a sign or a house, so a rishta member's side gives nothing of their chart away.
     """
     lagna = chart.get("lagna")
@@ -212,10 +214,10 @@ def manglik_status(chart: Dict[str, Any]) -> Dict[str, Any]:
 
     # Something to cancel: a house found, or an unknown Lagna that could still give one.
     reasons = (whole if (refs or not sure) else []) + excepted
-    if whole and (refs or not sure):
+    if not sure:
+        status = "check"          # C3 row 1: no birth time, no verdict, not even a cancelled one
+    elif whole and refs:
         status = "no"
-    elif not sure:
-        status = "check"
     elif not kept:
         status = "no"
     else:
