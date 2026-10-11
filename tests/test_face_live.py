@@ -82,6 +82,29 @@ def test_storage_object_from_a_download_url():
 
 
 
+def _fb(path: str, host: str = "firebasestorage.googleapis.com", scheme: str = "https") -> str:
+    from urllib.parse import quote
+    return f"{scheme}://{host}/v0/b/app.appspot.com/o/{quote(path, safe='')}?alt=media&token=t"
+
+
+def test_own_photo_url_takes_only_the_users_own_photos_folder():
+    hosts = ("firebasestorage.googleapis.com", "storage.googleapis.com")
+    assert fl.own_photo_url(_fb("users/u1/photos/a.jpg"), "u1", hosts)
+    assert fl.own_photo_url("https://storage.googleapis.com/app.appspot.com/users/u1/photos/a.jpg", "u1", hosts)
+    assert not fl.own_photo_url(_fb("users/u1/photos/a.jpg"), "u2", hosts)                 # someone else's
+    assert not fl.own_photo_url(_fb("users/u1/blur/a.jpg"), "u1", hosts)                   # a server-made blur
+    assert not fl.own_photo_url(_fb("users/u1/variants/abc_480.jpg"), "u1", hosts)         # a resized variant
+    assert not fl.own_photo_url(_fb("users/u1/verification/a.jpg"), "u1", hosts)           # a selfie
+    assert not fl.own_photo_url(_fb("users/u1/a.jpg"), "u1", hosts)                        # not in photos/
+    assert not fl.own_photo_url(_fb("users/u2/photos/users/u1/photos/a.jpg"), "u1", hosts)  # nested in u2's folder
+    assert not fl.own_photo_url(_fb("users/u1/photos/../../u2/a.jpg"), "u1", hosts)
+    assert not fl.own_photo_url("https://photos.shaadiparrot.com/users/u1/photos/a.jpg", "u1", hosts)  # not Storage
+    assert not fl.own_photo_url(_fb("users/u1/photos/a.jpg", scheme="http"), "u1", hosts)  # prod must be https
+    assert not fl.own_photo_url(_fb("users/u1/photos/a.jpg"), "", hosts)
+    emu = "http://10.0.2.2:9199/v0/b/demo.appspot.com/o/users%2Fu1%2Fphotos%2Fa.jpg?alt=media"
+    assert fl.own_photo_url(emu, "u1", ("10.0.2.2:9199",))
+
+
 def test_photo_checks_only_read_the_callers_own_uploads():
     import main
     assert main._own_gcs_photo("gs://shaadiparrot.firebasestorage.app/users/u1/photos/a.jpg", "u1")

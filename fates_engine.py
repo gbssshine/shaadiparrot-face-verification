@@ -10,6 +10,9 @@ import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import unquote
+
+import face_live
 
 PATHS = ("stars", "heart", "home")
 PATH_LABELS = {"stars": "Path of the Stars", "heart": "Path of the Heart", "home": "Path of the Home"}
@@ -98,6 +101,21 @@ class Person:
     stars_pref: str = "little"  # none | little | lot | must
     use_tests: bool = True
     chart: Optional[Dict[str, Any]] = None  # from fates_astro.chart_*()
+    # Matrimony (plan §2 C1 / C11). The facts are what families see on the card (public first); income is the public
+    # card value only, never a matches-only one. prefs are the private pref_* answers (prefs_from_doc).
+    profile_for: str = ""       # "" | self | son | daughter | ... | none (kundli only)
+    marriage_intent: bool = False   # profiles.marriageIntent (the private, trusted fact)
+    marital_status: str = ""
+    children: str = ""          # "" | No children | Yes, living together | Yes, living separately
+    diet: str = ""
+    education: str = ""
+    profession: str = ""
+    caste: str = ""
+    manglik: str = ""           # Yes | No | Partial (Anshik) | Don't know | ""
+    income: str = ""            # an income band code ("10-15L"), public card only
+    family_values: str = ""
+    prefs: Dict[str, Any] = field(default_factory=dict)
+    rishta: bool = False        # the viewer's Fates today are in rishta mode ({mode: 'rishta'})
 
 
 def _future_iso(v: Any) -> bool:
@@ -281,8 +299,25 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
     if lat == 0 and lon == 0:
         lat = lon = None
 
-    photos = [p for p in _str_list(public.get("photos")) if p.startswith("http")]
+    card_photos = [p for p in _str_list(public.get("photos")) if p.startswith("http")]
+    if card_blurred(uid, public):
+        # Private photos: the card holds server-made blurs. They are never a candidate's photos ('no_photos' then
+        # keeps them out of everyone's Fates, so nothing is revealed), and the face check is held against the real
+        # links on the private doc, so a private viewer keeps Daily Fates.
+        photos: List[str] = []
+        verify_photos = own_private_photos(uid, private)
+    else:
+        photos = verify_photos = card_photos
     fates_prefs = private.get("fatesPrefs") if isinstance(private.get("fatesPrefs"), dict) else {}
+
+    def fact(*keys: str) -> str:
+        """A biodata fact as families see it: the public card first (it is what the app shows), then the profile."""
+        for src in (public, private):
+            for k in keys:
+                v = _s(src.get(k))
+                if v:
+                    return v
+        return ""
 
     return Person(
         uid=uid,
@@ -311,7 +346,7 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
         tests=tests,
         photos=photos,
         discoverable=public.get("isDiscoverable") is True,
-        face_verified=verified_now(private, user, photos),
+        face_verified=verified_now(private, user, verify_photos),
         boosted=_future_iso(public.get("boostActiveUntilUtcIso")),
         geo_precise=precise_geo_source(pick("geoSource")),
         units="mi" if _norm(pick("settings_units")) == "mi" else "km",
@@ -320,7 +355,407 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
         last_active_ms=last_active,
         stars_pref=_s(fates_prefs.get("stars") or "little") if _s(fates_prefs.get("stars")) in WEIGHTS else "little",
         use_tests=fates_prefs.get("useTests") is not False,
+        profile_for=_norm(pick("profileFor")),
+        marriage_intent=private.get("marriageIntent") is True,
+        marital_status=fact("maritalStatus"),
+        children=fact("children"),
+        diet=fact("diet"),
+        education=fact("education"),
+        profession=fact("profession"),
+        caste=fact("caste"),
+        manglik=fact("manglik"),
+        income=_s(public.get("annualIncome")),
+        family_values=fact("familyValues"),
+        prefs=prefs_from_doc(private),
     )
+
+
+def card_blurred(uid: str, public: Dict[str, Any]) -> bool:
+    """The card shows blurs instead of the real photos: photoPrivacy is 'accepted', or a card photo lives in the
+    server's blur folder (users/{uid}/blur/, either URL kind)."""
+    if _s(public.get("photoPrivacy")) == "accepted":
+        return True
+    marker = f"users/{uid}/blur/"
+    return any(marker in unquote(p) for p in _str_list(public.get("photos")))
+
+
+def own_private_photos(uid: str, private: Dict[str, Any]) -> List[str]:
+    """The real photo links of a private profile, as the face check uses them: profiles.photos, first 6, only the
+    user's own Storage photos (face_live.own_photo_url)."""
+    links = [p for p in _str_list(private.get("photos")) if p.startswith("http")][:6]
+    return [p for p in links if face_live.own_photo_url(p, uid)]
+
+
+# =========================
+# MATRIMONY: POOLS (plan §2 C1) AND PARTNER PREFERENCES (§2 C11)
+# =========================
+QUICK_MALE_MIN_AGE = 21           # default of serverState/pools.quickMaleMinAge (the owner may lower it to 18)
+GROOM_MIN_AGE = 21                # a man looking for a bride through Rishtas
+SELF_PROFILE = ("", "self")       # profileFor of a profile someone made for themselves
+CONSENT_KEYS = ("intentConsentAtIso", "consentDeclaredAtIso")   # self / managed (family-made) consent
+KUNDLI_MODES = ("show", "rank", "18", "24")
+KUNDLI_RANK_FAITHS = ("hindu", "jain", "sikh", "buddhist")
+# pref_strict tokens a family can mark "Must have". Never saved: religion and marital status are must-haves.
+STRICT_TOKENS = ("religions", "communities", "maritalStatuses", "diets", "education")
+DEFAULT_STRICT = ("religions", "maritalStatuses")
+# Preferences that are must-haves by what they say ("Caste no bar" / chosen castes, Manglik "Must match", an income
+# minimum, "Prefer no children"). Work (professions) and height only ever rank, never hide anyone.
+ALWAYS_MUST = ("castes", "manglik", "children", "income")
+PREF_LABELS = {"religions": "Religion", "communities": "Mother tongue", "castes": "Caste", "manglik": "Manglik",
+               "maritalStatuses": "Marital status", "children": "Children", "diets": "Food", "education": "Education",
+               "professions": "Work", "height": "Height", "income": "Income"}
+MIXED_CASTE = "inter-caste / mixed"
+PARTIAL_MANGLIK = "partial (anshik)"
+# Biodata.IncomeRanges codes -> lakh minimum; anything else (prefer_not, "", junk) is unknown and never excludes.
+INCOME_RANKS = {"0-2l": 0, "2-4l": 2, "4-7l": 4, "7-10l": 7, "10-15l": 10, "15-20l": 15, "20-30l": 20,
+                "30-50l": 30, "50l-1cr": 50, "1cr+": 100}
+INCOME_MINIMUMS = (4, 7, 10, 15, 20, 30, 50, 100)
+# RishtaMatch.EducationRank over the exact Biodata.Educations strings; anything else is 0 (unknown).
+EDUCATION_RANKS = {"high school": 1, "diploma": 2, "bachelor's": 3, "law (llb)": 3, "master's": 4, "mba": 4,
+                   "ca / cs": 4, "mbbs / medical": 4, "doctorate": 5}
+VEG_DIETS = ("vegetarian", "jain food", "vegan")
+FAMILY_VALUES = {"traditional": 0, "moderate": 1, "liberal": 2}
+
+_CASTE_LIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "caste_list.json")
+_caste_state: Dict[str, Any] = {"loaded": False, "umbrellas": None}
+
+
+def load_caste_list(data: Optional[Dict[str, Any]]) -> None:
+    """Sets the caste umbrellas from a CasteList export ({entries: [{name, umbrella, religions, tongues}], blocked});
+    None means "no list" (exact caste matching only)."""
+    umbrellas: Optional[Dict[str, str]] = None
+    if isinstance(data, dict):
+        umbrellas = {}
+        for e in data.get("entries") or []:
+            if isinstance(e, dict) and _norm(e.get("name")):
+                umbrellas[_norm(e.get("name"))] = _norm(e.get("umbrella"))
+    _caste_state.update(loaded=True, umbrellas=umbrellas)
+
+
+def caste_umbrellas() -> Optional[Dict[str, str]]:
+    """name -> umbrella (both case-folded) from caste_list.json, the export the app and the functions share.
+    None while the file isn't there."""
+    if not _caste_state["loaded"]:
+        try:
+            with open(_CASTE_LIST_PATH, encoding="utf-8") as f:
+                load_caste_list(json.load(f))
+        except (OSError, ValueError):
+            load_caste_list(None)
+    return _caste_state["umbrellas"]
+
+
+def unstated(v: Any) -> bool:
+    """Biodata.IsUnstated: empty, "Prefer not to say" or "Don't know" (unknown never hides anyone)."""
+    s = _norm(v)
+    return not s or s.startswith("prefer not") or s in ("don't know", "don’t know")
+
+
+def pref_fits(wanted: Any, value: Any) -> bool:
+    """Biodata.PrefFits: nothing wanted, an unstated value, or one of the wanted values (ignoring case)."""
+    want = [_norm(w) for w in _str_list(wanted)]
+    return not want or unstated(value) or _norm(value) in want
+
+
+def caste_fits(wanted: Any, theirs: Any) -> bool:
+    """CasteList.Fits: "Caste no bar" (nothing wanted), an unstated or "Inter-caste / Mixed" caste, or a wanted one.
+    With caste_list.json an umbrella fits its communities ("Brahmin" fits "Brahmin - Iyer", never the other way);
+    without it only the exact caste fits."""
+    want = [_norm(w) for w in _str_list(wanted)]
+    t = _norm(theirs)
+    if not want or unstated(theirs) or t == MIXED_CASTE or t in want:
+        return True
+    umbrellas = caste_umbrellas()
+    if umbrellas is None:
+        return False
+    if umbrellas.get(t) in want:
+        return True
+    return any(t.startswith(w + " - ") for w in want)
+
+
+def manglik_fits(mine: Any, theirs: Any) -> bool:
+    """Biodata.ManglikFits: fits when either side is unstated or Partial (Anshik), otherwise only the same answer."""
+    a, b = _norm(mine), _norm(theirs)
+    if unstated(mine) or unstated(theirs) or PARTIAL_MANGLIK in (a, b):
+        return True
+    return a == b
+
+
+def income_rank(code: Any) -> int:
+    r = INCOME_RANKS.get(_norm(code))
+    return -1 if r is None else r
+
+
+def income_at_least(code: Any, min_lakh: int) -> bool:
+    """Biodata.IncomeAtLeast: no minimum, an unknown or private income, or a band from the minimum up."""
+    rank = income_rank(code)
+    return min_lakh <= 0 or rank == -1 or rank >= min_lakh
+
+
+def normal_min_lakh(v: int) -> int:
+    """Biodata.NormalMinLakh: the largest allowed minimum not above v, or 0 below 4."""
+    return max([m for m in INCOME_MINIMUMS if m <= (v or 0)], default=0)
+
+
+def education_rank(v: Any) -> int:
+    return EDUCATION_RANKS.get(_norm(v), 0)
+
+
+def prefs_from_doc(d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The partner preferences saved on profiles/{uid} (private). strict is None when pref_strict was never saved."""
+    d = d or {}
+    raw_strict = d.get("pref_strict")
+    strict = [t for t in (_s(x) for x in raw_strict) if t] if isinstance(raw_strict, (list, tuple)) else None
+    kundli = _norm(d.get("pref_kundli"))
+    return {
+        "religions": _str_list(d.get("pref_religions")),
+        "communities": _str_list(d.get("pref_communities")),
+        "castes": _str_list(d.get("pref_castes")),
+        "manglik": "match" if _norm(d.get("pref_manglik")) == "match" else "",
+        "maritalStatuses": _str_list(d.get("pref_maritalStatuses")),
+        "childrenOk": "none" if _norm(d.get("pref_childrenOk")) == "none" else "any",
+        "diets": _str_list(d.get("pref_diets")),
+        "educationMin": max(0, _to_int(d.get("pref_educationMin")) or 0),
+        "professions": _str_list(d.get("pref_professions")),
+        "incomeMinLakh": normal_min_lakh(_to_int(d.get("pref_incomeMinLakh")) or 0),
+        "kundli": kundli if kundli in KUNDLI_MODES else "",
+        "strict": strict,
+        "ageMin": max(0, _to_int(d.get("pref_ageMin")) or 0),
+        "ageMax": max(0, _to_int(d.get("pref_ageMax")) or 0),
+        "scope": _norm(d.get("pref_scope")),
+    }
+
+
+def pref_misses(prefs: Dict[str, Any], other: Person, own_manglik: str) -> List[str]:
+    """The preferences (tokens, PREF_LABELS order) `other` clearly misses. A value they didn't give never misses."""
+    out: List[str] = []
+    if not pref_fits(prefs.get("religions"), other.religion):
+        out.append("religions")
+    if not pref_fits(prefs.get("communities"), other.community):
+        out.append("communities")
+    if not caste_fits(prefs.get("castes"), other.caste):
+        out.append("castes")
+    if prefs.get("manglik") == "match" and not manglik_fits(own_manglik, other.manglik):
+        out.append("manglik")
+    if not pref_fits(prefs.get("maritalStatuses"), other.marital_status):
+        out.append("maritalStatuses")
+    if prefs.get("childrenOk") == "none" and _norm(other.children).startswith("yes"):
+        out.append("children")
+    if not pref_fits(prefs.get("diets"), other.diet):
+        out.append("diets")
+    need, rank = int(prefs.get("educationMin") or 0), education_rank(other.education)
+    if need > 0 and rank > 0 and rank < need:
+        out.append("education")
+    if not pref_fits(prefs.get("professions"), other.profession):
+        out.append("professions")
+    if not income_at_least(other.income, int(prefs.get("incomeMinLakh") or 0)):
+        out.append("income")
+    return out
+
+
+def must_haves(prefs: Dict[str, Any]) -> set:
+    """Which preferences hide people from my own list: the "Must have" marks (religion and marital status when never
+    saved) plus the ones that are must-haves by what they say. Work and height never hide anyone."""
+    strict = prefs.get("strict")
+    marked = DEFAULT_STRICT if strict is None else [t for t in strict if t in STRICT_TOKENS]
+    return set(marked) | set(ALWAYS_MUST)
+
+
+def marked_must_haves(prefs: Dict[str, Any]) -> set:
+    """The parts a family marked "Must have" itself (pref_strict, only the toggled ones): the only wishes that hide
+    their profile from others (matching owner decision 3). Never the defaults and never ALWAYS_MUST."""
+    strict = prefs.get("strict")
+    return set() if strict is None else {t for t in strict if t in STRICT_TOKENS}
+
+
+def _pref_gate(viewer: Person, cand: Person) -> Optional[str]:
+    """Partner preferences both ways (rishta mode). My must-haves follow the default rule; theirs are only the parts
+    their family marked "Must have" (the copy that says marked parts hide both ways). Unknown values pass.
+    Returns None, or why the candidate is left out."""
+    mine = must_haves(viewer.prefs)
+    for t in pref_misses(viewer.prefs, cand, viewer.manglik):
+        if t in mine:
+            return f"pref_{t}"
+    theirs = marked_must_haves(cand.prefs)
+    if theirs:
+        for t in pref_misses(cand.prefs, viewer, cand.manglik):
+            if t in theirs:
+                return f"their_pref_{t}"
+    return None
+
+
+def effective_kundli(p: Person) -> str:
+    """pref_kundli, else 'rank' for Hindu, Jain, Sikh, Buddhist, unstated or no religion, and 'show' for others."""
+    k = p.prefs.get("kundli") or ""
+    if k in KUNDLI_MODES:
+        return k
+    r = _norm(p.religion)
+    return "rank" if (not r or r.startswith("prefer not") or r in KUNDLI_RANK_FAITHS) else "show"
+
+
+def rishta_min_gunas(viewer: Person) -> Optional[int]:
+    """Gunas every rishta-mode fate needs: none in 'show' mode, 24 for '24+ gunas only', else 18."""
+    mode = effective_kundli(viewer)
+    if mode == "show":
+        return None
+    return 24 if mode == "24" else MIN_GUNAS_FOR_STARS_PATH
+
+
+def rishta_kundli_ok(viewer: Person, p: "Pair") -> bool:
+    """Rishta mode: both charts and enough gunas on every path (unless my kundli mode is 'show'), and never below a
+    minimum the other family chose ('18' / '24') when the gunas are known."""
+    need = rishta_min_gunas(viewer)
+    total = None if not p.stars else float(p.stars.get("total") or 0)
+    if need is not None and (total is None or total < need):
+        return False
+    theirs = {"18": 18, "24": 24}.get(p.cand.prefs.get("kundli") or "")
+    return not (theirs is not None and total is not None and total < theirs)
+
+
+def rishta_ready(p: Person, viewer: bool = False) -> Person:
+    """Rishta mode reads the partner preferences page: its age range (pref_ageMin/Max, else the settings ones) and, for
+    the viewer, its area (pref_scope near = 50 km, all India = no limit, my state = 300 km, also when never saved)."""
+    if p.prefs.get("ageMin"):
+        p.age_min = int(p.prefs["ageMin"])
+    if p.prefs.get("ageMax"):
+        p.age_max = int(p.prefs["ageMax"])
+    if viewer:
+        scope = p.prefs.get("scope") or ""
+        p.radius_km = 50.0 if scope == "near" else (20_000.0 if scope == "india" else 300.0)
+        p.rishta = True
+    return p
+
+
+def ist_day(now: Optional[Any] = None) -> str:
+    """Today's date in India ('YYYY-MM-DD'), the day the pool index fields are written in."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    return (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+
+def _birth_date(v: Any) -> Optional[Any]:
+    from datetime import date, datetime
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if hasattr(v, "timestamp"):
+        try:
+            from datetime import timezone
+            return datetime.fromtimestamp(v.timestamp(), tz=timezone.utc).date()
+        except Exception:
+            return None
+    s = _s(v)
+    if len(s) < 10:
+        return None
+    try:
+        return datetime.fromisoformat(s[:10]).date()
+    except ValueError:
+        return None
+
+
+def years_on(birth: Any, today_day: str) -> Optional[int]:
+    """Full years from a birth date to today_day ('YYYY-MM-DD'); None when the date is unusable."""
+    from datetime import date
+    b = _birth_date(birth)
+    try:
+        t = date.fromisoformat(str(today_day)[:10])
+    except ValueError:
+        return None
+    if b is None or b.year <= 1900 or b >= t:
+        return None
+    return t.year - b.year - ((t.month, t.day) < (b.month, b.day))
+
+
+def card_age(card: Dict[str, Any], today_day: str) -> int:
+    """feed.ts cardAge: from a birth date on the card, else its stored age (missing = 18); under 18 counts as 0."""
+    raw = next((card.get(k) for k in ("birthDate", "birthDateIso", "dob") if card.get(k) not in (None, "")), None)
+    age = years_on(raw, today_day)
+    if age is None:
+        stored = _to_int(card.get("age"))
+        age = 18 if stored is None else stored
+    return 0 if age < 18 else age
+
+
+def _pool_gender(v: Any) -> str:
+    """feed.ts normGender for the pool rule (only 'male' matters there)."""
+    s = _norm(v)
+    if s in ("male", "man", "m", "men", "boy", "guy"):
+        return "male"
+    if s in ("female", "woman", "f", "women", "girl", "lady") or any(w in s for w in ("female", "woman", "women")):
+        return "female"
+    return "male" if ("male" in s or "man" in s) else ""
+
+
+def pools_of(card: Optional[Dict[str, Any]], today_day: str, quick_male_min_age: int = QUICK_MALE_MIN_AGE) -> Dict[str, bool]:
+    """The Python mirror of feed.ts poolsOf (plan §2 C1), read from the server-written card index:
+    - inRishta: feedRishta is true and today has reached feedRishtaFromDay (21 for men, 18 for women). A card
+      without feedRishta is never in rishta.
+    - inQuick: feedQuick is true and today has reached feedQuickFromDay (a string; '' = already old enough, a missing
+      day = not in quick, as the JS comparison is). A card indexed before 1.0.8 (no feedQuick)
+      uses the legacy rule from its own facts: made for oneself, not marked for marriage, and old enough
+      (men quick_male_min_age, everyone else 18)."""
+    card = card or {}
+    day = str(today_day or "")
+    rishta_from = card.get("feedRishtaFromDay")
+    in_rishta = card.get("feedRishta") is True and isinstance(rishta_from, str) and bool(rishta_from) and day >= rishta_from
+    if card.get("feedQuick") is None:
+        min_age = max(18, int(quick_male_min_age)) if _pool_gender(card.get("gender")) == "male" else 18
+        in_quick = (_norm(card.get("profileFor")) in SELF_PROFILE and card.get("marriageIntent") is not True
+                    and card_age(card, day) >= min_age)
+    else:
+        # C1 `todayDay >= feedQuickFromDay`: in JS a missing or null day compares false, so only a string day
+        # ('' too) opens it.
+        quick_from = card.get("feedQuickFromDay")
+        in_quick = card.get("feedQuick") is True and isinstance(quick_from, str) and day >= quick_from
+    return {"inRishta": bool(in_rishta), "inQuick": bool(in_quick)}
+
+
+def rishta_viewer_block(private: Dict[str, Any], public: Optional[Dict[str, Any]], today_day: str) -> Optional[str]:
+    """Rishta-mode Fates are for a profile that wants marriage (profiles.marriageIntent, never the card copy), and a
+    man making his own profile must be 21 by profiles.birthDate. None, or 'needs_intent' / 'groom_age'."""
+    private, public = private or {}, public or {}
+    pf = _norm(private.get("profileFor"))
+    if pf == "none" or private.get("marriageIntent") is not True:
+        return "needs_intent"
+    gender = norm_gender(private.get("gender") or public.get("gender"))
+    if pf in SELF_PROFILE and gender == "male":
+        age = years_on(private.get("birthDate"), today_day)
+        if age is None or age < GROOM_MIN_AGE:
+            return "groom_age"
+    return None
+
+
+def quick_viewer_block(private: Dict[str, Any]) -> Optional[str]:
+    """Dating Fates (no mode) are only for someone's own profile: a family-made or kundli-only profile gets none."""
+    return None if _norm((private or {}).get("profileFor")) in SELF_PROFILE else "no_quick"
+
+
+def candidate_gate(viewer: Person, cand: Person, card: Dict[str, Any], private: Optional[Dict[str, Any]],
+                   today_day: str, quick_male_min_age: int = QUICK_MALE_MIN_AGE) -> Optional[str]:
+    """Mode rules for one candidate, on top of hard_filter. None when they may be brought, else why not.
+    - Dating (no mode): the quick pool only, by the card index and again by the private, trusted facts, so a dating
+      viewer never gets a family-made profile or one shown for marriage only.
+    - Rishta mode: the rishta pool only, the private facts still say marriage with consent, never a kundli-only
+      profile, then partner preferences both ways. The life stage is never read: a parent's account that carries a
+      son's or daughter's profile keeps the parent's own life stage."""
+    private = private or {}
+    pools = pools_of(card, today_day, quick_male_min_age)
+    pf = _norm(private.get("profileFor") if "profileFor" in private else card.get("profileFor"))
+    if viewer.rishta:
+        if not pools["inRishta"]:
+            return "pool"
+        if pf == "none":
+            return "kundli_only"
+        if private.get("marriageIntent") is not True or not any(_s(private.get(k)) for k in CONSENT_KEYS):
+            return "pool"
+        return _pref_gate(viewer, cand)
+    if not pools["inQuick"]:
+        return "pool"
+    if pf not in SELF_PROFILE or (private.get("marriageIntent") is True and private.get("quickSwipeOk") is not True):
+        return "pool"
+    return None
 
 
 # =========================
@@ -474,6 +909,18 @@ def _eq_status(a: str, b: str, soft: bool = False) -> Optional[str]:
     return "talk" if soft else "differs"
 
 
+def _food_status(a: str, b: str) -> Optional[str]:
+    """Food at home: the same aligns, vegetarian (or Jain, vegan) against non-vegetarian differs, the rest is a talk."""
+    if unstated(a) or unstated(b):
+        return None
+    x, y = _norm(a), _norm(b)
+    if x == y:
+        return "aligns"
+    if (x == "non-vegetarian" and y in VEG_DIETS) or (y == "non-vegetarian" and x in VEG_DIETS):
+        return "differs"
+    return "talk"
+
+
 def _habit_level(v: str) -> Optional[int]:
     s = _norm(v)
     if not s or "prefer not" in s:
@@ -507,6 +954,18 @@ def home_component(viewer: Person, cand: Person) -> Dict[str, Any]:
     shared_langs = sorted({_s(x) for x in viewer.languages} & {_s(x) for x in cand.languages}, key=str.casefold)
     rows.append(_cmp_row("languages", "Languages", ", ".join(viewer.languages), ", ".join(cand.languages),
                          None if not viewer.languages or not cand.languages else ("aligns" if shared_langs else "talk")))
+    if viewer.rishta:
+        # What families compare first (rishta mode only, so dating picks stay as they were).
+        rows.append(_cmp_row("marital", "Marital status", viewer.marital_status, cand.marital_status,
+                             None if unstated(viewer.marital_status) or unstated(cand.marital_status)
+                             else _eq_status(viewer.marital_status, cand.marital_status, soft=True)))
+        rows.append(_cmp_row("food", "Food", viewer.diet, cand.diet, _food_status(viewer.diet, cand.diet)))
+        va, vb = FAMILY_VALUES.get(_norm(viewer.family_values)), FAMILY_VALUES.get(_norm(cand.family_values))
+        rows.append(_cmp_row("family_values", "Family values", viewer.family_values, cand.family_values,
+                             None if va is None or vb is None else ("aligns", "talk", "differs")[abs(va - vb)]))
+        ea, eb = education_rank(viewer.education), education_rank(cand.education)
+        rows.append(_cmp_row("education", "Education", viewer.education, cand.education,
+                             None if not ea or not eb else ("aligns" if abs(ea - eb) <= 1 else "talk")))
     known = [r for r in rows if r["status"]]
     points = {"aligns": 1.0, "talk": 0.5, "differs": 0.0}
     score = round(100 * sum(points[r["status"]] for r in known) / len(known)) if len(known) >= 3 else None
@@ -599,6 +1058,8 @@ def evaluate_pair(viewer: Person, cand: Person, now_ms: int,
 
 
 def _eligible_for_path(viewer: Person, p: Pair, path: str) -> bool:
+    if viewer.rishta and not rishta_kundli_ok(viewer, p):
+        return False
     if p.fate is None or p.fate < (CHOOSER_MIN_FATE if p.chose_you else MIN_FATE_SCORE):
         return False
     if path == "stars":
@@ -775,7 +1236,8 @@ HEART_COMPLETE_HOOKS = {
     "personality": "Your personalities complete each other.",
 }
 # Home rows as nouns for "You agree on ...", most important first; the two habits share one noun.
-HOME_NOUNS = [("marriage", "marriage plans"), ("children", "children"), ("faith", "faith"), ("moving", "where to live"),
+HOME_NOUNS = [("marriage", "marriage plans"), ("children", "children"), ("faith", "faith"),
+              ("family_values", "family values"), ("food", "food at home"), ("moving", "where to live"),
               ("community", "community"), ("smoking", "habits"), ("drinking", "habits")]
 
 

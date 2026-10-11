@@ -45,10 +45,15 @@ def selfie_url_ok(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> 
 
 
 def own_photo_url(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> bool:
-    """A profile photo the server may download: on a Storage host and under users/{uid}/ (no other hosts, ever)."""
+    """A profile photo the server may download: on a Storage host and in the user's own photos folder,
+    users/{uid}/photos/ (no other hosts, ever). The server-made blurs (users/{uid}/blur/) and the resized
+    variants (users/{uid}/variants/) are never a profile photo, so they never reach a face check. The first
+    users/ folder in the object path must be that one, so a file nested inside someone else's folder doesn't count."""
     try:
         u = urlparse(url)
     except ValueError:
+        return False
+    if not uid or "/" in uid:
         return False
     allowed = tuple(h.lower() for h in (hosts or storage_hosts()))
     if u.netloc.lower() not in allowed or u.scheme not in ("https", "http"):
@@ -56,7 +61,11 @@ def own_photo_url(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> 
     if u.scheme == "http" and u.netloc.lower() in ("firebasestorage.googleapis.com", "storage.googleapis.com"):
         return False
     path = unquote(u.path)
-    return f"users/{uid}/" in path and ".." not in path
+    if ".." in path:
+        return False
+    folder = f"/users/{uid}/photos/"
+    at = path.find(folder)
+    return at >= 0 and path.find("/users/") == at
 
 
 def storage_object(url: str) -> Optional[Tuple[str, str]]:
