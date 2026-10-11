@@ -712,18 +712,30 @@ def legacy_merged(start: Date, days: int, lat: float, lon: float, tz_name: str, 
     return items[:limit]
 
 
+def _own_day(e: Mapping[str, Any], me: Prefs) -> bool:
+    """Whether a day the lists show is the person's own, for a wish: a national day, a day of their faith, a day of
+    their region that belongs to no faith in particular (Onam, Pongal), or any faith's big day when they chose
+    All of India. An unknown faith ("Prefer not to say", "No religion / Spiritual") never gets another faith's
+    big day here: the lists may show it, but Mithu does not wish them Eid Mubarak or Merry Christmas."""
+    return (e["tier"] == "national" or bool(me.faiths.intersection(e["faiths"]))
+            or (not e["faiths"] and _region_hit(e, me)) or (me.all_india and e["tier"] == "major"))
+
+
 def observance_for(day: Date, celebrates: Any = None, community: Any = None, *, religion: Any = None,
                    state: Any = None, fasts: Optional[Iterable[Mapping[str, Any]]] = None) -> str:
-    """Today's observance line for the TODAY_OBSERVANCE fact: the person's own festivals today (same filter as
-    upcoming), then any of today's vrats passed in `fasts` (astro_core.vrats_between rows; only for people who
-    keep Hindu days), or "none".
+    """Today's observance line for the TODAY_OBSERVANCE fact: the person's own festivals today (the upcoming
+    filter, narrowed to their own days by _own_day), then any of today's vrats passed in `fasts`
+    (astro_core.vrats_between rows; only for people who keep Hindu days), or "none".
+    - An unknown faith gets national days and their region's no-faith days only, never every faith's majors.
+    - An explicit All of India choice keeps every faith's big days.
 
     celebrates: faith keys or religions (a single string works too); religion is used when celebrates is empty."""
     if isinstance(celebrates, str):
         celebrates = [celebrates]
     me = read_prefs({"celebrates": list(celebrates or []), "religion": religion, "community": community,
                      "stateName": state})
-    near = _mine(day - timedelta(days=1), day + timedelta(days=2), me)   # a vrat within a day of a festival is it
+    # a vrat within a day of a festival is it
+    near = [e for e in _mine(day - timedelta(days=1), day + timedelta(days=2), me) if _own_day(e, me)]
     iso = day.isoformat()
     parts = []
     for e in (x for x in near if x["date"] == iso):

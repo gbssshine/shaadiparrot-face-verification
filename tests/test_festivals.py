@@ -401,11 +401,37 @@ def test_observance_line():
     assert "Kali Puja" in af.observance_for(diwali, "Hindu", "Bengali")
     assert af.observance_for(diwali, ["muslim"], None) == "none"
     assert af.observance_for(diwali, [], None, religion="Sikh").startswith("Bandi Chhor Divas")
-    assert af.observance_for(diwali, None, None).startswith("Diwali")              # unknown: every big day
     eid = af.observance_for(date(2027, 3, 10), None, None, religion="Muslim")
     assert eid.startswith("Eid ul-Fitr: Expected, depends on the moon") and "Eid Mubarak" in eid
     assert af.observance_for(date(2027, 1, 26), ["christian"], None).startswith("Republic Day")
     assert af.observance_for(date(2026, 10, 12), ["hindu"], None) == "none"
+
+
+def test_observance_line_never_wishes_an_unknown_faith_another_faiths_day():
+    """TODAY_OBSERVANCE is the reader's own day: Mithu wishes them for it, so "Prefer not to say" and
+    "No religion / Spiritual" never get Merry Christmas, Eid Mubarak or Shubh Deepavali."""
+    diwali, christmas, eid = date(2026, 11, 8), date(2026, 12, 25), date(2027, 3, 10)
+    for religion in (None, "", "Prefer not to say", "No religion / Spiritual"):
+        for day in (diwali, christmas, eid):
+            assert af.observance_for(day, None, None, religion=religion) == "none", (religion, day)
+            assert af.observance_for(day, [], "Hindi belt / North Indian", religion=religion, state="DL") == "none"
+    assert af.observance_for(christmas, [], None, religion="No religion / Spiritual") == "none"
+    assert af.observance_for(diwali, None, "Bengali", state="WB") == "none"              # not Kali Puja either
+    # national days stay for everyone
+    rd = af.observance_for(date(2027, 1, 26), None, None)
+    assert rd.startswith("Republic Day")
+    assert af.observance_for(date(2027, 1, 26), [], None, religion="Prefer not to say") == rd
+    # their own region's days that belong to no faith in particular stay too
+    assert af.observance_for(date(2027, 4, 15), None, "Bengali").startswith("Poila Boishakh")
+    # the upcoming lists still show every faith's big days for an unknown faith
+    assert any(f["id"] == "christmas" for f in af.upcoming(christmas, 1, *DELHI, {}, vrats=None)["festivals"])
+    # an explicit All of India choice keeps every faith's big days
+    assert af.observance_for(christmas, ["all"], None).startswith("Christmas")
+    assert "Eid Mubarak" in af.observance_for(eid, ["all"], None)
+    assert af.observance_for(diwali, ["all"], None).startswith("Diwali")
+    # their own faith still gets theirs
+    assert af.observance_for(christmas, [], None, religion="Christian").startswith("Christmas")
+    assert af.observance_for(christmas, ["hindu"], None) == "none"
 
 
 def test_observance_line_takes_todays_vrat_only_for_hindu_days():
