@@ -162,13 +162,18 @@ def _festival_note(fest: Dict[str, Any], offset: int, day: Date, place: Dict[str
             else f"{name} is {_when(offset)}")
     share = (f"{greeting}! Wishing you and your family a happy {name}." if greeting
              else f"Happy {name}! Wishing you and your family joy and blessings.")
+    # Moon-sighting days (Eid, Muharram, …) always carry the honesty label. Rows from astro_festivals.upcoming()
+    # (and the app's UpcomingDto) say it as `tentative`; the raw table entries as `moonSighting`.
+    tentative = bool(fest.get("moonSighting") or fest.get("tentative"))
     if mode == "off":
         if not greeting:
             return None
-        return {"topic": "festival", "title": head, "text": f"{head}. {greeting} to you and your family!",
+        text = (f"{head}. Expected, depends on the moon. {greeting} to you and your family!" if tentative
+                else f"{head}. {greeting} to you and your family!")
+        return {"topic": "festival", "title": head, "text": text,
                 "actions": [_action("share_greeting", "Send a greeting", share)]}
     parts = [f"{greeting}! {head}." if greeting and offset == 0 else f"{head}."]
-    if fest.get("moonSighting"):
+    if tentative:
         parts.append("Expected, depends on the moon.")
     when = _city_time(fest, day + timedelta(days=offset), place)
     if when:
@@ -277,13 +282,13 @@ def _p3(me: Dict[str, Any], day: Date, natal: Optional[Dict[str, Any]]) -> Optio
     when = Date.fromisoformat(e["date"])
     lead = {0: "Today", 1: "Tomorrow"}.get((when - day).days, f"On {when.day} {when:%B}")
     house = (e["sign"] - rashi) % 12 + 1
-    theme = ac.SKY_PLANET_LINES[e["planet"]].format(theme=ac.SKY_HOUSE_THEMES[house])
+    # A retrograde return or a re-entry gets its own timeline-free words (ac.sky_meaning), never "a warm year".
+    move, theme = ac.sky_move(e), ac.sky_meaning(e, house)
     # A profile made for someone else reads that person's chart: the parent reads "Ananya's 5th house".
     name = _first_name(me.get("firstName") or me.get("name")) if _is_managed(me) else ""
     whose = f"{name}'s" if name else "your"
-    return {"topic": "sky", "title": f"{e['planet']} moves into {e['signName']}",
-            "text": f"{lead} {e['planet']} moves into {e['signName']}, {whose} {ac.ordinal(house)} house from the "
-                    f"Moon: {theme}.",
+    return {"topic": "sky", "title": move,
+            "text": f"{lead} {move}, {whose} {ac.ordinal(house)} house from the Moon: {theme}.",
             "actions": []}
 
 

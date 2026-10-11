@@ -152,6 +152,50 @@ def test_week_events_carry_the_sky_and_the_person():
     assert "your 12th house" in mine["events"][0]["text"]
 
 
+def test_festivals_in_the_list_never_rename_the_sky_reader():
+    # Karva Chauth (29 Oct) and Jupiter into Simha (31 Oct) share a week; Diwali (8 Nov) is listed but falls outside.
+    # Each festival name once leaked into the sky line ("Diwali's 12th house", "Karva Chauth's 12th house").
+    karva = {"date": "2026-10-29", "name": "Karva Chauth", "id": "karva_chauth"}
+    diwali = {"date": "2026-11-08", "name": "Diwali", "id": "diwali"}
+    line = "Jupiter moves into Simha, {} 12th house from the Moon: a warm year for rest, travel and letting go begins."
+    for name, whose in ((None, "your"), ("Ananya", "Ananya's")):
+        for fests in ([karva, diwali], [diwali, karva]):
+            w = af.build_week(KANYA, HASTA, date(2026, 10, 28), PLACE, name=name,
+                              relation="daughter" if name else "", festivals=fests)
+            assert w["events"] == [
+                {"date": "2026-10-29", "kind": "festival", "id": "karva_chauth", "text": "Karva Chauth"},
+                {"date": "2026-10-31", "kind": "sky", "id": "jupiter", "text": line.format(whose)}]
+            facts = af.week_facts(w, natal_rashi=KANYA, natal_nak=HASTA, name=name)
+            assert facts["events"][1]["text"] == line.format(whose)
+            txt = af.facts_text(facts)
+            assert "Diwali" not in txt and "Karva Chauth's" not in txt
+
+
+def test_retrograde_return_and_re_entry_name_no_year():
+    ev = {e["date"]: e for e in ac.sky_events(date(2026, 10, 1), 450)}
+    first, back, again, sat_back = ev["2026-10-31"], ev["2027-01-25"], ev["2027-06-26"], ev["2027-10-20"]
+    assert not first["retro"] and not first["again"]
+    assert back["retro"] and not back["again"] and again["again"] and not again["retro"]
+    assert sat_back["retro"] and not ev["2027-06-03"]["again"] and not ev["2026-12-05"]["again"]
+    # Jupiter goes back from Simha into Karka on 25 Jan 2027: no new "warm year" begins.
+    assert ac.sky_line(back, KANYA) == ("Jupiter moves back into Karka, your 11th house from the Moon: a gentle second "
+                                        "look at gains, friends and wishes.")
+    assert ac.sky_line(back, KANYA, "Ananya").startswith("Jupiter moves back into Karka, Ananya's 11th house")
+    assert ac.sky_line(back, None) == "Jupiter moves back into Karka (Cancer)."
+    assert ac.sky_line(again, KANYA) == ("Jupiter moves into Simha again, your 12th house from the Moon: warmth "
+                                         "returns to rest, travel and letting go.")
+    assert ac.sky_line(sat_back, KANYA) == ("Saturn moves back into Meena, your 7th house from the Moon: a patient "
+                                            "second look at marriage and partnerships.")
+    for e in (back, again, sat_back):
+        for r in range(12):
+            assert "year" not in ac.sky_line(e, r) and "begins" not in ac.sky_line(e, r)
+    # The week of the return carries the same line, and so do the AI facts.
+    w = af.build_week(KANYA, HASTA, date(2027, 1, 27), PLACE, name="Ananya", relation="daughter")
+    assert w["events"] == [{"date": "2027-01-25", "kind": "sky", "id": "jupiter",
+                            "text": ac.sky_line(back, KANYA, "Ananya")}]
+    assert "a gentle second look" in af.facts_text(af.week_facts(w, natal_rashi=KANYA, natal_nak=HASTA, name="Ananya"))
+
+
 # ------------------------------------------------------------------ facts and prompt
 def test_facts_and_prompt():
     f = _facts()

@@ -186,6 +186,30 @@ def test_moon_sighting_is_marked_expected():
     assert begins["title"] == "Sharad Navratri begins tomorrow"
 
 
+# A row as astro_festivals.upcoming()['festivals'] (and the app's UpcomingDto) carries it: `tentative`, no moonSighting.
+EID_ROW = {"date": "2027-03-10", "id": "eid_ul_fitr", "kind": "eid_ul_fitr", "type": "festival", "name": "Eid ul-Fitr",
+           "note": "", "greeting": "Eid Mubarak", "tier": "major", "category": "festival", "faiths": ["muslim"],
+           "communities": [], "states": [], "tentative": True, "timeKind": "", "officeNote": "", "inDays": 1}
+
+
+def test_upcoming_rows_marked_tentative_carry_the_moon_label():
+    muslim, prefs = {**ME, "religion": "Muslim"}, {"celebrates": ["muslim"]}
+    off = {**prefs, "astroMode": "off"}
+    assert _note(date(2027, 3, 9), [EID_ROW], me=muslim, prefs=prefs)["text"] == \
+        "Eid ul-Fitr is tomorrow. Expected, depends on the moon."
+    assert _note(date(2027, 3, 10), [EID_ROW], me=muslim, prefs=prefs)["text"] == \
+        "Eid Mubarak! Eid ul-Fitr is today. Expected, depends on the moon."
+    # astroMode 'off' gets the greeting only, and the label too (from either flag).
+    for row in (EID_ROW, EID):
+        assert _note(date(2027, 3, 9), [row], me=muslim, prefs=off)["text"] == \
+            "Eid ul-Fitr is tomorrow. Expected, depends on the moon. Eid Mubarak to you and your family!"
+    # A fixed-date day has no label.
+    sure = _note(date(2027, 3, 9), [{**EID_ROW, "tentative": False}], me=muslim, prefs=prefs)
+    assert sure["text"] == "Eid ul-Fitr is tomorrow."
+    assert _note(date(2027, 3, 9), [{**EID_ROW, "tentative": False}], me=muslim, prefs=off)["text"] == \
+        "Eid ul-Fitr is tomorrow. Eid Mubarak to you and your family!"
+
+
 def test_today_beats_tomorrow_and_fasts_are_skipped():
     fests = [{"date": "2026-11-09", "id": "govardhan", "name": "Govardhan Puja"}, DIWALI,
              {"date": "2026-11-08", "id": "amavasya", "name": "Amavasya", "type": "vrat"}]
@@ -241,6 +265,24 @@ def test_sky_note_for_a_managed_profile_names_the_person():
     assert tomorrow["text"].startswith("Tomorrow Jupiter moves into Simha, your 5th house")
     assert _note(date(2026, 10, 31), natal={"rashi": 0})["text"].startswith("Today Jupiter moves into Simha")
     assert "dosha" not in note["text"].lower() and "sade" not in note["text"].lower()
+
+
+def test_sky_note_for_a_retrograde_return_names_no_year():
+    # Jupiter goes back from Simha into Karka on 25 Jan 2027 (Karka is the 11th from a Kanya Moon).
+    note = _note(date(2027, 1, 23))
+    assert note["title"] == "Jupiter moves back into Karka"
+    assert note["text"] == ("On 25 January Jupiter moves back into Karka, your 11th house from the Moon: a gentle "
+                            "second look at gains, friends and wishes.")
+    managed = _note(date(2027, 1, 24), me={**ME, "profileFor": "daughter", "firstName": "Ananya"})
+    assert managed["text"] == ("Tomorrow Jupiter moves back into Karka, Ananya's 11th house from the Moon: a gentle "
+                               "second look at gains, friends and wishes.")
+    # The forward re-entry on 26 Jun 2027 is no new year either.
+    again = _note(date(2027, 6, 26))
+    assert again["title"] == "Jupiter moves into Simha again"
+    assert again["text"] == ("Today Jupiter moves into Simha again, your 12th house from the Moon: warmth returns to "
+                             "rest, travel and letting go.")
+    for n in (note, managed, again):
+        assert "year" not in n["text"] and "begins" not in n["text"]
 
 
 def test_astro_mode_defaults():

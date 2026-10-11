@@ -830,13 +830,24 @@ def _crossing(body: int, lo: float, hi: float, sign_lo: int) -> float:
     return hi
 
 
+SKY_LOOKBACK_DAYS = 400   # longer than any Jupiter or Saturn retrograde loop, far shorter than their orbits
+
+
+def _was_in(body: int, sign: int, jd: float, days: int = SKY_LOOKBACK_DAYS) -> bool:
+    """Whether body stood in sign on any of the days before jd."""
+    return any(_sign_at(jd - k, body) == sign for k in range(1, days + 1))
+
+
 def _ingress(planet: str, frm: int, to: int, jd: float) -> Dict[str, Any]:
+    """retro: Jupiter or Saturn going back a sign (the mean Rahu always moves back through the signs, so never).
+    again: a forward move into the sign it left by retrograde not long ago (Jupiter into Simha on 2027-06-26).
+    Neither starts a new period, so their lines carry no "year" (sky_move, sky_meaning)."""
     at = moment_of(jd, IST)
-    # Jupiter and Saturn going back a sign are retrograde; the mean Rahu always moves back through the signs.
-    back = (frm - to) % 12 == 1
+    retro = (frm - to) % 12 == 1 and planet != "Rahu"
+    again = not retro and planet != "Rahu" and _was_in(dict(SKY_BODIES)[planet], to, jd)
     return {"planet": planet, "sign": to, "signName": RASHIS[to][0], "signEnglish": RASHIS[to][1], "from": frm,
             "date": at.date().isoformat(), "atIso": at.isoformat(timespec="minutes"),
-            "retro": back and planet != "Rahu"}
+            "retro": retro, "again": again}
 
 
 @lru_cache(maxsize=32)
@@ -903,18 +914,50 @@ SKY_PLANET_LINES = {
     "Saturn": "slow, steady effort on {theme} pays off",
     "Rahu": "a time of fresh ideas around {theme} begins",
 }
+# A retrograde return to the sign the planet just left, or the forward re-entry after it, starts no new period:
+# these lines name no year and no length of time (CR4). A planet without an "again" line keeps its usual one.
+SKY_RETRO_LINES = {
+    "Jupiter": "a gentle second look at {theme}",
+    "Saturn": "a patient second look at {theme}",
+}
+SKY_AGAIN_LINES = {
+    "Jupiter": "warmth returns to {theme}",
+}
+
+
+def sky_move(event: Dict[str, Any]) -> str:
+    """'Jupiter moves into Simha'; a retrograde return 'Jupiter moves back into Karka'; the re-entry after it
+    'Jupiter moves into Simha again'."""
+    if event.get("retro"):
+        return f"{event['planet']} moves back into {event['signName']}"
+    if event.get("again"):
+        return f"{event['planet']} moves into {event['signName']} again"
+    return f"{event['planet']} moves into {event['signName']}"
+
+
+def sky_meaning(event: Dict[str, Any], house: int) -> str:
+    """What the move means for the house from the birth Moon: 'a warm year for love, children and creativity
+    begins' for a new Jupiter sign, timeline-free words for a retrograde return or a re-entry."""
+    planet = event["planet"]
+    line = SKY_PLANET_LINES[planet]
+    if event.get("retro"):
+        line = SKY_RETRO_LINES.get(planet, "a second look at {theme}")
+    elif event.get("again"):
+        line = SKY_AGAIN_LINES.get(planet, line)
+    return line.format(theme=SKY_HOUSE_THEMES[house])
 
 
 def sky_line(event: Dict[str, Any], natal_rashi: Optional[int], name: Optional[str] = None) -> str:
     """'Jupiter moves into Simha, your 5th house from the Moon: a warm year for love, children and creativity
-    begins.' name: the person a managed profile is for ("Ananya's 5th house"). Without a birth Moon only the move."""
-    head = f"{event['planet']} moves into {event['signName']}"
+    begins.' name: the person a managed profile is for ("Ananya's 5th house"). Without a birth Moon only the move.
+    A retrograde return: 'Jupiter moves back into Karka, your 12th house from the Moon: a gentle second look at
+    rest, travel and letting go.'"""
+    head = sky_move(event)
     if natal_rashi is None:
         return f"{head} ({event['signEnglish']})."
     house = (event["sign"] - natal_rashi) % 12 + 1
-    theme = SKY_PLANET_LINES[event["planet"]].format(theme=SKY_HOUSE_THEMES[house])
     whose = f"{name.strip()}'s" if name and name.strip() else "your"
-    return f"{head}, {whose} {ordinal(house)} house from the Moon: {theme}."
+    return f"{head}, {whose} {ordinal(house)} house from the Moon: {sky_meaning(event, house)}."
 
 
 # ------------------------------------------------------------------ transits for the chart
@@ -967,10 +1010,10 @@ def transits(natal_rashi: int, now: Optional[datetime] = None, sure: bool = True
         if nxt:
             house = (nxt["sign"] - natal_rashi) % 12 + 1
             when = Date.fromisoformat(nxt["date"])
-            item = {"kind": "jupiter", "title": f"Jupiter moves into {nxt['signName']} · {_short_date(when)}",
+            # A retrograde return reads "Jupiter moves back into Karka", never "a warm year … begins".
+            item = {"kind": "jupiter", "title": f"{sky_move(nxt)} · {_short_date(when)}",
                     "date": nxt["date"], "house": house, "sign": nxt["sign"], "signName": nxt["signName"],
-                    "text": f"Your {ordinal(house)} house from the Moon: "
-                            f"{SKY_PLANET_LINES['Jupiter'].format(theme=SKY_HOUSE_THEMES[house])}."}
+                    "text": f"Your {ordinal(house)} house from the Moon: {sky_meaning(nxt, house)}."}
             if not sure:
                 item["approximate"] = True
             out.append(item)

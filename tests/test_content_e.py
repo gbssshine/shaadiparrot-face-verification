@@ -120,6 +120,19 @@ def test_next_jupiter_after_the_ingress():
     later = ac.transits(4, datetime(2026, 11, 2, tzinfo=timezone.utc))   # Moon in Simha
     jup = next(t for t in later if t["kind"] == "jupiter")
     assert jup["date"] == "2027-01-25" and jup["signName"] == "Karka" and jup["house"] == 12
+    # 25 Jan 2027 is Jupiter's retrograde return to Karka: no new "warm year" begins (shown 1 Nov 2026 - 25 Jan 2027).
+    assert jup["title"] == "Jupiter moves back into Karka · 25 Jan 2027"
+    assert jup["text"] == "Your 12th house from the Moon: a gentle second look at rest, travel and letting go."
+    kanya = next(t for t in ac.transits(5, datetime(2026, 11, 2, tzinfo=timezone.utc)) if t["kind"] == "jupiter")
+    assert kanya["title"] == "Jupiter moves back into Karka · 25 Jan 2027"
+    assert kanya["text"] == "Your 11th house from the Moon: a gentle second look at gains, friends and wishes."
+    # After the return the card shows the forward re-entry into Simha, again without a new "year".
+    feb = next(t for t in ac.transits(4, datetime(2027, 2, 2, tzinfo=timezone.utc)) if t["kind"] == "jupiter")
+    assert feb["date"] == "2027-06-26" and feb["house"] == 1
+    assert feb["title"] == "Jupiter moves into Simha again · 26 Jun 2027"
+    assert feb["text"] == "Your 1st house from the Moon: warmth returns to you, your health and fresh starts."
+    for t in (jup, kanya, feb):
+        assert "year" not in t["text"] and "begins" not in t["text"]
 
 
 def test_exact_chart_has_sure_transits():

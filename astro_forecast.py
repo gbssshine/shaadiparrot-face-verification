@@ -72,11 +72,12 @@ def week_events(monday: Date, natal_rashi: Optional[int], festivals: Optional[Li
     out: List[Dict[str, str]] = []
     seen = set()
     for f in festivals or []:
-        day, name = str(f.get("date") or "")[:10], str(f.get("name") or "").strip()
-        if not name or not (a <= day <= b) or (day, name) in seen:
+        # fday/fname, never day/name: name is the managed person's first name, used by the sky lines below.
+        fday, fname = str(f.get("date") or "")[:10], str(f.get("name") or "").strip()
+        if not fname or not (a <= fday <= b) or (fday, fname) in seen:
             continue
-        seen.add((day, name))
-        out.append({"date": day, "kind": "festival", "id": str(f.get("id") or ""), "text": name})
+        seen.add((fday, fname))
+        out.append({"date": fday, "kind": "festival", "id": str(f.get("id") or ""), "text": fname})
     for e in ac.sky_events_between(monday, sunday):
         out.append({"date": e["date"], "kind": "sky", "id": e["planet"].lower(),
                     "text": ac.sky_line(e, natal_rashi, name)})
