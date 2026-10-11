@@ -5,7 +5,7 @@ the Moon passes through that day is kept as a possibility and matching reports a
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -39,7 +39,11 @@ def _parse_date(v: Any) -> Optional[Tuple[int, int, int]]:
     if not m:
         return None
     y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if not (1900 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31):
+    if not (1900 <= y <= 2100):
+        return None
+    try:
+        _date(y, mo, d)   # 31 April or 29 February in a common year is no date at all
+    except ValueError:
         return None
     return y, mo, d
 

@@ -1,12 +1,17 @@
-from datetime import date, datetime, timezone
+import json
+import time
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from google.api_core import exceptions as gexc
 
 import astro_api
 import astro_content
 import astro_core as ac
+import fates_astro_chart as fc
 import main
 
 DELHI = (28.6139, 77.209, "Asia/Kolkata")
@@ -37,6 +42,29 @@ def test_rahu_kaal_is_an_eighth_of_daylight():
     assert rise.tzinfo is not None
 
 
+def test_good_times_never_sit_on_rahu_yamaganda_or_gulika():
+    for i in range(7):   # Monday 12 Oct to Sunday 18 Oct 2026
+        p = ac.panchang(date(2026, 10, 12) + timedelta(days=i), *DELHI)
+        bad = {p["rahuKaal"]["startIso"], p["yamaganda"]["startIso"], p["gulika"]["startIso"]}
+        rahu = (p["rahuKaal"]["startIso"], p["rahuKaal"]["endIso"])
+        for g in p["goodTimes"]:
+            assert g["startIso"] not in bad, (p["weekday"], g)
+            if g["name"].startswith("Abhijit"):
+                assert g["startIso"] >= rahu[1] or g["endIso"] <= rahu[0], (p["weekday"], g, rahu)
+        abhijit = [g for g in p["goodTimes"] if g["name"].startswith("Abhijit")]
+        if p["weekday"] == "Wednesday":
+            assert not abhijit
+        if p["weekday"] == "Friday":   # Rahu kaal covers the first half: what's left starts as it ends
+            assert abhijit and abhijit[0]["start"] == p["rahuKaal"]["end"]
+
+
+def test_adhik_month_keeps_its_name_in_the_dark_half():
+    # 2026 has Adhik Jyeshtha: its dark half is still Jyeshtha in the purnimanta reckoning.
+    assert ac.panchang(date(2026, 6, 10), *DELHI)["masa"] == {"amanta": "Jyeshtha", "purnimanta": "Jyeshtha", "adhik": True}
+    assert ac.panchang(date(2026, 5, 5), *DELHI)["masa"] == {"amanta": "Vaishakha", "purnimanta": "Jyeshtha", "adhik": False}
+    assert ac.panchang(date(2026, 7, 5), *DELHI)["masa"] == {"amanta": "Jyeshtha", "purnimanta": "Ashadha", "adhik": False}
+
+
 def test_upcoming_has_festivals_and_no_duplicate_vrats():
     items = ac.upcoming(date(2026, 10, 10), 45, *DELHI, limit=30)
     names = [i["name"] for i in items]
@@ -44,6 +72,38 @@ def test_upcoming_has_festivals_and_no_duplicate_vrats():
     assert "Sankashti Chaturthi" not in names            # Karva Chauth already is that day
     eka = [i["date"] for i in items if i["kind"] == "ekadashi"]
     assert all(abs((date.fromisoformat(a) - date.fromisoformat(b)).days) > 3 for a, b in zip(eka, eka[1:]))
+
+
+def test_kshaya_tithis_are_not_lost():
+    # A tithi that begins after one sunrise and ends before the next belongs to that day.
+    vr = ac.vrats_between(date(2026, 10, 10), 400, *DELHI)
+    on = {(v["date"], v["kind"]) for v in vr}
+    assert ("2026-11-20", "ekadashi") in on             # Dev Uthani: Dashami at sunrise, Dwadashi at the next
+    assert ("2027-07-29", "ekadashi") in on
+    assert ("2027-02-24", "sankashti") in on            # Chaturthi was over before that night's moonrise
+    assert any(("2026-12-%02d" % d, "pradosh") in on for d in range(20, 24))
+    year = [v for v in vr if v["date"] < "2027-10-10"]
+    count = {k: sum(1 for v in year if v["kind"] == k) for k in ("ekadashi", "pradosh", "sankashti", "purnima", "amavasya")}
+    assert 24 <= count["ekadashi"] <= 25 and 23 <= count["pradosh"] <= 25, count
+    assert 12 <= count["sankashti"] <= 13 and 12 <= count["purnima"] <= 13 and 12 <= count["amavasya"] <= 13, count
+    for kind, longest in (("ekadashi", 17), ("pradosh", 17), ("sankashti", 31), ("purnima", 31), ("amavasya", 31)):
+        days = [date.fromisoformat(v["date"]) for v in vr if v["kind"] == kind]
+        assert max((b - a).days for a, b in zip(days, days[1:])) <= longest, kind
+    # On Today the festival stands for the vrat.
+    ahead = ac.upcoming(date(2026, 11, 15), 10, *DELHI, limit=20)
+    assert any(i["date"] == "2026-11-20" and i["name"] == "Dev Uthani Ekadashi" for i in ahead)
+    assert not any(i["kind"] == "ekadashi" for i in ahead)
+
+
+def test_festival_list_runs_ahead():
+    days = [f["date"] for f in ac.FESTIVALS]
+    assert days == sorted(days)
+    # Today's festival feed goes quiet when the list runs out: extend astro_core.FESTIVALS before this fails.
+    assert date.fromisoformat(days[-1]) - date.today() >= timedelta(days=60)
+    ahead = ac.upcoming(date(2027, 8, 1), 40, *DELHI, limit=20)
+    assert [i["name"] for i in ahead if i["type"] == "festival"] == [
+        "Hariyali Teej", "Independence Day", "Raksha Bandhan", "Janmashtami", "Ganesh Chaturthi"]
+    assert not any(i["kind"] == "purnima" for i in ahead)   # Raksha Bandhan stands for it
 
 
 def test_chart_and_dashas():
@@ -66,13 +126,45 @@ def test_good_days_respect_season():
     assert g["days"], g
     assert all(d["date"] >= "2026-11-21" for d in g["days"])            # Chaturmas ends with Dev Uthani
     assert not any("2026-12-17" <= d["date"] <= "2027-01-13" for d in g["days"])   # Kharmas
+    # A window after midnight is printed on the next calendar day, still the same Hindu day (sunrise to sunrise).
     assert all(d["weekday"] in ("Monday", "Wednesday", "Thursday", "Friday") or d["window"]["night"] for d in g["days"])
+
+
+def test_good_windows_join_across_a_change():
+    # 25 Nov 2026 in Delhi: Rohini then Mrigashira, Pratipada then Dwitiya, all four good for a wedding.
+    # The whole Hindu day is one window, not three pieces with only the night one shown.
+    g = ac.good_days("wedding", date(2026, 11, 25), 1, *DELHI)
+    day = g["days"][0]
+    assert day["date"] == "2026-11-25"
+    assert day["window"] == {"start": "06:51", "end": "06:52", "endsNextDay": True, "night": False}
+    assert day["score"] == 4
+    assert day["reasons"][0] == "Rohini and Mrigashira nakshatras"
+    assert day["reasons"][1] == "Krishna Pratipada and Dwitiya"
+
+
+def test_good_days_fast_after_warm_up():
+    start = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    for ev in ac.EVENTS:   # warm-up: today's tithi and nakshatra table and the city's day frames
+        ac.good_days(ev, start, 120, *DELHI)
+    for ev in ac.EVENTS:
+        t = time.perf_counter()
+        ac.good_days(ev, start, 120, *DELHI, people=[{"name": "Asha", "rashi": 4, "nak": 9}])
+        assert time.perf_counter() - t < 0.3, ev
 
 
 def test_day_line_tones():
     line = ac.day_line("Riya", "daughter", 0, 1, 4, 3)   # Moon 5th from hers
     assert "Riya" in line["text"] and "studies" in line["text"]
     assert line["tone"] in ("good", "steady", "gentle")
+    nameless = ac.day_line("", "", 0, 1, 0, 1)
+    assert nameless["text"].startswith("Your loved one feels")
+    assert "for your loved one" in ac.day_line("", "", 0, 1, 1, 1)["text"]
+
+
+def test_zone_survives_bad_names():
+    assert ac.zone("Europe/London").key == "Europe/London"
+    for bad in ("Asia", "x" * 300, "../etc/passwd", "", None, "Foo/Bar"):
+        assert ac.zone(bad).key == "Asia/Kolkata", bad
 
 
 def test_question_rotates():
@@ -81,19 +173,128 @@ def test_question_rotates():
     assert a["id"] != b["id"] and 2 <= len(a["options"]) <= 4
 
 
+def test_impossible_dates_are_no_dates():
+    assert fc._parse_date("2023-02-31") is None and fc._parse_date("2000-04-31") is None
+    assert fc._parse_date("2023-02-29") is None and fc._parse_date("2024-02-29") == (2024, 2, 29)
+    assert fc._parse_date("1999-12-31T00:00:00Z") == (1999, 12, 31)
+
+
+# ------------------------------------------------------------------ a small Firestore stand-in
+class FakeSnap:
+    def __init__(self, ref, data):
+        self.reference, self.id, self._d, self.exists = ref, ref.id, data, data is not None
+
+    def to_dict(self):
+        return None if self._d is None else json.loads(json.dumps(self._d))
+
+
+class FakeRef:
+    def __init__(self, db, path):
+        self._db, self.path, self.id = db, path, path.rsplit("/", 1)[-1]
+
+    def collection(self, name):
+        return FakeCol(self._db, f"{self.path}/{name}")
+
+    def get(self):
+        if self.path in self._db.hide_once:   # another device writes right after this read
+            self._db.hide_once.discard(self.path)
+            return FakeSnap(self, None)
+        return FakeSnap(self, self._db.docs.get(self.path))
+
+    def set(self, data, merge=False):
+        self._db.write(self.path, data, merge)
+
+
+class FakeCol:
+    def __init__(self, db, path):
+        self._db, self.path = db, path
+
+    def document(self, id_):
+        return FakeRef(self._db, f"{self.path}/{id_}")
+
+    def limit(self, n):
+        return self
+
+    def stream(self):
+        prefix = self.path + "/"
+        return [FakeSnap(FakeRef(self._db, p), d) for p, d in list(self._db.docs.items())
+                if p.startswith(prefix) and "/" not in p[len(prefix):]]
+
+
+class FakeBatch:
+    def __init__(self, db):
+        self._db, self._ops = db, []
+
+    def create(self, ref, data):
+        self._ops.append(("create", ref, data, False))
+
+    def set(self, ref, data, merge=False):
+        self._ops.append(("set", ref, data, merge))
+
+    def commit(self):
+        if any(op == "create" and ref.path in self._db.docs for op, ref, _, _ in self._ops):
+            raise gexc.AlreadyExists("Document already exists")
+        for op, ref, data, merge in self._ops:
+            self._db.write(ref.path, data, merge)
+
+
+class FakeDb:
+    def __init__(self, docs=None):
+        self.docs = {k: dict(v) for k, v in (docs or {}).items()}
+        self.reads = 0
+        self.hide_once = set()
+
+    def collection(self, name):
+        return FakeCol(self, name)
+
+    def get_all(self, refs):
+        refs = list(refs)
+        self.reads += len(refs)
+        return [FakeSnap(r, self.docs.get(r.path)) for r in reversed(refs)]   # any order, like Firestore
+
+    def batch(self):
+        return FakeBatch(self)
+
+    def write(self, path, data, merge):
+        def apply(dst, src):
+            for k, v in src.items():
+                if isinstance(v, dict):
+                    apply(dst.setdefault(k, {}), v)
+                elif type(v).__name__ == "Increment":
+                    dst[k] = (dst.get(k) or 0) + v.value
+                else:
+                    dst[k] = v
+        cur = dict(self.docs.get(path) or {}) if merge else {}
+        apply(cur, data)
+        self.docs[path] = cur
+
+
 # ------------------------------------------------------------------ HTTP
-@pytest.fixture()
-def client():
-    me = {"firstName": "Asha", "gender": "Female", "birthDate": "1994-08-21", "birthTime": "07:40",
-          "birthCityName": "Pune", "birthCountryIso2": "IN", "lat": 12.97, "lon": 77.59}
+ME = "me123456"
+H = {"Authorization": "Bearer ok"}
+# The way the app stores it: coordinates and birth details on the private profile, a rounded copy of the
+# coordinates on the public card, the users doc without any place.
+PROFILE = {"firstName": "Asha", "gender": "Female", "birthDate": "1994-08-21", "birthTime": "07:40",
+           "birthCityName": "Pune", "birthStateName": "Maharashtra", "birthCountryIso2": "IN",
+           "cityName": "Bengaluru", "stateName": "Karnataka", "countryName": "India", "countryIso2": "IN",
+           "lat": 12.9719, "lon": 77.5937}
+PUBLIC = {"firstName": "Asha", "gender": "Female", "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59,
+          "isDiscoverable": True}
+USER = {"gender": "Female", "birthDate": "1994-08-21", "lifeStage": "single"}
+
+
+def make_client(profile=PROFILE, public=PUBLIC, user=USER, db=None, premium=False):
+    astro_api._hits.clear()
+    astro_api._report_hits.clear()
+    astro_api._scores_cache.clear()
     astro_api.configure(astro_api.Deps(
-        db=lambda: None,
-        verify_uid=lambda h: "u1" if h == "Bearer ok" else (_ for _ in ()).throw(astro_api.HTTPException(401)),
+        db=lambda: db,
+        verify_uid=lambda h: ME if h == "Bearer ok" else (_ for _ in ()).throw(astro_api.HTTPException(401)),
         resolve_place=main._resolve_birth_place,
         places_query=main._places_query,
-        load_user_docs=lambda uid: (me, {}, me),
-        is_premium=lambda u, p, now: False,
-        complete=lambda *a, **k: ("text", "stop"),
+        load_user_docs=lambda uid: (dict(profile), dict(public), dict(user)) if uid == ME else ({}, {}, {}),
+        is_premium=lambda u, p, now: premium,
+        complete=lambda *a, **k: ("## The short answer\nA warm match.", "stop"),
         take_rate=lambda *a: True,
     ))
     app = FastAPI()
@@ -101,7 +302,9 @@ def client():
     return TestClient(app)
 
 
-H = {"Authorization": "Bearer ok"}
+@pytest.fixture()
+def client():
+    return make_client()
 
 
 def test_today_endpoint(client):
@@ -121,6 +324,30 @@ def test_today_uses_profile_place(client):
     assert r.status_code == 200 and r.json()["place"]["name"] == "Bengaluru"
 
 
+def test_today_falls_back_to_the_profile_city():
+    # No coordinates anywhere (an unfinished account): the profile's city name still finds the place.
+    prof = {k: v for k, v in PROFILE.items() if k not in ("lat", "lon")}
+    prof.update({"cityName": "Mumbai", "stateName": "Maharashtra"})
+    c = make_client(profile=prof, public={"firstName": "Asha"}, user={})
+    body = c.post("/astro/today", json={"place": None}, headers=H).json()
+    assert body["place"] == {"name": "Mumbai", "tz": "Asia/Kolkata"}
+    nothing = make_client(profile={}, public={}, user={}).post("/astro/today", json={}, headers=H).json()
+    assert nothing["place"]["name"] == "New Delhi"
+
+
+def test_today_takes_odd_input(client):
+    # Mid-ocean (no city within 3 degrees) with a zone name that is a folder: India time, no error.
+    r = client.post("/astro/today", json={"place": {"lat": 0, "lon": -140, "tz": "Asia"}}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["place"]["tz"] == "Asia/Kolkata"
+    # A very long typed name or city is cut, not refused: Today still loads for everyone else.
+    r = client.post("/astro/today", json={"members": [
+        {"id": "k1", "name": "R" * 100, "relation": "daughter", "birthDate": "2018-03-02", "birthCity": "x" * 120},
+        {"id": "k2", "name": "Bad", "birthDate": "2018-02-30"}]}, headers=H)
+    assert r.status_code == 200, r.text
+    assert [f["id"] for f in r.json()["family"]] == ["k1"]
+
+
 def test_chart_me_and_other(client):
     r = client.post("/astro/chart", json={}, headers=H)
     assert r.status_code == 200, r.text
@@ -130,6 +357,15 @@ def test_chart_me_and_other(client):
     assert r2.json()["chart"]["basis"] == "moon"
     bad = client.post("/astro/chart", json={"person": {"name": "X", "birthDate": "02/03/2018"}}, headers=H)
     assert bad.status_code == 422
+    impossible = client.post("/astro/chart", json={"person": {"name": "X", "birthDate": "2023-02-31"}}, headers=H)
+    assert impossible.status_code == 422 and impossible.json()["detail"] == "bad_birth_date"
+
+
+def test_someone_without_a_date_is_never_me(client):
+    # A typed person with no birth date used to turn into the caller under their name.
+    r = client.post("/astro/match", json={"b": {"name": "Vikram"}}, headers=H)
+    assert r.status_code == 422 and r.json()["detail"] == "bad_birth_date"
+    assert client.post("/astro/chart", json={"person": {"name": "Vikram"}}, headers=H).status_code == 422
 
 
 def test_match_any_pair(client):
@@ -155,11 +391,12 @@ def test_report_needs_parrot_plus(client):
 
 def test_good_days_endpoint(client):
     r = client.post("/astro/good-days", json={"event": "naming", "place": {"lat": 28.61, "lon": 77.21}, "days": 30,
-                                             "people": [{"me": True}, {"name": "Baby", "birthDate": "2026-09-01"}]}, headers=H)
+                                             "people": [{"me": True}, {"name": "Baby", "birthDate": "2026-09-01"},
+                                                        {"name": "Typo", "birthDate": "2026-02-30"}, {"me": True}]}, headers=H)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["title"].startswith("Naming") and body["place"]["name"]
-    assert all(len(d["people"]) == 2 for d in body["days"])
+    assert all(len(d["people"]) == 2 for d in body["days"])   # the impossible date and the second "me" are left out
 
 
 def test_question_without_db(client):
@@ -177,6 +414,8 @@ def test_places_search(client):
     names = [p["name"] for p in r.json()["places"]]
     assert names[0] == "Bengaluru"
     assert client.post("/astro/places", json={"q": "b"}, headers=H).json()["places"] == []
+    assert client.post("/astro/places", json={"q": "%%"}, headers=H).json()["places"] == []   # no wildcards
+    assert client.post("/astro/places", json={"q": "m" * 90}, headers=H).status_code == 200
 
 
 def test_scores_without_db_is_empty(client):
@@ -184,37 +423,128 @@ def test_scores_without_db_is_empty(client):
     assert r.status_code == 200 and r.json()["scores"] == {}
 
 
-def test_scores_with_profiles():
-    class Snap:
-        def __init__(self, id_, d):
-            self.id, self._d, self.exists = id_, d, d is not None
+SOON = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+PAST = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
 
-        def to_dict(self):
-            return self._d
 
-    class Doc:
-        def __init__(self, id_):
-            self.id = id_
+def _member_docs(uid, birth="1996-04-11", public=None, profile=None):
+    prof = {"firstName": "Neha", "gender": "Female", "birthDate": birth, "birthTime": "05:20",
+            "birthCityName": "Jaipur", "birthCountryIso2": "IN", **(profile or {})}
+    if birth is None:
+        prof.pop("birthDate")
+    return {f"profiles/{uid}": prof,
+            f"publicProfiles/{uid}": {"firstName": "Neha", "gender": "Female", "isDiscoverable": True, **(public or {})}}
 
-    class Col:
-        def document(self, id_):
-            return Doc(id_)
 
-    class Db:
-        def collection(self, name):
-            return Col()
+def test_scores_only_for_people_i_could_see():
+    docs = {}
+    docs.update(_member_docs("bride1234"))
+    docs.update(_member_docs("nobirth12", birth=None))
+    docs.update(_member_docs("hidden123", public={"isDiscoverable": False}))
+    docs.update(_member_docs("paused123", public={"isProfileActive": False}))
+    docs.update(_member_docs("banned123", profile={"moderationStatus": "banned"}))
+    docs.update(_member_docs("suspend12", profile={"moderationStatus": "suspended", "moderationUntil": SOON}))
+    docs.update(_member_docs("wasoff123", profile={"moderationStatus": "suspended", "moderationUntil": PAST}))
+    docs.update(_member_docs("iblocked1"))
+    docs.update(_member_docs("blockme12"))
+    docs.update(_member_docs("kundli123", profile={"profileFor": "none"}))
+    docs.update(_member_docs("typo12345", birth="2001-02-30"))
+    docs.update(_member_docs("after1234", birth="1997-07-22"))
+    docs["profiles/nocard123"] = {"birthDate": "1995-05-05", "gender": "Female"}   # no public card
+    docs[f"users/{ME}/blocks/iblocked1"] = {"at": 1}
+    docs[f"users/{ME}/blockedBy/blockme12"] = {"at": 1}
+    c = make_client(profile={"firstName": "Rahul", "gender": "Male", "birthDate": "1993-09-02"}, public={}, user={},
+                    db=FakeDb(docs))
+    ids = ["bride1234", "nobirth12", "hidden123", "paused123", "banned123", "suspend12", "wasoff123", "iblocked1",
+           "blockme12", "kundli123", "typo12345", "after1234", "nocard123", "ghost1234", ME, "../bad"]
+    sc = c.post("/astro/scores", json={"uids": ids}, headers=H).json()["scores"]
+    assert list(sc) == ["bride1234", "wasoff123", "after1234"]
+    assert all(0 <= s["total"] <= 36 and 0 <= s["min"] <= s["max"] <= 36 for s in sc.values())
 
-        def get_all(self, refs):
-            data = {"bride1234": {"birthDate": "1996-04-11", "gender": "Female"}, "nobirth12": {"gender": "Female"}}
-            return [Snap(r.id, data.get(r.id)) for r in refs]
 
+def test_scores_follow_my_own_birth_details():
+    db = FakeDb(_member_docs("bride1234"))
     me = {"firstName": "Rahul", "gender": "Male", "birthDate": "1993-09-02"}
-    astro_api.configure(astro_api.Deps(
-        db=lambda: Db(), verify_uid=lambda h: "me123456", resolve_place=lambda p: None, places_query=main._places_query,
-        load_user_docs=lambda uid: (me, {}, me), is_premium=lambda *a: False, complete=lambda *a, **k: ("", ""),
-        take_rate=lambda *a: True))
-    app = FastAPI()
-    app.include_router(astro_api.router)
-    r = TestClient(app).post("/astro/scores", json={"uids": ["bride1234", "nobirth12", "ghost1234"]}, headers=H)
-    sc = r.json()["scores"]
-    assert list(sc) == ["bride1234"] and 0 <= sc["bride1234"]["total"] <= 36
+    c = make_client(profile=me, public={}, user={}, db=db)
+    first = c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H).json()["scores"]
+    reads = db.reads
+    again = c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H).json()["scores"]
+    assert again == first and db.reads == reads           # from the cache
+    me["birthDate"] = "1993-09-20"                         # I fixed my birth date
+    c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H)
+    assert db.reads > reads                                 # worked out again, not the old score
+
+
+def test_member_match_reads_their_profile_on_the_server():
+    db = FakeDb(_member_docs("bride1234"))
+    c = make_client(profile={**PROFILE, "gender": "Male", "firstName": "Rahul"}, db=db)
+    r = c.post("/astro/match", json={"b": {"uid": "bride1234", "name": "N."}}, headers=H)
+    assert r.status_code == 200, r.text
+    m = r.json()["match"]
+    assert m["a"]["name"] == "Rahul" and m["b"]["name"] == "Neha" and 0 <= m["total"] <= 36
+    assert m["bMoon"]["pada"] == 0 and m["bMoon"]["nakshatra"]
+    for secret in ("1996", "04-11", "05:20", "Jaipur"):   # nothing of their birth details comes back
+        assert secret not in r.text
+    # Their chart would give the birth moment away; good dates may count them in.
+    assert c.post("/astro/chart", json={"person": {"uid": "bride1234"}}, headers=H).status_code == 403
+    g = c.post("/astro/good-days", json={"event": "wedding", "days": 120, "people": [{"me": True}, {"uid": "bride1234"}]},
+               headers=H).json()
+    assert all([p["name"] for p in d["people"]] == ["Rahul", "Neha"] for d in g["days"])
+    assert "1996" not in json.dumps(g)
+
+
+def test_member_match_refused_when_hidden_or_blocked():
+    docs = {}
+    docs.update(_member_docs("bride1234"))
+    docs.update(_member_docs("hidden123", public={"isDiscoverable": "false"}))
+    docs.update(_member_docs("banned123", public={"moderationStatus": "banned"}))
+    docs.update(_member_docs("nobirth12", birth=None))
+    docs.update(_member_docs("blockme12"))
+    docs.update(_member_docs("iblocked1"))
+    docs[f"users/blockme12/blocks/{ME}"] = {"at": 1}
+    docs[f"users/{ME}/blocks/iblocked1"] = {"at": 1}
+    c = make_client(db=FakeDb(docs))
+
+    def status(uid):
+        r = c.post("/astro/match", json={"b": {"uid": uid}}, headers=H)
+        return r.status_code, r.json().get("detail")
+
+    assert status("bride1234")[0] == 200
+    for uid in ("hidden123", "banned123", "blockme12", "iblocked1", "ghost1234", ME, "../../x"):
+        assert status(uid) == (404, "member_unavailable"), uid
+    assert status("nobirth12") == (422, "member_no_birth_date")
+    assert make_client(db=None).post("/astro/match", json={"b": {"uid": "bride1234"}}, headers=H).status_code == 503
+
+
+def test_question_counts_only_the_question_shown():
+    db = FakeDb()
+    c = make_client(db=db)
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    q = astro_content.question_for(today)
+    vote_path = f"dailyQuestionVotes/{today.isoformat()}__{ME}"
+    # Yesterday's question still on screen just after midnight: nothing is counted, today's comes back.
+    r = c.post("/astro/question", json={"vote": 1, "qid": "yesterdays_question"}, headers=H).json()
+    assert r["voted"] is None and r["question"]["id"] == q["id"] and vote_path not in db.docs
+    # The right question; the place is the phone's own name for it, the count goes under the database's city.
+    place = {"lat": 12.97, "lon": 77.59, "city": "Bangalore"}
+    r = c.post("/astro/question", json={"vote": 1, "qid": q["id"], "place": place}, headers=H).json()
+    assert r["voted"] == 1 and r["results"]["total"] == 1 and r["results"]["city"]["name"] == "Bangalore"
+    counts = db.docs[f"dailyQuestions/{today.isoformat()}"]
+    assert counts["counts"] == {"1": 1} and counts["cities"] == {"bengaluru": {"1": 1}}
+    # Once only, even from another phone at the same moment.
+    r = c.post("/astro/question", json={"vote": 0, "qid": q["id"], "place": place}, headers=H).json()
+    assert r["voted"] == 1
+    db.hide_once.add(vote_path)
+    r = c.post("/astro/question", json={"vote": 0, "qid": q["id"], "place": place}, headers=H).json()
+    assert r["voted"] == 1 and db.docs[f"dailyQuestions/{today.isoformat()}"]["counts"] == {"1": 1}
+
+
+def test_family_context_sends_ages_not_birth_dates(monkeypatch):
+    born = (datetime.now(timezone.utc) - timedelta(days=365 * 7 + 30)).date().isoformat()
+    db = FakeDb({"users/u1/family/k1": {"name": "Riya", "relation": "Daughter", "birthDate": born},
+                 "users/u1/family/k2": {"name": "Papa", "relation": "Father"},
+                 "users/u1/family/k3": {"name": "Odd", "relation": "Son", "birthDate": "2020-02-30"}})
+    monkeypatch.setattr(main, "firestore_client", db)
+    ctx = main._family_context("u1")
+    assert "Riya (Daughter, age 7, Moon " in ctx and "Papa (Father)" in ctx and "Odd (Son)" in ctx
+    assert born not in ctx and "born" not in ctx

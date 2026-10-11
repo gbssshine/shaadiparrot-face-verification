@@ -7,6 +7,8 @@ Gulika are eighths of the daylight; Abhijit is the 8th of the 15 daytime muhurta
 """
 from __future__ import annotations
 
+import threading
+from bisect import bisect_right
 from datetime import date as Date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,9 +53,14 @@ YEAR_DAYS = 365.25
 
 # ------------------------------------------------------------------ basics
 def zone(name: Any) -> ZoneInfo:
+    """A tz database zone; anything unknown or malformed (the app may send any text) is India time."""
+    key = str(name or "").strip()
+    if not key or len(key) > 64:
+        return ZoneInfo("Asia/Kolkata")
     try:
-        return ZoneInfo(str(name or "").strip() or "Asia/Kolkata")
-    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        # OSError: a folder such as "Asia" (PermissionError on Windows, IsADirectoryError on Linux) or a bad name.
         return ZoneInfo("Asia/Kolkata")
 
 
@@ -198,12 +205,21 @@ def panchang(day: Date, lat: float, lon: float, tz_name: str) -> Dict[str, Any]:
     chog[7]["name"] = chog[0]["name"]
     chog[7]["good"] = chog[0]["good"]
 
-    rahu = eighth(RAHU_PART[wd])
+    rahu, yama, gulika = eighth(RAHU_PART[wd]), eighth(YAMA_PART[wd]), eighth(GULIKA_PART[wd])
     good_times = []
     if wd != 2:   # Abhijit is skipped on Wednesdays
-        good_times.append({"name": "Abhijit muhurat", **abhijit})
+        # On Fridays Rahu kaal covers the first half of Abhijit: only the part outside Rahu kaal is a good time.
+        a0, a1 = rise + daylight * 7 / 15, rise + daylight * 8 / 15
+        r0, r1 = rise + part * (RAHU_PART[wd] - 1), rise + part * RAHU_PART[wd]
+        free = [(a0, min(a1, r0)), (max(a0, r1), a1)] if r0 < a1 and a0 < r1 else [(a0, a1)]
+        s0, s1 = max(free, key=lambda w: w[1] - w[0])
+        if s1 - s0 >= 10 / 1440.0:
+            good_times.append({"name": "Abhijit muhurat", **_span(moment_of(s0, tz), moment_of(s1, tz))})
+    # A good choghadiya that falls on Rahu kaal, Yamaganda or Gulika is left out: the app shows those as times
+    # to avoid, and the same slot can't be both.
+    bad = {rahu["startIso"], yama["startIso"], gulika["startIso"]}
     for c in chog:
-        if c["good"] and c["start"] != rahu["start"]:
+        if c["good"] and c["startIso"] not in bad:
             good_times.append({"name": c["name"] + " choghadiya", "start": c["start"], "end": c["end"],
                                "startIso": c["startIso"], "endIso": c["endIso"]})
     good_times.sort(key=lambda g: g["startIso"])
@@ -224,7 +240,7 @@ def panchang(day: Date, lat: float, lon: float, tz_name: str) -> Dict[str, Any]:
         "moonSign": {"index": moon_sign, "name": RASHIS[moon_sign][0], "english": RASHIS[moon_sign][1]},
         "sunSign": {"index": sun_sign, "name": RASHIS[sun_sign][0], "english": RASHIS[sun_sign][1]},
         "masa": lunar_month(rise),
-        "rahuKaal": rahu, "yamaganda": eighth(YAMA_PART[wd]), "gulika": eighth(GULIKA_PART[wd]),
+        "rahuKaal": rahu, "yamaganda": yama, "gulika": gulika,
         "abhijit": abhijit, "abhijitSkipped": wd == 2, "brahmaMuhurta": brahma,
         "choghadiya": chog, "goodTimes": good_times,
         "dayLengthMinutes": int(round(daylight * 1440)),
@@ -247,50 +263,90 @@ def _prev_new_moon(jd: float) -> float:
     return hi
 
 
-def lunar_month(jd: float) -> Dict[str, Any]:
-    nm = _prev_new_moon(jd)
+def _masa(nm: float, nm_next: float, krishna: bool) -> Dict[str, Any]:
+    """The lunar month that starts at the new moon nm (the next one is nm_next), in the dark or bright half."""
     sign = int(sid(nm, swe.SUN) // 30.0)
-    nm_next = _prev_new_moon(nm + 31.0)
     adhik = int(sid(nm_next, swe.SUN) // 30.0) == sign
     amanta = MASA_BY_SUN_SIGN[sign]
-    paksha_krishna = tithi_angle(jd) >= 180.0
     # Purnimanta (North India) months run full moon to full moon: the dark half belongs to the next month.
-    purnimanta = MASA_BY_SUN_SIGN[(sign + 1) % 12] if paksha_krishna else amanta
+    # An adhik month runs new moon to new moon in both systems, so its dark half keeps the adhik name.
+    purnimanta = MASA_BY_SUN_SIGN[(sign + 1) % 12] if krishna and not adhik else amanta
     return {"amanta": amanta, "purnimanta": purnimanta, "adhik": adhik}
 
 
+def lunar_month(jd: float) -> Dict[str, Any]:
+    nm = _prev_new_moon(jd)
+    return _masa(nm, _prev_new_moon(nm + 31.0), tithi_angle(jd) >= 180.0)
+
+
 # ------------------------------------------------------------------ vrats and festivals
+PRADOSH_KAAL = 0.1   # the three muhurtas (2 h 24 min) after sunset
+
+
 def vrats_between(start: Date, days: int, lat: float, lon: float, tz_name: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for i in range(days):
-        d = start + timedelta(days=i)
-        tz = zone(tz_name)
-        f = _day_frame(d.year, d.month, d.day, round(lat, 3), round(lon, 3), tz.key)
-        t_rise = tithi_at(f["sunrise"])
-        t_set = tithi_at(f["sunset"])
-        t_moon = tithi_at(f["moonrise"]) if f["moonrise"] else None
-        wd = d.weekday()
-        items = []
-        if t_rise in (11, 26):
-            items.append(("ekadashi", "Ekadashi vrat", "A day of fasting and Vishnu puja."))
+    """Monthly vrats from start for days. Each vrat goes by its tithi at the moment that matters for it (sunrise,
+    sunset or moonrise). A tithi can also begin after one such moment and end before the next (kshaya): it is
+    then placed on the day it fell within, so no Ekadashi, Amavasya, Purnima, Pradosh or Sankashti goes missing."""
+    tz = zone(tz_name)
+    la, lo = round(lat, 3), round(lon, 3)
+    # The day before and the day after too: a skipped tithi is found by comparing neighbours.
+    dates = [start + timedelta(days=i) for i in range(-1, days + 1)]
+    frames = [_day_frame(x.year, x.month, x.day, la, lo, tz.key) for x in dates]
+    at_rise = [tithi_at(f["sunrise"]) for f in frames]
+    at_set = [tithi_at(f["sunset"]) for f in frames]
+    at_moon = [tithi_at(f["moonrise"]) if f["moonrise"] else None for f in frames]
+
+    def skipped(a: Optional[int], b: Optional[int]) -> Optional[int]:
+        """The tithi that ran wholly between two moments with tithis a and b, if one did."""
+        return a % 30 + 1 if a is not None and b is not None and (b - a) % 30 == 2 else None
+
+    found: List[Tuple[int, str, str, str]] = []   # (index into dates, kind, name, note)
+    for i in range(1, days + 1):
+        f = frames[i]
+        t_rise, t_set, t_moon = at_rise[i], at_set[i], at_moon[i]
+        k_rise = skipped(t_rise, at_rise[i + 1])   # began after this sunrise, ended before the next
+        if t_rise in (11, 26) or k_rise in (11, 26):
+            found.append((i, "ekadashi", "Ekadashi vrat", "A day of fasting and Vishnu puja."))
+        k_set = skipped(at_set[i - 1], t_set)
         if t_set in (13, 28):
-            nm = {0: "Som Pradosh", 5: "Shani Pradosh"}.get(wd, "Pradosh vrat")
-            items.append(("pradosh", nm, "Shiva puja at dusk, after sunset."))
-        if t_set == 15 or (t_rise == 15 and t_set == 16):
-            items.append(("purnima", "Purnima", "Full moon: Satyanarayan katha in many homes."))
-        if t_rise == 30:
-            items.append(("amavasya", "Amavasya", "New moon: a day to remember the ancestors."))
+            found.append((i, "pradosh", "", ""))
+        elif k_set in (13, 28):
+            # Trayodashi began after yesterday's sunset and ended before today's: the evening whose pradosh
+            # kaal it touched, else today.
+            touched = tithi_at(frames[i - 1]["sunset"] + PRADOSH_KAAL) == k_set
+            found.append((i - 1 if touched else i, "pradosh", "", ""))
+        if t_set == 15 or (t_rise == 15 and t_set == 16) or k_rise == 15:
+            found.append((i, "purnima", "Purnima", "Full moon: Satyanarayan katha in many homes."))
+        if t_rise == 30 or k_rise == 30:
+            found.append((i, "amavasya", "Amavasya", "New moon: a day to remember the ancestors."))
         if t_moon == 19:
-            mr = moment_of(f["moonrise"], tz)
-            items.append(("sankashti", "Sankashti Chaturthi", f"Ganesha vrat, broken at moonrise ({mr.strftime('%H:%M')})."))
-        for kind, name, note in items:
-            # one entry per tithi: the first day it falls on
-            if any(o["kind"] == kind and (d - Date.fromisoformat(o["date"])).days <= 1 for o in out):
-                continue
-            out.append({"date": d.isoformat(), "kind": kind, "type": "vrat", "name": name, "note": note})
+            found.append((i, "sankashti", "", ""))
+        elif at_moon[i - 1] == 18 and (t_moon == 20 or (t_moon is None and at_moon[i + 1] != 19)):
+            # Chaturthi came and went between two moonrises (a day without moonrise in between counts as
+            # none): today if it held at sunrise or sunset, else yesterday.
+            found.append((i if 19 in (t_rise, t_set) else i - 1, "sankashti", "", ""))
+
+    out: List[Dict[str, Any]] = []
+    for i, kind, name, note in sorted(found, key=lambda x: x[0]):
+        if i < 1:   # the day before the range
+            continue
+        d = dates[i]
+        if kind == "pradosh":
+            name, note = {0: "Som Pradosh", 5: "Shani Pradosh"}.get(d.weekday(), "Pradosh vrat"), "Shiva puja at dusk, after sunset."
+        elif kind == "sankashti":
+            mr = frames[i]["moonrise"]
+            name = "Sankashti Chaturthi"
+            note = (f"Ganesha vrat, broken at moonrise ({moment_of(mr, tz).strftime('%H:%M')})." if mr
+                    else "Ganesha vrat, broken at moonrise.")
+        # One entry per tithi: the first day it falls on. The same vrat comes back after 13 days at the soonest,
+        # so anything within 3 days is the same tithi seen twice (two moonrises far north, for one).
+        if any(o["kind"] == kind and abs((d - Date.fromisoformat(o["date"])).days) <= 3 for o in out):
+            continue
+        out.append({"date": d.isoformat(), "kind": kind, "type": "vrat", "name": name, "note": note})
     return out
 
 
+# Festivals by date (New Delhi). Extend the list before it runs out: a test fails 60 days before its last date.
 FESTIVALS: List[Dict[str, str]] = [
     {"date": "2026-10-11", "id": "navratri", "name": "Sharad Navratri begins", "note": "Nine nights of Durga: ghatasthapana in the morning."},
     {"date": "2026-10-17", "id": "durga_puja", "name": "Durga Puja (Saptami)", "note": "Pandal days begin in Bengal and beyond."},
@@ -315,13 +371,78 @@ FESTIVALS: List[Dict[str, str]] = [
     {"date": "2027-03-22", "id": "holi", "name": "Holi", "note": "Colours day (some lists say 23 March)."},
     {"date": "2027-04-07", "id": "ugadi", "name": "Ugadi · Gudi Padwa", "note": "Hindu new year."},
     {"date": "2027-04-14", "id": "baisakhi", "name": "Baisakhi", "note": "Harvest festival."},
+    # From here on worked out by the same panchang rules for New Delhi (udaya tithi, or the tithi in aparahna,
+    # pradosh, nishita or at moonrise, Bhadra for Rakhi) and checked against Drik Panchang and the DoPT 2027 list.
+    {"date": "2027-04-15", "id": "ram_navami", "name": "Ram Navami", "note": "Lord Rama's birthday."},
+    {"date": "2027-04-19", "id": "mahavir_jayanti", "name": "Mahavir Jayanti", "note": "The birth of Bhagwan Mahavir."},
+    {"date": "2027-04-20", "id": "hanuman_jayanti", "name": "Hanuman Jayanti", "note": "Chaitra Purnima: Hanuman Chalisa in many homes."},
+    {"date": "2027-05-09", "id": "akshaya_tritiya", "name": "Akshaya Tritiya", "note": "A lucky day for gold and new beginnings."},
+    {"date": "2027-05-17", "id": "bakrid", "name": "Eid ul-Adha (Bakrid)", "note": "Depends on the moon sighting."},
+    {"date": "2027-05-20", "id": "buddha_purnima", "name": "Buddha Purnima", "note": "Vaishakha Purnima."},
+    {"date": "2027-06-04", "id": "vat_savitri", "name": "Vat Savitri", "note": "Wives pray at the banyan tree for their husband's long life."},
+    {"date": "2027-07-18", "id": "guru_purnima", "name": "Guru Purnima", "note": "Thank your teachers and elders."},
+    {"date": "2027-08-04", "id": "hariyali_teej", "name": "Hariyali Teej", "note": "Green bangles, swings and mehndi."},
+    {"date": "2027-08-15", "id": "independence_day", "name": "Independence Day", "note": ""},
+    {"date": "2027-08-17", "id": "raksha_bandhan", "name": "Raksha Bandhan", "note": "Rakhi for brothers, blessings and gifts for sisters."},
+    {"date": "2027-08-25", "id": "janmashtami", "name": "Janmashtami", "note": "Krishna's birthday: the fast ends at midnight."},
+    {"date": "2027-09-04", "id": "ganesh_chaturthi", "name": "Ganesh Chaturthi", "note": "Ganpati comes home."},
+    {"date": "2027-09-29", "id": "mahalaya", "name": "Mahalaya Amavasya", "note": "Pitru Paksha ends: a day to remember the ancestors."},
+    {"date": "2027-09-30", "id": "navratri", "name": "Sharad Navratri begins", "note": "Nine nights of Durga: ghatasthapana in the morning."},
+    {"date": "2027-10-06", "id": "durga_puja", "name": "Durga Puja (Saptami)", "note": "Pandal days begin in Bengal and beyond."},
+    {"date": "2027-10-09", "id": "dussehra", "name": "Dussehra", "note": "Vijayadashami: good wins over evil."},
+    {"date": "2027-10-14", "id": "sharad_purnima", "name": "Sharad Purnima", "note": "Kheer under the full moon."},
+    {"date": "2027-10-18", "id": "karva_chauth", "name": "Karva Chauth", "note": "The fast ends at moonrise: see the time for your city."},
+    {"date": "2027-10-27", "id": "dhanteras", "name": "Dhanteras", "note": "Buy something new for the home, light the first diya."},
+    {"date": "2027-10-29", "id": "diwali", "name": "Diwali", "note": "Lakshmi puja in the evening."},
+    {"date": "2027-10-31", "id": "bhai_dooj", "name": "Bhai Dooj", "note": "Tilak for brothers, blessings for sisters."},
+    {"date": "2027-11-04", "id": "chhath", "name": "Chhath Puja", "note": "Evening arghya to the setting Sun."},
+    {"date": "2027-11-10", "id": "dev_uthani", "name": "Dev Uthani Ekadashi", "note": "Tulsi Vivah: the wedding season opens."},
+    {"date": "2027-11-14", "id": "gurpurab", "name": "Guru Nanak Jayanti", "note": "Kartik Purnima."},
+    {"date": "2027-12-25", "id": "christmas", "name": "Christmas", "note": ""},
+    {"date": "2028-01-01", "id": "new_year", "name": "New Year 2028", "note": ""},
+    {"date": "2028-01-14", "id": "lohri", "name": "Lohri", "note": "Bonfire, rewri and gajak."},
+    {"date": "2028-01-15", "id": "sankranti", "name": "Makar Sankranti · Pongal", "note": "The Sun enters Makara: til-gud and kites."},
+    {"date": "2028-01-26", "id": "republic_day", "name": "Republic Day", "note": ""},
+    {"date": "2028-01-31", "id": "basant_panchami", "name": "Basant Panchami", "note": "Saraswati puja: wear yellow."},
+    {"date": "2028-02-23", "id": "shivratri", "name": "Maha Shivratri", "note": "Night of Shiva."},
+    {"date": "2028-03-10", "id": "holika_dahan", "name": "Holika Dahan", "note": "The bonfire on the eve of Holi."},
+    {"date": "2028-03-11", "id": "holi", "name": "Holi", "note": "Colours day."},
+    {"date": "2028-03-27", "id": "ugadi", "name": "Ugadi · Gudi Padwa", "note": "Hindu new year."},
+    {"date": "2028-04-03", "id": "ram_navami", "name": "Ram Navami", "note": "Lord Rama's birthday."},
+    {"date": "2028-04-07", "id": "mahavir_jayanti", "name": "Mahavir Jayanti", "note": "The birth of Bhagwan Mahavir."},
+    {"date": "2028-04-09", "id": "hanuman_jayanti", "name": "Hanuman Jayanti", "note": "Chaitra Purnima: Hanuman Chalisa in many homes."},
+    {"date": "2028-04-13", "id": "baisakhi", "name": "Baisakhi", "note": "Harvest festival."},
+    {"date": "2028-04-27", "id": "akshaya_tritiya", "name": "Akshaya Tritiya", "note": "A lucky day for gold and new beginnings."},
+    {"date": "2028-05-08", "id": "buddha_purnima", "name": "Buddha Purnima", "note": "Vaishakha Purnima."},
+    {"date": "2028-05-24", "id": "vat_savitri", "name": "Vat Savitri", "note": "Wives pray at the banyan tree for their husband's long life."},
+    {"date": "2028-07-06", "id": "guru_purnima", "name": "Guru Purnima", "note": "Thank your teachers and elders."},
+    {"date": "2028-07-24", "id": "hariyali_teej", "name": "Hariyali Teej", "note": "Green bangles, swings and mehndi."},
+    {"date": "2028-08-05", "id": "raksha_bandhan", "name": "Raksha Bandhan", "note": "Rakhi for brothers, blessings and gifts for sisters."},
+    {"date": "2028-08-13", "id": "janmashtami", "name": "Janmashtami", "note": "Krishna's birthday: the fast ends at midnight."},
+    {"date": "2028-08-15", "id": "independence_day", "name": "Independence Day", "note": ""},
+    {"date": "2028-08-23", "id": "ganesh_chaturthi", "name": "Ganesh Chaturthi", "note": "Ganpati comes home."},
+    {"date": "2028-09-18", "id": "mahalaya", "name": "Mahalaya Amavasya", "note": "Pitru Paksha ends: a day to remember the ancestors."},
+    {"date": "2028-09-19", "id": "navratri", "name": "Sharad Navratri begins", "note": "Nine nights of Durga: ghatasthapana in the morning."},
+    {"date": "2028-09-25", "id": "durga_puja", "name": "Durga Puja (Saptami)", "note": "Pandal days begin in Bengal and beyond."},
+    {"date": "2028-09-27", "id": "dussehra", "name": "Dussehra", "note": "Vijayadashami: good wins over evil."},
+    {"date": "2028-10-02", "id": "sharad_purnima", "name": "Sharad Purnima", "note": "Kheer under the full moon."},
+    {"date": "2028-10-07", "id": "karva_chauth", "name": "Karva Chauth", "note": "The fast ends at moonrise: see the time for your city."},
+    {"date": "2028-10-15", "id": "dhanteras", "name": "Dhanteras", "note": "Buy something new for the home, light the first diya."},
+    {"date": "2028-10-17", "id": "diwali", "name": "Diwali", "note": "Lakshmi puja in the evening."},
+    {"date": "2028-10-19", "id": "bhai_dooj", "name": "Bhai Dooj", "note": "Tilak for brothers, blessings for sisters."},
+    {"date": "2028-10-23", "id": "chhath", "name": "Chhath Puja", "note": "Evening arghya to the setting Sun."},
+    {"date": "2028-10-28", "id": "dev_uthani", "name": "Dev Uthani Ekadashi", "note": "Tulsi Vivah: the wedding season opens."},
+    {"date": "2028-11-02", "id": "gurpurab", "name": "Guru Nanak Jayanti", "note": "Kartik Purnima."},
+    {"date": "2028-12-25", "id": "christmas", "name": "Christmas", "note": ""},
 ]
 
 
 # Festivals that already are the day's vrat: the generic entry within a day of them is left out.
 FESTIVAL_COVERS = {"dev_uthani": {"ekadashi"}, "sharad_purnima": {"purnima"}, "gurpurab": {"purnima"},
                    "diwali": {"amavasya"}, "karva_chauth": {"sankashti"}, "holika_dahan": {"purnima"},
-                   "shivratri": {"pradosh"}}
+                   "shivratri": {"pradosh"}, "hanuman_jayanti": {"purnima"}, "buddha_purnima": {"purnima"},
+                   "guru_purnima": {"purnima"}, "raksha_bandhan": {"purnima"}, "vat_savitri": {"amavasya"},
+                   "mahalaya": {"amavasya"}}
 
 
 def upcoming(start: Date, days: int, lat: float, lon: float, tz_name: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -540,7 +661,9 @@ def day_line(name: str, relation: str, natal_rashi: int, natal_nak: int, today_r
     tara = ((today_nak - natal_nak) % 27) % 9 + 1
     group = RELATION_GROUP.get((relation or "").strip().lower(), "any")
     t = LINES[house]
-    text = (t.get(group) or t["any"]).format(n=name or "They")
+    text = (t.get(group) or t["any"]).format(n=name or "your loved one")
+    if not name:   # the lines are written for one person; a line may open with the name
+        text = text[0].upper() + text[1:]
     good = house in HOUSE_GOOD and tara not in TARA_HARD
     hard = house in HOUSE_HARD and tara in TARA_HARD
     return {"text": text, "tone": "good" if good else ("gentle" if hard else "steady"), "house": house, "tara": tara}
@@ -572,14 +695,81 @@ EVENTS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _blocked(jd: float, ev: Dict[str, Any]) -> Optional[str]:
+# Tithi and nakshatra changes are moments in UT, the same for every place and event. They are found once a
+# day for the whole process (yesterday to about four months ahead) and looked up with bisect, so a good-dates
+# search doesn't redo thousands of ephemeris calls for every request.
+BOUNDS_BACK_DAYS = 2.0
+BOUNDS_AHEAD_DAYS = 126.0
+_bounds_lock = threading.Lock()
+_bounds: Optional[Dict[str, Any]] = None
+
+
+def _chain(fn, span: float, lo: float, hi: float) -> Tuple[List[float], List[int]]:
+    """Every moment from lo until past hi when fn reaches a multiple of span, with the segment that ends there."""
+    ends: List[float] = []
+    segs: List[int] = []
+    t = lo
+    while True:
+        seg = int(fn(t) // span)
+        e = _end_of(fn, t, span)
+        ends.append(e)
+        segs.append(seg)
+        if e > hi:
+            return ends, segs
+        t = e + 1e-5
+
+
+def _build_bounds(day: Date) -> Dict[str, Any]:
+    lo = jd_of(datetime(day.year, day.month, day.day, tzinfo=timezone.utc)) - BOUNDS_BACK_DAYS
+    hi = lo + BOUNDS_BACK_DAYS + BOUNDS_AHEAD_DAYS
+    tb, ts = _chain(tithi_angle, 12.0, lo, hi)
+    nb, ns = _chain(moon_lon, NAK_SPAN, lo, hi)
+    tn = [s % 30 + 1 for s in ts]
+    # New moons (the end of Amavasya) mark the lunar months: one before the table and one after it as well.
+    moons = [_prev_new_moon(lo)] + [e for e, n in zip(tb, tn) if n == 30]
+    moons.append(_prev_new_moon(moons[-1] + 31.0))
+    return {"day": day, "lo": lo, "hi": min(tb[-1], nb[-1]), "tb": tb, "tn": tn, "nb": nb,
+            "nn": [s % 27 for s in ns], "moons": moons}
+
+
+def shared_bounds(jd_from: float, jd_to: float) -> Optional[Dict[str, Any]]:
+    """Today's table of tithi and nakshatra changes when it covers jd_from..jd_to, else None."""
+    global _bounds
+    today = datetime.now(timezone.utc).date()
+    b = _bounds
+    if b is None or b["day"] != today:
+        with _bounds_lock:
+            b = _bounds
+            if b is None or b["day"] != today:
+                b = _build_bounds(today)
+                _bounds = b
+    return b if b["lo"] <= jd_from and jd_to < b["hi"] else None
+
+
+def _tithi_in(b: Dict[str, Any], jd: float) -> Tuple[int, float]:
+    """The tithi running at jd and when it ends, from the table."""
+    i = bisect_right(b["tb"], jd)
+    return b["tn"][i], b["tb"][i]
+
+
+def _nak_in(b: Dict[str, Any], jd: float) -> Tuple[int, float]:
+    i = bisect_right(b["nb"], jd)
+    return b["nn"][i], b["nb"][i]
+
+
+def _blocked(jd: float, ev: Dict[str, Any], b: Optional[Dict[str, Any]] = None) -> Optional[str]:
     sun = sid(jd, swe.SUN)
     if ev["season"]:
         sign = int(sun // 30.0)
         if sign in (8, 11):
             return "Kharmas (Sun in " + ("Dhanu" if sign == 8 else "Meena") + "): no ceremonies"
-        m = lunar_month(jd)
-        t = tithi_at(jd)
+        if b is not None:
+            t = _tithi_in(b, jd)[0]
+            i = bisect_right(b["moons"], jd) - 1
+            m = _masa(b["moons"][i], b["moons"][i + 1], t > 15)
+        else:
+            m = lunar_month(jd)
+            t = tithi_at(jd)
         if m["adhik"]:
             return "Adhik maas: ceremonies wait"
         mon = m["amanta"]
@@ -593,25 +783,65 @@ def _blocked(jd: float, ev: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _good_windows(rise: float, next_rise: float, ev: Dict[str, Any]) -> List[Tuple[float, float, int, int]]:
-    """Stretches of the Hindu day (sunrise to sunrise) when both the tithi and the nakshatra suit the event."""
+def _pieces(rise: float, next_rise: float, b: Optional[Dict[str, Any]]) -> List[Tuple[float, float, int, int]]:
+    """The Hindu day (sunrise to sunrise) cut at every tithi and nakshatra change: (start, end, tithi, nakshatra)."""
     out = []
     t = rise
     for _ in range(8):
         if t >= next_rise - 1e-4:
             break
-        tn, nk = tithi_at(t), int(moon_lon(t) // NAK_SPAN) % 27
-        end = min(_end_of(tithi_angle, t, 12.0), _end_of(moon_lon, t, NAK_SPAN), next_rise)
-        if tn in ev["tithis"] and nk in ev["naks"] and end - t >= 1 / 24:
-            out.append((t, end, tn, nk))
+        if b is not None:
+            (tn, te), (nk, ne) = _tithi_in(b, t), _nak_in(b, t)
+        else:
+            tn, nk = tithi_at(t), int(moon_lon(t) // NAK_SPAN) % 27
+            te, ne = _end_of(tithi_angle, t, 12.0), _end_of(moon_lon, t, NAK_SPAN)
+        end = min(te, ne, next_rise)
+        out.append((t, end, tn, nk))
         t = end + 1e-5
     return out
+
+
+def _good_windows(rise: float, next_rise: float, ev: Dict[str, Any],
+                  b: Optional[Dict[str, Any]] = None) -> List[Tuple[float, float, List[int], List[int]]]:
+    """Stretches of the Hindu day when both the tithi and the nakshatra suit the event, with every tithi and
+    nakshatra inside each. A change from one good tithi (or nakshatra) to another doesn't break a stretch:
+    neighbouring good pieces are joined first, and only then is anything under an hour left out."""
+    wins: List[List[Any]] = []
+    prev_good = False
+    for t0, t1, tn, nk in _pieces(rise, next_rise, b):
+        good = tn in ev["tithis"] and nk in ev["naks"]
+        if good and prev_good:
+            w = wins[-1]
+            w[1] = t1
+            if tn not in w[2]:
+                w[2].append(tn)
+            if nk not in w[3]:
+                w[3].append(nk)
+        elif good:
+            wins.append([t0, t1, [tn], [nk]])
+        prev_good = good
+    return [(w[0], w[1], w[2], w[3]) for w in wins if w[1] - w[0] >= 1 / 24]
+
+
+def _and(items: List[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _tithi_words(tns: List[int]) -> str:
+    """"Krishna Pratipada", "Krishna Pratipada and Dwitiya", "Purnima and Krishna Pratipada"."""
+    named = [tithi_name(t) for t in tns]
+    if len({p for _, p in named}) == 1 and not any(t in (15, 30) for t in tns):
+        return f"{named[0][1]} " + _and([n for n, _ in named])
+    return _and([n if t in (15, 30) else f"{p} {n}" for t, (n, p) in zip(tns, named)])
 
 
 def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_name: str,
               people: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     ev = EVENTS.get(event) or EVENTS["griha_pravesh"]
     tz = zone(tz_name)
+    last = start + timedelta(days=days)
+    bounds = shared_bounds(jd_of(datetime(start.year, start.month, start.day, tzinfo=tz)) - 0.1,
+                           jd_of(datetime(last.year, last.month, last.day, tzinfo=tz)) + 1.5)
     found: List[Dict[str, Any]] = []
     blocked_note: Optional[str] = None
     for i in range(days):
@@ -619,16 +849,16 @@ def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_nam
         if d.weekday() not in ev["days"]:
             continue
         f = _day_frame(d.year, d.month, d.day, round(lat, 3), round(lon, 3), tz.key)
-        wins = _good_windows(f["sunrise"], f["nextRise"], ev)
+        wins = _good_windows(f["sunrise"], f["nextRise"], ev, bounds)
         if not wins:
             continue
-        why_block = _blocked(f["sunrise"], ev)
+        why_block = _blocked(f["sunrise"], ev, bounds)
         if why_block:
             blocked_note = blocked_note or why_block
             continue
-        w0, w1, tn, nk = max(wins, key=lambda w: w[1] - w[0])
-        t_name, paksha = tithi_name(tn)
-        reasons = [f"{NAKSHATRAS[nk][0]} nakshatra", f"{paksha} {t_name}", WEEKDAYS[d.weekday()]]
+        w0, w1, tns, nks = max(wins, key=lambda w: w[1] - w[0])
+        reasons = [_and([NAKSHATRAS[n][0] for n in nks]) + (" nakshatra" if len(nks) == 1 else " nakshatras"),
+                   _tithi_words(tns), WEEKDAYS[d.weekday()]]
         score = 3 + (1 if w1 - w0 >= 0.5 else 0)
         personal = []
         mid = (w0 + w1) / 2
@@ -638,8 +868,8 @@ def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_nam
             if pr is None or pn is None:
                 continue
             house = (today_rashi - pr) % 12 + 1
-            tara = ((nk - pn) % 27) % 9 + 1
-            ok = house not in HOUSE_HARD and tara not in TARA_HARD
+            # Every nakshatra of the window counts: one hard tara is enough to say "careful".
+            ok = house not in HOUSE_HARD and not any(((nk - pn) % 27) % 9 + 1 in TARA_HARD for nk in nks)
             score += 1 if ok else -1
             personal.append({"name": person.get("name") or "", "ok": ok})
         s_t, e_t = moment_of(w0, tz), moment_of(w1, tz)

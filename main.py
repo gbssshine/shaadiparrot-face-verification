@@ -286,12 +286,12 @@ def _is_allowed_topic(user_text: str) -> bool:
 
 def _topic_block_reply(user_text: str, locale: str) -> str:
     variants_en = [
-        "I can’t help with recipes 🦜 But I can help with: dating, texting, profile glow-up, Vedic daily fates. Ask me one of those 🙂",
-        "Not a cooking parrot 😅 I’m best at: love, texting, profile, Vedic astrology. What do you want today? 🦜",
+        "I can’t help with recipes 🦜 But I can help with: rishtas and marriage, your kundli, family life, your biodata, today's panchang. Ask me one of those 🙂",
+        "Not a cooking parrot 😅 I’m best at: rishtas, kundli, family and Vedic astrology. What do you want today? 🦜",
     ]
     variants_ru = [
-        "С рецептами не помогу 🦜 Но могу: свидания/отношения, тексты сообщений, улучшение профиля, ведический daily fate. Спроси 🙂",
-        "Я не кулинарный попугай 😅 Зато топ в: отношениях, сообщениях, профиле, астрологии. Что делаем? 🦜",
+        "С рецептами не помогу 🦜 Но могу: ришта и брак, твоя кундли, семья, биодата, панчанг на сегодня. Спроси 🙂",
+        "Я не кулинарный попугай 😅 Зато топ в: ришта, кундли, семье и астрологии. Что делаем? 🦜",
     ]
     lang = (locale or "en").strip().lower()
     pool = variants_ru if lang.startswith("ru") else variants_en
@@ -401,18 +401,18 @@ def _identity_reply(locale: str) -> str:
     lang = (locale or "en").strip().lower()
     if lang.startswith("ru"):
         return (
-            "Я Shaadi Parrot 🦜\n"
-            "• Помогаю с общением в дейтинге и отношениях\n"
-            "• Делаю разборы мэтчей и идеи для первого шага\n"
-            "• Даю ведические daily-fate подсказки\n"
+            "Я Митху, попугай-астролог Shaadi Parrot 🦜\n"
+            "• Читаю кундли и сверяю гуны пары\n"
+            "• Помогаю с риштой, семьёй, работой и деньгами\n"
+            "• Каждый день подсказываю по панчангу и звёздам\n"
             "Напиши, что сейчас происходит — разберём по шагам ✨"
         )
 
     return (
-        "I’m Shaadi Parrot 🦜\n"
-        "• I help with dating chats and relationship advice\n"
-        "• I do match breakdowns and first-message ideas\n"
-        "• I give Vedic-style daily fate guidance\n"
+        "I’m Mithu, the Shaadi Parrot astrologer 🦜\n"
+        "• I read kundlis and check the gunas of a pair\n"
+        "• I help with rishtas, family, work and money\n"
+        "• I give daily guidance from the panchang and your stars\n"
         "Tell me what’s happening, and I’ll break it down step by step ✨"
     )
 
@@ -423,9 +423,18 @@ def _identity_reply(locale: str) -> str:
 # Sent byte-identical as the first message of every chat request, so DeepSeek serves it
 # from its prefix cache. Anything per-intent or per-user goes in later messages.
 _SYSTEM_PROMPT_BASE = (
-    "You are Shaadi Parrot 🦜: Indian-style dating coach + Vedic daily-fate assistant inside an app.\n"
+    "You are Mithu 🦜, the warm, witty Vedic astrologer parrot of Shaadi Parrot, an Indian matrimony and family "
+    "astrology app: kundli matching, rishtas, panchang and family life.\n"
+    "You help with marriage and rishta questions (with the family involved), kundli and gunas, married life, in-laws, "
+    "children, work, money and everyday life.\n"
     "Rules:\n"
-    "- Be warm, confident, practical, a bit playful.\n"
+    "- Be warm, confident, practical, a bit playful; respect Indian family values.\n"
+    "- Follow the user's life_stage and profileFor in USER_CONTEXT: single = finding a life partner (a rishta, families "
+    "involved); profileFor son/daughter/brother/sister/relative/friend = a parent or relative searching for that person, "
+    "so speak to them about that person; newly_married / married = harmony at home and with the in-laws; "
+    "married_kids = the family and the children. Never suggest casual dating or hook-ups.\n"
+    "- No fear: never predict death, illness, accidents, divorce or guaranteed outcomes; no paid pujas or remedies; "
+    "doshas are explained calmly with their cancellations.\n"
     "- Use 4–10 emojis TOTAL across the whole answer (not every line).\n"
     "- No markdown.\n"
     "- Use short headings + bullets using '•'.\n"
@@ -450,23 +459,23 @@ def _build_intent_prompt(locale: str, intent: str) -> str:
 
     if intent == Intent.MATCH:
         base += (
-            "Task: produce a FULL 'match breakdown' for two users (USER + MATCH).\n"
+            "Task: produce a FULL rishta breakdown for two people (USER + MATCH) who accepted each other's interest.\n"
             "Structure (short headings + bullets):\n"
-            "1) Quick vibe summary\n"
-            "2) Strengths (why it can work)\n"
-            "3) Friction points / red flags\n"
-            "4) Indian-style compatibility (fun but respectful): family vibe, lifestyle, values, routines\n"
-            "5) Vedic-style compatibility notes (based on provided ASTRO lines)\n"
+            "1) The short answer\n"
+            "2) Where they click (values, family, lifestyle, goals)\n"
+            "3) What to talk about early (expectations, family, career, city, children)\n"
+            "4) Families: how the two families may see this rishta, respectfully\n"
+            "5) Vedic notes (only from the provided ASTRO lines)\n"
             "6) Distance & logistics (based on distance_km)\n"
-            "7) Best conversation starters (3–8)\n"
-            "8) A 3-step first date plan\n"
-            "Finish with 1 verdict line: 'Worth it' or 'Proceed with caution' + 1 emoji.\n"
+            "7) Good first questions to ask each other (3–6)\n"
+            "8) A respectful next step (a call, then the families meet)\n"
+            "Finish with 1 verdict line: 'Worth taking forward' or 'Go slowly' + 1 emoji.\n"
             "Output target: 45–90 short bullet lines total.\n"
         )
     else:
         base += (
-            "- If asked for a message/reply: output 2–4 message options.\n"
-            "- If asked for profile/bio: give actionable edits + 1 sample bio.\n"
+            "- If asked for a message/reply: output 2–4 respectful message options (matrimony, families involved).\n"
+            "- If asked for profile/biodata: give actionable edits + 1 sample 'about me' for a matrimony biodata.\n"
             "- If asked for daily fate/horoscope: give a Vedic-style daily forecast + practical tips.\n"
         )
 
@@ -475,7 +484,7 @@ def _build_intent_prompt(locale: str, intent: str) -> str:
         elif intent == Intent.PROFILE:
             base += "Output target: 10–16 bullet lines + 1 short sample bio.\n"
         elif intent == Intent.ASTRO:
-            base += "Output target: 12–18 bullet lines with sections: Energy, Love, Work, Practical tips, Mantra.\n"
+            base += "Output target: 12–18 bullet lines with sections: Energy, Love & family, Work, Practical tips, Mantra.\n"
         else:
             base += "Output target: 9–15 short bullet lines.\n"
 
@@ -574,7 +583,7 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     if not profile:
         return ""
 
-    base_keys = ["firstName", "age", "gender", "lifeStage", "cityName", "countryName", "relationshipIntent", "languages"]
+    base_keys = ["firstName", "age", "gender", "lifeStage", "profileFor", "maritalStatus", "cityName", "countryName", "relationshipIntent", "languages"]
     texting_keys = base_keys + ["bio", "aboutMe", "interests", "workout", "smoking", "drinking"]
     profile_keys = base_keys + ["interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "bio", "aboutMe"]
     birth_keys = ["birthDate", "birthTime", "birthCityName", "birthStateName", "birthCountryName"]
@@ -1041,7 +1050,7 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24, state: Optiona
 # HISTORY_LIMIT messages are unsummarized, the oldest is about to leave the window, so they are
 # folded into the summary by a small parallel LLM call (no added latency for the user).
 _MEMORY_SYSTEM_PROMPT = (
-    "You maintain the long-term memory that Shaadi Parrot, a dating coach and Vedic astrology assistant, "
+    "You maintain the long-term memory that Mithu, the matrimony and family Vedic astrology assistant of Shaadi Parrot, "
     "keeps about ONE app user.\n"
     "Merge PREVIOUS MEMORY with NEW MESSAGES into one updated memory.\n"
     "Keep only durable, useful facts: the user's situation and goals, people they mention (names, relationship "
@@ -1431,8 +1440,9 @@ def _is_repeated_question(user_text: str, history: List[Dict[str, Any]]) -> bool
 
 
 def _family_context(uid: str) -> str:
-    """The family the user added in the app (users/{uid}/family): who they are and their Moon sign, so Mithu
-    can talk about 'your daughter' by name. Empty when there is none."""
+    """The family the user added in the app (users/{uid}/family): who they are, their age and Moon sign, so
+    Mithu can talk about 'your daughter' by name. Ages, not birth dates: the exact dates (children's too) don't
+    need to reach the LLM provider. Empty when there is none."""
     if firestore_client is None:
         return ""
     try:
@@ -1440,6 +1450,7 @@ def _family_context(uid: str) -> str:
     except Exception:
         logger.warning("family context read failed", exc_info=True)
         return ""
+    today = datetime.now(timezone.utc).date()
     parts = []
     for d in docs:
         m = d.to_dict() or {}
@@ -1448,11 +1459,14 @@ def _family_context(uid: str) -> str:
         if not name:
             continue
         bits = [rel] if rel else []
-        bd = str(m.get("birthDate") or "")
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", bd):
-            bits.append("born " + bd)
+        bd = fates_astro_chart._parse_date(m.get("birthDate"))
+        if bd:
+            y, mo, dd = bd
+            age = today.year - y - ((today.month, today.day) < (mo, dd))
+            if 0 <= age <= 120:
+                bits.append("a baby" if age == 0 else f"age {age}")
             try:
-                c = fates_astro_chart.chart_from_birth((int(bd[:4]), int(bd[5:7]), int(bd[8:10])), None, None)
+                c = fates_astro_chart.chart_from_birth(bd, None, None)
                 bits.append("Moon " + _ZODIAC[c["rashi"]])
             except Exception:
                 pass
@@ -1772,7 +1786,8 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         user_text=user_text,
         history=history,
         repeated_question=repeated_question,
-        family_ctx=_family_context(uid),
+        # The "who are you" reply is canned: no family read and no charts for it.
+        family_ctx="" if is_identity else _family_context(uid),
     )
 
     # Fold messages about to leave the prompt window into the memory, in parallel with the reply.

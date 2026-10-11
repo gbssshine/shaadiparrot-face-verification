@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY tools/fetch_models.py tools/fetch_models.py
 RUN python tools/fetch_models.py /app/models
 
-COPY main.py face_live.py face_match.py fates_api.py fates_engine.py fates_ai.py fates_astro.py fates_astro_chart.py fates_tests_catalog.json places.sqlite3 ./
+COPY main.py face_live.py face_match.py fates_api.py fates_engine.py fates_ai.py fates_astro.py fates_astro_chart.py astro_api.py astro_core.py astro_content.py fates_tests_catalog.json places.sqlite3 ./
 
 ENV PORT=8080
 EXPOSE 8080
