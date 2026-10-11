@@ -98,6 +98,10 @@ class VerifyFaceStartRequest(BaseModel):
 class VerifyFaceLiveRequest(BaseModel):
     challengeId: str            # from /verify-face-start
     selfies: List[str]          # one per challenge step, in order (the user's own Storage uploads)
+    # A profile made by a parent or relative: the person themself does the face check and agrees to the profile
+    # on the same screen ("I'm Arjun: I agree"). Recorded as their consent only when the check passes.
+    personConsent: bool = False
+    consentTextVersion: str = ""
 
 
 class VerifyPhotoRequest(BaseModel):
@@ -111,6 +115,8 @@ Role = Literal["user", "assistant"]
 class ChatTurn(BaseModel):
     role: Role
     text: str
+    # What a server-written message is: 'daily_horoscope', 'mithu_note'. None for a normal reply.
+    kind: Optional[str] = None
 
 
 class AiChatRequest(BaseModel):
@@ -119,6 +125,8 @@ class AiChatRequest(BaseModel):
     mode: Optional[str] = "shaadi_parrot"
     thread_id: Optional[str] = "default"
     history: Optional[List[ChatTurn]] = None  # ignored on server
+    # What the app can show (1.0.8+: ["actions"]). Without "actions" the birth hint stays a line of text.
+    caps: Optional[List[str]] = None
 
 
 class AiChatResponse(BaseModel):
@@ -126,6 +134,10 @@ class AiChatResponse(BaseModel):
     blocked: bool = False
     reason: Optional[str] = None
     thread_id: Optional[str] = None
+    # For apps that sent caps ["actions"]: buttons under the reply, e.g. [{"type": "add_birth_time", "label": ...}].
+    actions: Optional[List[Dict[str, str]]] = None
+    # 'birth_details' whenever the reply asks for the birth time or place (as a button or as the text line).
+    hint: Optional[str] = None
 
 
 class HistoryResponse(BaseModel):
@@ -318,6 +330,16 @@ def _parse_match_command(user_text: str) -> Optional[str]:
     return (m.group(1) or "").strip()
 
 
+# Hindi astro words, in Devanagari and in the Roman spellings families type ("Hinglish"). Only words an English
+# question wouldn't use, so English replies stay as they were.
+_HINDI_ASTRO_WORDS = [
+    "राशिफल", "राशि", "कुंडली", "कुण्डली", "नक्षत्र", "ज्योतिष", "ग्रह", "भविष्य", "पंचांग", "मुहूर्त",
+    "मांगलिक", "मंगल दोष", "गुण मिलान", "आज का दिन", "कल का दिन",
+    "rashifal", "kundali", "janam kundli", "jyotish", "bhavishya", "gun milan", "guna milan",
+    "aaj ka din", "kal ka din",
+]
+
+
 def _infer_intent(user_text: str) -> str:
     if _parse_match_command(user_text):
         return Intent.MATCH
@@ -328,7 +350,7 @@ def _infer_intent(user_text: str) -> str:
         "horoscope", "forecast", "daily fate", "vedic", "kundli", "nakshatra", "rashi",
         "tomorrow", "tmr", "zodiac", "moon sign",
         "гороскоп", "прогноз", "сегодня", "ведичес", "накшатр", "раши", "кундли", "совместим"
-    ]
+    ] + _HINDI_ASTRO_WORDS
     if any(w in t for w in astro_words):
         return Intent.ASTRO
 
@@ -356,7 +378,8 @@ def _recent_history_has_astro(history: List[Dict[str, str]], lookback: int = 5) 
 
     astro_markers = [
         "horoscope", "forecast", "daily fate", "vedic", "nakshatra", "rashi", "zodiac",
-        "гороскоп", "прогноз", "накшат", "раши", "астро"
+        "гороскоп", "прогноз", "накшат", "раши", "астро",
+        "राशि", "नक्षत्र", "कुंडली", "कुण्डली", "ज्योतिष", "rashifal", "kundali", "jyotish",
     ]
 
     tail = (history or [])[-max(1, lookback):]
@@ -435,6 +458,8 @@ _SYSTEM_PROMPT_BASE = (
     "married_kids = the family and the children. Never suggest casual dating or hook-ups.\n"
     "- No fear: never predict death, illness, accidents, divorce or guaranteed outcomes; no paid pujas or remedies; "
     "doshas are explained calmly with their cancellations.\n"
+    "- Respect every faith. Use the user's own festival names. If ASTRO_MODE is off, don't bring up astrology "
+    "unless asked.\n"
     "- Use 4–10 emojis TOTAL across the whole answer (not every line).\n"
     "- No markdown.\n"
     "- Use short headings + bullets using '•'.\n"
@@ -451,6 +476,13 @@ def _max_tokens_for_intent(intent: str) -> int:
         Intent.PROFILE: DS_MAX_TOKENS_PROFILE,
         Intent.ASTRO: DS_MAX_TOKENS_ASTRO,
     }.get(intent, DS_MAX_TOKENS_DEFAULT)
+
+
+# Families often write in Hindi: Mithu answers in the language and script of the question (English stays English).
+CHAT_LANGUAGE_RULE = (
+    "Reply in the language and script the user wrote in (Hindi in Devanagari if they wrote Hindi; never Roman "
+    "Hinglish unless they did). Mithu speaks of himself in the masculine."
+)
 
 
 def _build_intent_prompt(locale: str, intent: str) -> str:
@@ -491,7 +523,7 @@ def _build_intent_prompt(locale: str, intent: str) -> str:
     if lang.startswith("ru"):
         base += "Reply in Russian.\n"
     else:
-        base += "Reply in English.\n"
+        base += CHAT_LANGUAGE_RULE + "\n"
 
     return base
 
@@ -596,10 +628,12 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     elif intent == Intent.ASTRO:
         keys = astro_keys
     elif intent == Intent.MATCH:
+        # No birth details here: they are the other person's private data. The MATCH_ASTRO line (signs only,
+        # computed on the server) carries what the breakdown needs. birth_keys stay only in astro_keys (my own).
         keys = list(dict.fromkeys(base_keys + [
             "bio", "aboutMe", "interests", "tags", "workout", "smoking", "drinking",
             "education", "jobTitle", "occupation"
-        ] + birth_keys))
+        ]))
     else:
         keys = base_keys + ["interests"]
 
@@ -615,6 +649,74 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     if not parts:
         return ""
     return f"{prefix}_CONTEXT: " + " | ".join(parts)
+
+
+# =========================
+# READER, ASTRO MODE, TODAY'S OBSERVANCE (facts for the chat and the horoscope)
+# =========================
+# profileFor values of a profile made by a parent or relative for someone else.
+MANAGED_PROFILE_FOR = frozenset({"son", "daughter", "brother", "sister", "relative", "friend"})
+ASTRO_MODES = ("full", "fun", "off")
+# Faiths whose people are asked first ("Kundli, your way") and get the light 'fun' mode until they answer.
+_ASK_FIRST_FAITHS = frozenset({"muslim", "christian", "sikh", "parsi", "jewish", "buddhist", "spiritual"})
+
+
+def _faith_key(religion: Any) -> str:
+    """'Parsi / Zoroastrian' -> 'parsi', 'No religion / Spiritual' -> 'spiritual', 'Hindu' -> 'hindu'."""
+    r = str(religion or "").strip().lower()
+    if not r:
+        return ""
+    if "spiritual" in r or r.startswith("no religion"):
+        return "spiritual"
+    head = r.split("/")[0].split()
+    return head[0] if head else ""
+
+
+def _astro_mode(profile: Dict[str, Any]) -> str:
+    """users.astroMode when the user chose one; else 'fun' for ask-first faiths (by religion or the festivals they
+    celebrate) and 'full' for everyone else."""
+    mode = str(profile.get("astroMode") or "").strip().lower()
+    if mode in ASTRO_MODES:
+        return mode
+    celebrates = profile.get("celebrates")
+    faiths = {_faith_key(profile.get("religion"))}
+    if isinstance(celebrates, list):
+        faiths |= {str(c or "").strip().lower() for c in celebrates}
+    return "fun" if faiths & _ASK_FIRST_FAITHS else "full"
+
+
+def _is_managed(profile: Dict[str, Any]) -> bool:
+    return str(profile.get("profileFor") or "").strip().lower() in MANAGED_PROFILE_FOR
+
+
+def _first_name(profile: Dict[str, Any]) -> str:
+    return _flatten_value(profile.get("firstName") or profile.get("name"), max_len=40)
+
+
+def _reader_line(profile: Dict[str, Any]) -> str:
+    """Who reads the horoscope: the person themself, or the family that made the profile for them."""
+    if not _is_managed(profile):
+        return "READER: self"
+    return f"READER: family of {_first_name(profile) or 'this person'} (the profile was made by a parent or relative)"
+
+
+def _observance_text(observance: Optional[str]) -> str:
+    """Today's festival or fast for the user's own faith (the caller looks it up), or 'none'."""
+    return _trim_text(_normalize_text(observance or ""), 120) or "none"
+
+
+_ASTRO_MODE_NOTES = {
+    "full": "full",
+    "fun": "fun (keep it light, entertainment framing)",
+    "off": "off (no astrology unless the user asks)",
+}
+# In the horoscope the reader asked for the reading, so 'off' needs no note there.
+_HOROSCOPE_MODE_NOTES = {**_ASTRO_MODE_NOTES, "off": "off"}
+
+
+def _day_facts(profile: Dict[str, Any], observance: Optional[str] = None) -> str:
+    """The chat's per-user facts line: ASTRO_MODE and TODAY_OBSERVANCE."""
+    return f"ASTRO_MODE={_ASTRO_MODE_NOTES[_astro_mode(profile)]} | TODAY_OBSERVANCE={_observance_text(observance)}"
 
 
 # =========================
@@ -736,16 +838,23 @@ def _resolve_birth_place(profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+# "I don't know my birth time" answered with a part of the day (users.birthTimeApprox): the Moon is taken at that
+# hour instead of noon. It only sharpens the Moon; a Lagna still needs a real time.
+_APPROX_BIRTH_HOURS = {"morning": (9, 0), "afternoon": (14, 30), "evening": (19, 0), "night": (3, 0)}
+
+
 def _natal_chart(profile: Dict[str, Any], fallback_tz: str = HOROSCOPE_DEFAULT_TZ) -> Optional[Dict[str, Any]]:
-    """Sidereal (Lahiri) natal basics. Unknown birth time -> local noon and no lagna."""
+    """Sidereal (Lahiri) natal basics. Unknown birth time -> local noon (or the approximate part of the day the
+    user picked) and no lagna."""
     bd = _parse_birth_date(profile)
     if not bd:
         return None
     bt = _parse_birth_time(profile)
+    hour, minute = bt or _APPROX_BIRTH_HOURS.get(str(profile.get("birthTimeApprox") or "").strip().lower(), (12, 0))
     place = _resolve_birth_place(profile)
     tz = _zone(place.get("tz") if place else None, fallback=_zone(fallback_tz).key)
     try:
-        jd = _jd_ut(datetime(bd[0], bd[1], bd[2], bt[0] if bt else 12, bt[1] if bt else 0, tzinfo=tz))
+        jd = _jd_ut(datetime(bd[0], bd[1], bd[2], hour, minute, tzinfo=tz))
         sun_lon = _calc_sidereal_lon_ut(jd, swe.SUN)
         moon_lon = _calc_sidereal_lon_ut(jd, swe.MOON)
         lagna = None
@@ -999,7 +1108,7 @@ def _read_message_text(doc: Dict[str, Any]) -> str:
 
 
 def _load_chat_history(uid: str, thread_id: str, limit: int = 24, state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Oldest-first rows {role, content, ms}; pass `state` when the caller already loaded it."""
+    """Oldest-first rows {role, content, ms, kind?}; pass `state` when the caller already loaded it."""
     col = _chat_msgs_col_ref(uid, thread_id)
     if col is None:
         return []
@@ -1033,7 +1142,11 @@ def _load_chat_history(uid: str, thread_id: str, limit: int = 24, state: Optiona
             if role not in ("user", "assistant"):
                 continue
 
-            rows.append({"role": role, "content": text, "ms": ms})
+            row = {"role": role, "content": text, "ms": ms}
+            kind = d.get("kind")
+            if isinstance(kind, str) and kind.strip():
+                row["kind"] = kind.strip()[:40]     # 'daily_horoscope', 'mithu_note': /history passes it on
+            rows.append(row)
 
         rows.reverse()
         return rows
@@ -1114,15 +1227,23 @@ def _own_gcs_photo(gcs_uri: str, uid: str) -> bool:
 
 
 def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:
-    """A counter in serverRate/{uid} (no client can read or write that collection), per day or per minute."""
+    """A counter in serverRate/{uid} (no client can read or write that collection), per day or per minute.
+    Fails open: a Firestore hiccup must not take a feature down. For AI cost caps use _take_rate_strict."""
+    return _rate_counter(uid, key, limit, per, fail_open=True)
+
+
+def _take_rate_strict(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """The same counter, but it fails closed: no Firestore or any error means "no". For every AI cost cap
+    (a Firestore outage must not turn into unlimited model calls)."""
+    return _rate_counter(uid, key, limit, per, fail_open=False)
+
+
+def _rate_counter(uid: str, key: str, limit: int, per: str, fail_open: bool) -> bool:
     if firestore_client is None:
-        return True
-    from google.cloud import firestore as fs
-    ref = firestore_client.collection("serverRate").document(uid)
+        return fail_open
     now = datetime.now(timezone.utc)
     day = now.strftime("%Y-%m-%dT%H:%M") if per == "minute" else now.date().isoformat()
 
-    @fs.transactional
     def take(tx) -> bool:
         cur = (ref.get(transaction=tx).to_dict() or {}).get(key) or {}
         n = int(cur.get("n") or 0) if cur.get("day") == day else 0
@@ -1132,10 +1253,17 @@ def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:
         return True
 
     try:
-        return take(firestore_client.transaction())
+        ref = firestore_client.collection("serverRate").document(uid)
+        return _run_transaction(take)
     except Exception:
-        logger.exception("rate counter failed")
-        return True
+        logger.exception("rate counter failed (%s)", "open" if fail_open else "closed")
+        return fail_open
+
+
+def _run_transaction(work):
+    """Runs work(transaction) in a Firestore transaction (retried on contention) and returns its result."""
+    from google.cloud import firestore as fs
+    return fs.transactional(work)(firestore_client.transaction())
 
 
 @app.post("/verify-photo")
@@ -1485,6 +1613,7 @@ def _build_llm_messages(
     history: List[Dict[str, Any]],
     repeated_question: bool = False,
     family_ctx: str = "",
+    observance: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     # Most stable first, so consecutive requests share a cached prefix: global rules,
     # then this user's memory, then the per-intent instructions and facts.
@@ -1500,6 +1629,7 @@ def _build_llm_messages(
         msgs.append({"role": "system", "content": uctx})
     if family_ctx:
         msgs.append({"role": "system", "content": family_ctx})
+    msgs.append({"role": "system", "content": _day_facts(user_profile, observance)})
 
     if intent == Intent.ASTRO:
         ua = _compute_astro_short(user_profile, label="USER_ASTRO")
@@ -1571,36 +1701,63 @@ def _extract_reply_safe(txt: str) -> str:
     return txt
 
 
-def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any], intent: str, history: List[Dict[str, str]]) -> str:
-    text = (reply_text or "").strip()
-    if not text:
-        return text
+# Words that make a reply an astrology reading (English, Russian, Hindi in Devanagari and in Roman letters).
+_ASTROISH_REPLY_WORDS = [
+    "horoscope", "vedic", "nakshatra", "rashi", "moon", "venus", "cosmic",
+    "астро", "гороскоп", "накшатра", "раши", "венера", "луна",
+    "राशि", "नक्षत्र", "कुंडली", "कुण्डली", "ग्रह", "राशिफल", "चंद्र", "चन्द्र", "शुक्र", "ज्योतिष",
+    "rashifal", "kundali", "jyotish", "chandra", "shukra",
+]
 
-    if intent != Intent.ASTRO:
-        return text
+BIRTH_HINT = "birth_details"
+BIRTH_ACTION_EVERY_DAYS = 14        # the "Add my birth time" button: at most once per 14 days per chat
+
+
+def _missing_birth_detail(reply_text: str, user_profile: Dict[str, Any], intent: str) -> Optional[str]:
+    """'time' or 'place' when an astro reply would be more exact with that birth detail (the birth date is
+    known, the time or the place isn't); None when no hint applies."""
+    text = (reply_text or "").strip()
+    if not text or intent != Intent.ASTRO:
+        return None
 
     birth_date = (user_profile.get("birthDate") or "").strip() if isinstance(user_profile.get("birthDate"), str) else ""
     birth_time = (user_profile.get("birthTime") or "").strip() if isinstance(user_profile.get("birthTime"), str) else ""
     birth_place = str(user_profile.get("birthCityName") or "").strip()
-
-    has_birth_date = bool(birth_date)
-    missing_time_or_place = not birth_time or not birth_place
+    if not birth_date or (birth_time and birth_place):
+        return None
 
     lower = text.lower()
-    astroish = any(k in lower for k in [
-        "horoscope", "vedic", "nakshatra", "rashi", "moon", "venus", "cosmic",
-        "астро", "гороскоп", "накшатра", "раши", "венера", "луна"
-    ])
+    if not any(k in lower for k in _ASTROISH_REPLY_WORDS):
+        return None
+    return "time" if not birth_time else "place"
 
-    if astroish and has_birth_date and missing_time_or_place:
-        hint = (
-            "\n\nRemember, for a more precise reading next time, add your birth time and place in your profile 🪐"
-        )
-        prev_assistant = (_last_assistant_text(history) or "").lower()
-        if len(text) + len(hint) <= 6900 and "birth time and place" not in lower and "birth time and place" not in prev_assistant:
-            text += hint
+
+def _append_profile_hint_if_needed(reply_text: str, user_profile: Dict[str, Any], intent: str, history: List[Dict[str, str]]) -> str:
+    """Apps without caps ["actions"] (1.0.7): the birth hint as a line of text, which the app turns into a button
+    by its marker 'birth time and place'. Not twice in a row."""
+    text = (reply_text or "").strip()
+    if not _missing_birth_detail(text, user_profile, intent):
+        return text
+
+    hint = (
+        "\n\nRemember, for a more precise reading next time, add your birth time and place in your profile 🪐"
+    )
+    lower = text.lower()
+    prev_assistant = (_last_assistant_text(history) or "").lower()
+    if len(text) + len(hint) <= 6900 and "birth time and place" not in lower and "birth time and place" not in prev_assistant:
+        text += hint
 
     return text
+
+
+def _birth_actions(missing: str, state: Dict[str, Any], now: datetime) -> Optional[List[Dict[str, str]]]:
+    """Apps with caps ["actions"]: a button instead of the text line, at most once per BIRTH_ACTION_EVERY_DAYS per
+    chat (state asked.birth_time); None while that time hasn't passed."""
+    asked = _to_utc_datetime(((state or {}).get("asked") or {}).get("birth_time"))
+    if asked is not None and now - asked < timedelta(days=BIRTH_ACTION_EVERY_DAYS):
+        return None
+    label = "Add my birth time" if missing == "time" else "Add my birth place"
+    return [{"type": "add_birth_time", "label": label}]
 
 
 # =========================
@@ -1814,13 +1971,27 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
             if retry_text and not _looks_repetitive_reply(retry_text, history):
                 assistant_text = retry_text
 
-    assistant_text = _append_profile_hint_if_needed(assistant_text, user_profile, intent, history)
+    state_patch: Dict[str, Any] = {"turns": _to_int(state.get("turns")) + 1}
+
+    # The birth hint: a button for apps that can show one (caps "actions"), the old text line for 1.0.7.
+    actions: Optional[List[Dict[str, str]]] = None
+    hint: Optional[str] = None
+    missing = None if is_identity else _missing_birth_detail(assistant_text, user_profile, intent)
+    if missing and _wants_actions(body.caps):
+        actions = _birth_actions(missing, state, datetime.now(timezone.utc))
+        if actions:
+            hint = BIRTH_HINT
+            state_patch["asked"] = {"birth_time": _now_iso()}
+    elif missing:
+        with_hint = _append_profile_hint_if_needed(assistant_text, user_profile, intent, history)
+        if with_hint != assistant_text.strip():
+            hint = BIRTH_HINT
+        assistant_text = with_hint
 
     created_at_ms = _now_ms()
     created_at_iso = _now_iso()
     _save_chat_message_batch(uid, thread_id, user_text, assistant_text, created_at_iso, created_at_ms)
 
-    state_patch: Dict[str, Any] = {"turns": _to_int(state.get("turns")) + 1}
     if memory_job is not None:
         try:
             new_summary = memory_job.result(timeout=DS_TIMEOUT_SEC)
@@ -1835,7 +2006,12 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
             })
     _save_chat_state(uid, thread_id, state_patch)
 
-    return AiChatResponse(reply_text=assistant_text, blocked=False, reason=None, thread_id=thread_id)
+    return AiChatResponse(reply_text=assistant_text, blocked=False, reason=None, thread_id=thread_id,
+                          actions=actions, hint=hint)
+
+
+def _wants_actions(caps: Optional[List[str]]) -> bool:
+    return any(isinstance(c, str) and c.strip().lower() == "actions" for c in (caps or [])[:20])
 
 
 def _complete_reply(msgs: List[Dict[str, str]], max_tokens: int, kind: str) -> str:
@@ -1858,7 +2034,8 @@ def _is_mutual_match(uid: str, other_uid: str) -> bool:
 # =========================
 # HISTORY + RESET
 # =========================
-@app.get("/history", response_model=HistoryResponse)
+# exclude_none: a message without a kind looks exactly as before ({role, text}).
+@app.get("/history", response_model=HistoryResponse, response_model_exclude_none=True)
 def history_endpoint(thread_id: str = "default", authorization: Optional[str] = Header(default=None)):
     uid = _verify_firebase_token_or_401(authorization)
     tid = (thread_id or "default").strip() or "default"
@@ -1869,7 +2046,7 @@ def history_endpoint(thread_id: str = "default", authorization: Optional[str] = 
         role = (r.get("role") or "").strip()
         txt = _sanitize_legacy_history_text((r.get("content") or "").strip())
         if role in ("user", "assistant") and txt:
-            out.append(ChatTurn(role=role, text=txt))
+            out.append(ChatTurn(role=role, text=txt, kind=r.get("kind") or None))
 
     return HistoryResponse(thread_id=tid, messages=out)
 
@@ -1940,8 +2117,10 @@ _HOROSCOPE_SYSTEM_PROMPT = (
     "You are Mithu, the Shaadi Parrot 🦜, the warm Vedic astrology companion of an Indian app for kundli, family and rishta.\n"
     "Write today's personal daily horoscope (Jyotish) for ONE user, using only the facts provided.\n"
     "Format: plain text, no markdown, no asterisks.\n"
-    "Line 1: a short friendly greeting with the user's first name (if given) and today's weekday.\n"
-    "Then six sections. Each is a heading line followed by 1–2 lines that start with '• ':\n"
+    "Line 1: a short friendly greeting and today's weekday; with the user's first name (if given) when READER is "
+    "self, without any name when READER is family.\n"
+    "Line 2: 'Theme: ' followed by today's theme in at most 7 words.\n"
+    "Then five sections. Each is a heading line followed by 1–2 lines that start with '• ':\n"
     "🌙 Overall mood\n"
     "💞 Love & family (follow life_stage: single = meeting someone, rishta talks, honesty; relationship = the "
     "partner; married = the spouse and the in-laws; married_kids = the spouse and the children; none given = love "
@@ -1949,7 +2128,10 @@ _HOROSCOPE_SYSTEM_PROMPT = (
     "💼 Career & money\n"
     "🌿 Health & energy\n"
     "🎨 Lucky color & number (use exactly LUCKY_COLOR and LUCKY_NUMBER)\n"
-    "✨ Today's tip (one practical, specific action for today)\n"
+    "Then two short lists. Each is a heading line followed by exactly 2 lines that start with '• ', each line at "
+    "most 8 words:\n"
+    "✅ Do\n"
+    "⛔ Avoid (gentle everyday cautions, never fear)\n"
     "Last line: one gentle sentence that astrology is guidance to apply with discernment.\n"
     "Rules:\n"
     "- 180–250 words in total. Warm, encouraging, specific, easy to read.\n"
@@ -1958,6 +2140,11 @@ _HOROSCOPE_SYSTEM_PROMPT = (
     "- Emojis only at the start of the section headings, plus at most two elsewhere.\n"
     "- Never predict death, illness, accidents, breakups or guaranteed outcomes; no medical, legal or "
     "financial advice beyond everyday common sense.\n"
+    "- If READER is family, write about the person named in READER in the third person ('Ananya's day…'). "
+    "Greet the reader warmly without a name. Give tips the family can act on.\n"
+    "- If ASTRO_MODE is fun, keep it light: entertainment framing.\n"
+    "- Respect every faith. If TODAY_OBSERVANCE names a festival or fast, wish the reader for it once, by its own "
+    "name; if it is none, don't bring up festivals.\n"
     "- Never mention being an AI, prompts, or data fields.\n"
     "- English only.\n"
 )
@@ -1993,7 +2180,10 @@ def _daily_sky(now_local: datetime) -> Dict[str, Any]:
     }
 
 
-def _horoscope_facts(profile: Dict[str, Any], natal: Dict[str, Any], sky: Dict[str, Any]) -> str:
+def _horoscope_facts(profile: Dict[str, Any], natal: Dict[str, Any], sky: Dict[str, Any],
+                     observance: Optional[str] = None) -> str:
+    """The facts the reading is written from. `observance`: today's festival or fast for the reader's own faith
+    (looked up by the caller), else "none"."""
     house = (sky["moon_sign_idx"] - natal["moon_sign_idx"]) % 12 + 1
     tara_idx = ((sky["moon_nak_idx"] - natal["nakshatra_idx"]) % 27) % 9
     tara_name, tara_quality = _TARAS[tara_idx]
@@ -2018,6 +2208,9 @@ def _horoscope_facts(profile: Dict[str, Any], natal: Dict[str, Any], sky: Dict[s
 
     lines = [
         "USER: " + ("; ".join(user_bits) or "unknown"),
+        _reader_line(profile),
+        f"ASTRO_MODE: {_HOROSCOPE_MODE_NOTES[_astro_mode(profile)]}",
+        f"TODAY_OBSERVANCE: {_observance_text(observance)}",
         f"TODAY: {sky['weekday']}, {sky['date']}",
         f"WEEKDAY_LORD: {sky['lord']}",
         f"TITHI: {sky['tithi']}",
@@ -2073,7 +2266,26 @@ def _release_lease(name: str) -> None:
         logger.warning("lease release failed: %s", name, exc_info=True)
 
 
-def _store_daily_horoscope(uid: str, thread_id: str, day_key: str, tz_name: str, text: str) -> Tuple[str, bool]:
+HOROSCOPE_REGENS_PER_DAY = 2
+
+
+def _birth_sig(profile: Dict[str, Any]) -> str:
+    """A short signature of the birth details a reading is built on. When it changes the same day (the user
+    added their birth time, fixed the date, picked an approximate time), today's reading is written again."""
+    raw = "|".join(str(profile.get(k) or "") for k in ("birthDate", "birthTime", "birthCityName", "birthTimeApprox"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _horoscope_messages(profile: Dict[str, Any], natal: Dict[str, Any], sky: Dict[str, Any],
+                        observance: Optional[str] = None) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": _HOROSCOPE_SYSTEM_PROMPT},
+        {"role": "user", "content": _horoscope_facts(profile, natal, sky, observance)},
+    ]
+
+
+def _store_daily_horoscope(uid: str, thread_id: str, day_key: str, tz_name: str, text: str,
+                           birth_sig: str = "") -> Tuple[str, bool]:
     """Caches today's reading and adds it to the chat once. Returns (text, already_cached)."""
     cache_ref = _horoscope_ref(uid, day_key)
     ms = _now_ms()
@@ -2085,6 +2297,7 @@ def _store_daily_horoscope(uid: str, thread_id: str, day_key: str, tz_name: str,
     batch = firestore_client.batch()
     batch.create(cache_ref, {
         "uid": uid, "dayKey": day_key, "text": text, "tz": tz_name, "threadId": thread_id, "createdAtIso": iso,
+        "birthSig": birth_sig, "regenCount": 0,
     })
     batch.set(_chat_msgs_col_ref(uid, thread_id).document(msg_id), {
         "role": "assistant", "text": text, "createdAtIso": iso, "createdAtMs": ms,
@@ -2097,6 +2310,78 @@ def _store_daily_horoscope(uid: str, thread_id: str, day_key: str, tz_name: str,
     except google_exceptions.AlreadyExists:
         existing = cache_ref.get().to_dict() or {}
         return existing.get("text") or text, True
+
+
+def _store_regenerated_horoscope(uid: str, thread_id: str, day_key: str, sig: str, text: str) -> Tuple[str, bool]:
+    """One transaction: today's reading becomes the new text (a set, not create(): the doc exists) with the new
+    birth signature and regenCount + 1, plus one chat message flagged updated. Returns (text, written_now).
+    A reading another request already wrote for these birth details wins; past the daily limit nothing is written."""
+    ref = _horoscope_ref(uid, day_key)
+    ms = _now_ms()
+    iso = _now_iso()
+    msg_ref = _chat_msgs_col_ref(uid, thread_id).document(f"{ms}_a_{hashlib.md5(text.encode('utf-8')).hexdigest()[:8]}")
+    chat_ref = _chat_doc_ref(uid, thread_id)
+
+    def work(tx) -> Tuple[str, bool]:
+        cur = ref.get(transaction=tx).to_dict() or {}
+        if cur.get("text") and cur.get("birthSig") == sig:
+            return cur["text"], False
+        n = _to_int(cur.get("regenCount"))
+        if n >= HOROSCOPE_REGENS_PER_DAY:
+            return cur.get("text") or text, False
+        tx.set(ref, {"uid": uid, "dayKey": day_key, "text": text, "birthSig": sig, "regenCount": n + 1,
+                     "updatedAtIso": iso}, merge=True)
+        tx.set(msg_ref, {
+            "role": "assistant", "text": text, "createdAtIso": iso, "createdAtMs": ms,
+            "kind": "daily_horoscope", "dayKey": day_key, "updated": True,
+        })
+        tx.set(chat_ref, {"uid": uid, "threadId": thread_id, "updatedAtIso": iso, "updatedAtMs": ms}, merge=True)
+        return text, True
+
+    return _run_transaction(work)
+
+
+def _regenerate_daily_horoscope(uid: str, thread_id: str, day_key: str, tz: ZoneInfo, now_local: datetime,
+                                profile: Dict[str, Any], cached: Dict[str, Any], sig: str,
+                                observance: Optional[str] = None) -> Optional[Tuple[str, bool]]:
+    """Today's reading was written for other birth details: write it again, at most HOROSCOPE_REGENS_PER_DAY
+    times a day (regenCount on the doc and the horoscope_regen counter). Returns (text, written_now), or None
+    to keep serving the cached reading."""
+    if _to_int(cached.get("regenCount")) >= HOROSCOPE_REGENS_PER_DAY or not _parse_birth_date(profile):
+        return None
+    # The lease first: parallel taps wait for one rewrite instead of each spending the daily counter.
+    lease = f"horoscope_{uid}_{day_key}_{sig}"
+    if not _take_lease(lease, HOROSCOPE_LEASE_SEC):
+        for _ in range(24):
+            time.sleep(0.5)
+            try:
+                cur = _horoscope_ref(uid, day_key).get().to_dict() or {}
+            except Exception:
+                cur = {}
+            if cur.get("text") and cur.get("birthSig") == sig:
+                return cur["text"], False
+        return None
+    if not _take_rate(uid, "horoscope_regen", HOROSCOPE_REGENS_PER_DAY, "day"):
+        _release_lease(lease)
+        return None
+
+    natal = _natal_chart(profile, fallback_tz=tz.key)
+    text = ""
+    if natal:
+        try:
+            text = _complete_reply(_horoscope_messages(profile, natal, _daily_sky(now_local), observance),
+                                   HOROSCOPE_MAX_TOKENS, kind="horoscope_regen")
+        except Exception:
+            logger.exception("Daily horoscope regen failed uid=%s", uid)
+            text = ""
+    if not text or text == "…":
+        _release_lease(lease)
+        return None
+    try:
+        return _store_regenerated_horoscope(uid, thread_id, day_key, sig, text)
+    except Exception:
+        logger.exception("Daily horoscope regen store failed uid=%s", uid)
+        return text, True
 
 
 @app.post("/daily-horoscope", response_model=DailyHoroscopeResponse, response_model_exclude_none=True)
@@ -2118,7 +2403,17 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         logger.exception("Daily horoscope cache read failed uid=%s", uid)
         return unavailable
     if cached.get("text"):
-        return DailyHoroscopeResponse(ok=True, text=cached["text"], dayKey=day_key, cached=True)
+        served = DailyHoroscopeResponse(ok=True, text=cached["text"], dayKey=day_key, cached=True)
+        if not cached.get("birthSig"):
+            return served       # written before birth signatures existed: kept as it is for the rest of that day
+        profile = _merge_dicts_prefer_first(*_load_user_docs(uid))
+        sig = _birth_sig(profile)
+        if cached["birthSig"] == sig:
+            return served
+        fresh = _regenerate_daily_horoscope(uid, thread_id, day_key, tz, now_local, profile, cached, sig)
+        if not fresh:
+            return served
+        return DailyHoroscopeResponse(ok=True, text=fresh[0], dayKey=day_key, cached=not fresh[1])
 
     profile = _merge_dicts_prefer_first(*_load_user_docs(uid))
     if not _parse_birth_date(profile):
@@ -2144,11 +2439,8 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         return unavailable
 
     try:
-        msgs = [
-            {"role": "system", "content": _HOROSCOPE_SYSTEM_PROMPT},
-            {"role": "user", "content": _horoscope_facts(profile, natal, _daily_sky(now_local))},
-        ]
-        text = _complete_reply(msgs, HOROSCOPE_MAX_TOKENS, kind="horoscope")
+        text = _complete_reply(_horoscope_messages(profile, natal, _daily_sky(now_local)), HOROSCOPE_MAX_TOKENS,
+                               kind="horoscope")
     except Exception:
         logger.exception("Daily horoscope generation failed uid=%s", uid)
         _release_lease(lease)
@@ -2158,7 +2450,7 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         return unavailable
 
     try:
-        text, was_cached = _store_daily_horoscope(uid, thread_id, day_key, tz.key, text)
+        text, was_cached = _store_daily_horoscope(uid, thread_id, day_key, tz.key, text, birth_sig=_birth_sig(profile))
     except Exception:
         logger.exception("Daily horoscope store failed uid=%s", uid)
         was_cached = False
@@ -2326,10 +2618,21 @@ def _store_template(uid: str, vec: Any, status: str) -> None:
         logger.exception("face template write failed")
 
 
+PHOTOS_PRIVATE = "accepted"     # profiles.photoPrivacy: real photos only after acceptance, blurs on the card
+
+
 def _own_photos(uid: str) -> List[str]:
-    pub = (firestore_client.collection("publicProfiles").document(uid).get().to_dict() or {}) if firestore_client else {}
-    photos = [str(p) for p in (pub.get("photos") or []) if isinstance(p, str) and p.strip()][:6]
-    return [p for p in photos if face_live.own_photo_url(p, uid)]
+    """The user's real profile photos, which the face check compares with (first 6). While the photos are private
+    the card holds only blurs, so the links come from the profile; otherwise from the card. own_photo_url keeps
+    only the user's own Storage photos (never a blur, a variant or another host)."""
+    if firestore_client is None:
+        return []
+    refs = [firestore_client.collection(name).document(uid) for name in ("profiles", "publicProfiles")]
+    by_path = {snap.reference.path: (snap.to_dict() or {}) for snap in firestore_client.get_all(refs) if snap.exists}
+    profile, card = (by_path.get(ref.path, {}) for ref in refs)
+    source = profile if str(profile.get("photoPrivacy") or "").strip() == PHOTOS_PRIVATE else card
+    links = [p.strip() for p in (source.get("photos") or []) if isinstance(p, str) and p.strip()]
+    return [p for p in links if face_live.own_photo_url(p, uid)][:6]
 
 
 def _photo_faces(urls: List[str]) -> List[List[Any]]:
@@ -2387,28 +2690,48 @@ def _cohort_scores(uid: str, front: Any) -> List[float]:
     return [face_match.similarity(front, f) for f in _cohort(uid)]
 
 
+def _person_consent_fields(profile_for: Any, person_consent: bool, text_version: Any, status: str,
+                           now_iso: str) -> Optional[Dict[str, str]]:
+    """The person's own consent to a profile a parent or relative made for them, given on the face-check screen.
+    Recorded only for a passed check on a managed profile; None otherwise."""
+    if status != "ok" or not person_consent:
+        return None
+    if str(profile_for or "").strip().lower() not in MANAGED_PROFILE_FOR:
+        return None
+    return {
+        "personConsentAtIso": now_iso,
+        "personConsentVia": "face_check",
+        "personConsentTextVersion": re.sub(r"[^A-Za-z0-9_.-]", "", str(text_version or ""))[:40],
+    }
+
+
 def _save_face_result(uid: str, status: str, reason: str, photos: List[str], record: Dict[str, Any],
-                      review: Optional[Dict[str, Any]] = None) -> None:
+                      review: Optional[Dict[str, Any]] = None,
+                      person_consent: Optional[Dict[str, str]] = None) -> None:
     """status: "ok" (verified), "failed" or "in_review" (on hold: only the same face as a banned account).
     Verified first, looked at later: a pass that the server wasn't fully sure about is verified at once and
     carries `review` + needsLook, so the team can look in the web admin and remove it if it's wrong.
     profiles: the flags + which photos were checked (the app can't write these); publicProfiles: the badge;
     faceVerifications/{uid} (server only): the kept frame, the scores and what a reviewer needs.
-    One batch, so the badge and the private flags never disagree."""
+    One batch, so the badge and the private flags never disagree.
+    person_consent (a passed check on a managed profile, _person_consent_fields): the person's own consent goes on
+    profiles (server-only fields, never on the card) and is copied into faceVerifications/{uid}, in the same batch."""
     if firestore_client is None:
         return
     from google.cloud import firestore as fs
     ok = status == "ok"
     now = _now_iso()
+    consent = dict(person_consent or {}) if ok else {}
     try:
         batch = firestore_client.batch()
         batch.set(firestore_client.collection("profiles").document(uid), {
             "faceVerified": ok, "isFaceVerified": ok, "faceVerifiedReason": reason,
             "faceVerifiedAtIso": now, "faceVerifiedMethod": FACE_METHOD,
             "faceVerifiedPhotos": photos if ok else [],
+            **consent,
         }, merge=True)
         batch.set(firestore_client.collection("publicProfiles").document(uid), {"isFaceVerified": ok}, merge=True)
-        batch.set(_face_ref(uid), {**record, "status": status, "reason": reason, "updatedAtIso": now,
+        batch.set(_face_ref(uid), {**record, **consent, "status": status, "reason": reason, "updatedAtIso": now,
                                    "needsLook": bool(review),
                                    "review": ({"requestedAtIso": now, **review} if review else fs.DELETE_FIELD)}, merge=True)
         batch.commit()
@@ -2548,8 +2871,16 @@ def verify_face_live(body: VerifyFaceLiveRequest, authorization: Optional[str] =
     record.update({"frontSelfie": keep or "", "selfies": [keep] if keep else []})
     if front is not None:
         _store_template(uid, front, "verified" if status == "ok" else "pending")
+    person_consent = None
+    if status == "ok" and body.personConsent:
+        try:
+            profile_for = (firestore_client.collection("profiles").document(uid).get().to_dict() or {}).get("profileFor")
+            person_consent = _person_consent_fields(profile_for, True, body.consentTextVersion, status, _now_iso())
+        except Exception:
+            logger.exception("person consent: profile read failed")     # the check's result is still saved
     _save_face_result(uid, status, reason, record.get("photos") or [], record,
-                      {**review, "frontSelfie": keep, "photos": record.get("photos") or []} if review else None)
+                      {**review, "frontSelfie": keep, "photos": record.get("photos") or []} if review else None,
+                      person_consent=person_consent)
     _clean_selfies(uid, keep, bucket=(face_live.storage_object(urls[0]) or (None,))[0])
     return {"ok": status == "ok", "status": status, "reason": reason}
 
