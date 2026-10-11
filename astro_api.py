@@ -502,6 +502,11 @@ def chart(body: ChartReq, authorization: Optional[str] = Header(default=None)):
         place = None
     try:
         out = ac.birth_chart(date, time_, place)
+        # One Manglik status per chart (C3): the reading /match, /scores and Fates give, Jupiter's cancellation
+        # included (birth_chart reads Manglik without Jupiter), and the Mangal line rebuilt to go with it.
+        out["manglik"] = fates_astro.manglik_status(fates_astro.chart_from_birth(date, time_, place))
+        out["lines"] = ac.chart_lines(out["lagna"], out["moon"], out["sun"], out["dasha"], out["manglik"],
+                                      out["timeKnown"])
     except Exception:
         logger.exception("chart failed")
         raise HTTPException(status_code=503, detail="temporarily_unavailable")
