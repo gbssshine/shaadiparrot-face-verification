@@ -929,13 +929,51 @@ class _Ref:
         return _Snap(self.path, self.db.data.get(self.path))
 
     def set(self, data, merge=False):
-        self.db.data[self.path] = {**(self.db.data.get(self.path) or {}), **data} if merge else dict(data)
+        old = self.db.data.get(self.path) or {}
+        if merge is True:
+            self.db.data[self.path] = _deep_merge(old, data)                     # maps are merged field by field
+        elif merge:
+            self.db.data[self.path] = {**old, **{k: data[k] for k in merge}}     # the listed fields are replaced whole
+        else:
+            self.db.data[self.path] = dict(data)
 
     def update(self, data):
         self.db.data[self.path] = {**self.db.data[self.path], **data}
 
     def delete(self):
         self.db.data.pop(self.path, None)
+
+
+def _deep_merge(old, new):
+    out = dict(old)
+    for k, v in new.items():
+        out[k] = _deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+class _Tx:
+    """Enough of a Firestore transaction for @firestore.transactional: one attempt, its writes applied on commit."""
+    _read_only, _max_attempts, _id = False, 1, b"tx"
+
+    def __init__(self):
+        self.writes = []
+
+    def _clean_up(self):
+        self.writes = []
+
+    def _begin(self, retry_id=None):
+        pass
+
+    def _commit(self):
+        for ref, data, merge in self.writes:
+            ref.set(data, merge=merge)
+        self.writes = []
+
+    def _rollback(self):
+        self.writes = []
+
+    def set(self, ref, data, merge=False):
+        self.writes.append((ref, data, merge))
 
 
 class _Query:
@@ -972,6 +1010,9 @@ class FakeDb:
 
     def get_all(self, refs):
         return [r.get() for r in refs]
+
+    def transaction(self):
+        return _Tx()
 
 
 def _card(uid, **kw):
@@ -1081,12 +1122,116 @@ def test_a_day_made_in_the_other_mode_never_shows_its_unopened_people(api):
     ref = db.document("dailyFates/me__2026-10-11")
     untouched = {"mode": "quick", "order": ["heart", "home"], "openedCount": 0,
                  "paths": {"heart": {"targetUid": "a", "opened": False}, "home": {"targetUid": "b", "opened": False}}}
+
+    def reconcile(mode, key=TODAY):
+        return api._reconcile_mode(db, ref, ref.get().to_dict(), mode, db.data.get("fatesMemory/me") or {}, "me", key)
+
     ref.set(untouched)
-    assert api._reconcile_mode(ref, ref.get().to_dict(), "quick") == untouched          # same mode: as it is
-    assert api._reconcile_mode(ref, ref.get().to_dict(), "rishta") is None              # made again
+    assert reconcile("quick") == untouched                                               # same mode: as it is
+    assert reconcile("rishta") is None                                                   # made again
     assert "dailyFates/me__2026-10-11" not in db.data
+    assert db.data["fatesMemory/me"]["modeSwitch"] == {"day": TODAY, "n": 1}             # today's one remake is used
     legacy_day = {k: v for k, v in untouched.items() if k != "mode"}                     # stored before 1.0.8 = dating
     ref.set({**legacy_day, "openedCount": 1, "paths": {**untouched["paths"], "home": {"targetUid": "b", "opened": True}}})
-    kept = api._reconcile_mode(ref, ref.get().to_dict(), "rishta")
+    kept = reconcile("rishta")
     assert kept["order"] == ["home"] and set(kept["paths"]) == {"home"} and kept["mode"] == "rishta"
     assert db.data["dailyFates/me__2026-10-11"]["paths"].keys() == {"home"}
+    # After the one remake an untouched day is not made again: its unopened people go, an empty day in the new mode.
+    ref.set(untouched)
+    emptied = reconcile("rishta")
+    assert (emptied["paths"], emptied["order"], emptied["mode"]) == ({}, [], "rishta")
+    assert db.data["dailyFates/me__2026-10-11"]["paths"] == {} and db.data["fatesMemory/me"]["modeSwitch"]["n"] == 1
+    ref.set(untouched)
+    assert reconcile("rishta", key="2026-10-12") is None                                 # the next fate day has its own
+    assert db.data["fatesMemory/me"]["modeSwitch"] == {"day": "2026-10-12", "n": 1}
+
+
+def _api_for(api, monkeypatch, db, uid):
+    monkeypatch.setattr(api, "_deps", api.Deps(db=lambda: db, verify_uid=lambda h: uid,
+                                                complete=lambda *a, **k: ("{}", "stop"), resolve_place=lambda p: None,
+                                                is_premium=lambda *a: False))
+    monkeypatch.setattr(api, "day_key", lambda now=None: TODAY)
+    monkeypatch.setattr(api, "_stat", lambda *a, **k: None)
+
+
+def _flip(api, n):
+    """Asks for today's Fates n times, the modes alternating (rishta first)."""
+    out = []
+    for i in range(n):
+        body = api.TodayRequest(mode="rishta") if i % 2 == 0 else None
+        out.append(api.fates_today(body, authorization="Bearer x"))
+    return out
+
+
+def test_alternating_modes_remakes_the_day_at_most_once(api, monkeypatch):
+    """A profile that wants marriage may ask in both modes; flipping between them must not make day after day (each
+    reads the pool, blurs photos, may call the AI and spends other people's exposure): one remake a fate day."""
+    me = _card("me", gender="Male", lookingForGender="Female")
+    db = FakeDb(_people({"me": me}, {"me": SELF_GROOM}))
+    db.data["dailyFates/me__2026-10-11"] = {
+        "uid": "me", "dayKey": TODAY, "createdAtIso": api._now_iso(), "mode": "quick", "order": ["heart"], "openedCount": 0,
+        "paths": {"heart": {"targetUid": "quick0", "teaser": {}, "opened": False, "decision": None}}}
+    _api_for(api, monkeypatch, db, "me")
+    made = []
+
+    def generate(db_, viewer, memory, key, now_ms):
+        mode = "rishta" if viewer.rishta else "quick"
+        made.append(mode)
+        return {"uid": viewer.uid, "dayKey": key, "createdAtIso": api._now_iso(), "mode": mode, "order": ["heart"],
+                "openedCount": 0, "paths": {"heart": {"targetUid": f"{mode}{len(made)}", "teaser": {}, "opened": False}}}
+
+    def store(db_, doc, key):
+        db_.data.setdefault(f"dailyFates/{doc['uid']}__{key}", doc)
+        return db_.data[f"dailyFates/{doc['uid']}__{key}"]
+
+    monkeypatch.setattr(api, "generate", generate)
+    monkeypatch.setattr(api, "_store_generation", store)
+
+    views = _flip(api, 6)
+    assert made == ["rishta"]                                       # the first switch remakes the untouched day, once
+    assert [v["mode"] for v in views] == ["rishta", "quick"] * 3     # every answer is in the mode asked
+    assert len(views[0]["paths"]) == 1
+    assert all(v["paths"] == [] for v in views[1:])                  # then nobody unopened from the other mode
+    doc = db.data["dailyFates/me__2026-10-11"]
+    assert doc["paths"] == {} and doc["mode"] == "quick"
+    assert db.data["fatesMemory/me"]["modeSwitch"] == {"day": TODAY, "n": 1}
+
+
+def test_a_switch_keeps_opened_paths_without_a_remake(api, monkeypatch):
+    me = _card("me", gender="Male", lookingForGender="Female")
+    db = FakeDb(_people({"me": me}, {"me": SELF_GROOM}))
+    db.data["dailyFates/me__2026-10-11"] = {
+        "uid": "me", "dayKey": TODAY, "createdAtIso": api._now_iso(), "mode": "quick", "order": ["heart", "home"],
+        "openedCount": 1, "paths": {"heart": {"targetUid": "a", "teaser": {}, "opened": True, "report": {"r": 1}},
+                                    "home": {"targetUid": "b", "teaser": {}, "opened": False}}}
+    _api_for(api, monkeypatch, db, "me")
+    monkeypatch.setattr(api, "generate", lambda *a: pytest.fail("no remake when a path was opened"))
+    views = _flip(api, 4)
+    assert all([p["path"] for p in v["paths"]] == ["heart"] and v["paths"][0]["opened"] for v in views)
+    assert "modeSwitch" not in (db.data.get("fatesMemory/me") or {})   # today's remake is still there
+
+
+def test_the_verify_teaser_is_counted_once_a_day_per_mode(api, monkeypatch):
+    """Before verification only a count is shown; flipping modes must not count the pool again and again."""
+    me = _card("me", gender="Male", lookingForGender="Female")
+    db = FakeDb(_people({"me": me}, {"me": {**SELF_GROOM, "faceVerified": False}}))
+    db.data["fatesMemory/me"] = {"verifyTeaser": {"day": "2026-10-10", "n": {"quick": 9, "rishta": 9}}}   # yesterday
+    _api_for(api, monkeypatch, db, "me")
+    counted = []
+
+    def candidates(db_, viewer, now_ms, memory):
+        counted.append("rishta" if viewer.rishta else "quick")
+        return [object()] * (2 if viewer.rishta else 5)
+
+    monkeypatch.setattr(api, "_candidates", candidates)
+    views = _flip(api, 5)
+    assert counted == ["rishta", "quick"]                                        # once per mode, not on every flip
+    assert [(v["mode"], v["verifiedNearby"]) for v in views] == [("rishta", 2), ("quick", 5)] * 2 + [("rishta", 2)]
+    assert all(v["needsVerification"] and v["paths"] == [] for v in views)
+    assert db.data["fatesMemory/me"]["verifyTeaser"] == {"day": TODAY, "n": {"rishta": 2, "quick": 5}}
+    # A count stored before 1.0.8 (a plain number) is the dating count.
+    db.data["fatesMemory/me"]["verifyTeaser"] = {"day": TODAY, "n": 7}
+    assert api.fates_today(None, authorization="Bearer x")["verifiedNearby"] == 7
+    assert api.fates_today(api.TodayRequest(mode="rishta"), authorization="Bearer x")["verifiedNearby"] == 2
+    assert counted == ["rishta", "quick", "rishta"]
+    assert db.data["fatesMemory/me"]["verifyTeaser"] == {"day": TODAY, "n": {"quick": 7, "rishta": 2}}

@@ -262,6 +262,8 @@ def rishta_env(env):
 
     viewer("rohan", {**CONSENT, "profileFor": "self"})                          # wants marriage: rishta mode
     viewer("vikram", {**CONSENT, "profileFor": "self"})                         # the same, asks in both modes
+    viewer("arun", {**CONSENT, "profileFor": "self"})                           # flips between the modes all day
+    viewer("newbie", {**CONSENT, "profileFor": "self", "faceVerified": False})  # not verified yet, flips too
     viewer("dev", {"profileFor": "self"})                                        # a dating account
     viewer("sam", {"profileFor": "self"})                                        # asks for rishta without intent
     viewer("kid", {**CONSENT, "profileFor": "self", "birthDate": "2006-01-01"})  # a groom of 20
@@ -341,3 +343,45 @@ def test_a_mode_switch_never_shows_the_other_modes_unopened_people(rishta_env):
     assert rishta["mode"] == "rishta"
     doc, targets = _targets(rishta_env, v["uid"], rishta["dayKey"])
     assert doc["mode"] == "rishta" and targets <= {"priya", "kavya", "bothok"}
+
+
+def test_alternating_modes_remake_the_day_at_most_once(rishta_env, monkeypatch):
+    import fates_api
+    c, v, db = rishta_env["client"], rishta_env["v"]["arun"], rishta_env["db"]
+    made, real = [], fates_api.generate
+
+    def counting(db_, viewer, memory, key, now_ms):
+        made.append("rishta" if viewer.rishta else "quick")
+        return real(db_, viewer, memory, key, now_ms)
+
+    monkeypatch.setattr(fates_api, "generate", counting)
+    views = [c.post("/fates/today", json={"mode": "rishta"} if i % 2 == 0 else {}, headers=v["h"]).json() for i in range(5)]
+    assert made == ["rishta", "quick"]                                # the day, then one remake for the switch
+    assert [x["mode"] for x in views] == ["rishta", "quick", "rishta", "quick", "rishta"]
+    assert all(x["paths"] == [] for x in views[2:])                   # after that nobody unopened from the other mode
+    doc, targets = _targets(rishta_env, v["uid"], views[0]["dayKey"])
+    assert doc["mode"] == "rishta" and not targets
+    mem = db.document(f"fatesMemory/{v['uid']}").get().to_dict()
+    assert mem["modeSwitch"] == {"day": views[0]["dayKey"], "n": 1}
+
+
+def test_the_verify_teaser_counts_each_mode_once_a_day(rishta_env, monkeypatch):
+    import fates_api
+    c, v, db = rishta_env["client"], rishta_env["v"]["newbie"], rishta_env["db"]
+    day = fates_api.day_key()
+    mem_ref = db.document(f"fatesMemory/{v['uid']}")
+    mem_ref.set({"verifyTeaser": {"day": "2000-01-01", "n": {"quick": 99, "rishta": 99}}})    # another day's counts
+    counted, real = [], fates_api._candidates
+
+    def counting(db_, viewer, now_ms, memory):
+        counted.append("rishta" if viewer.rishta else "quick")
+        return real(db_, viewer, now_ms, memory)
+
+    monkeypatch.setattr(fates_api, "_candidates", counting)
+    views = [c.post("/fates/today", json={"mode": "rishta"} if i % 2 == 0 else {}, headers=v["h"]).json() for i in range(5)]
+    assert counted == ["rishta", "quick"]
+    assert all(x["needsVerification"] and x["paths"] == [] for x in views)
+    rishta_n, quick_n = views[0]["verifiedNearby"], views[1]["verifiedNearby"]
+    assert [x["verifiedNearby"] for x in views] == [rishta_n, quick_n, rishta_n, quick_n, rishta_n] and rishta_n != 99
+    assert mem_ref.get().to_dict()["verifyTeaser"] == {"day": day, "n": {"rishta": rishta_n, "quick": quick_n}}
+    assert not db.document(f"dailyFates/{v['uid']}__{day}").get().exists

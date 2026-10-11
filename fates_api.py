@@ -2,14 +2,16 @@
 
 Data (all server-only, the app talks to these endpoints and never reads the collections):
   dailyFates/{uid}__{dayKey}  today's paths: teasers, and for opened paths the report and verdict
-  fatesMemory/{uid}           who was shown when, streak, today's extra opens
+  fatesMemory/{uid}           who was shown when, streak, today's extra opens and per-day counters (aiCalls,
+                              modeSwitch, verifyTeaser)
   fateExposure/{dayKey}       how many people got each person as a fate today (fairness cap)
 Someone who accepted the viewer as a fate ("chose you") is brought into the viewer's own paths the
 next morning, one a day: that is the free way to meet them. Parrot+ or a crown shows them at once.
 A fate day starts at 07:30 IST, when the morning push goes out.
 Two modes (plan §2 C1): /today without a mode (1.0.7 apps send {}) is the dating Fates and brings only people in the
 quick pool; {mode: 'rishta'} (1.0.8, a profile that wants marriage) brings only rishta-pool people who fit both
-families' must-haves, with both kundlis and 18+ gunas on every path. A stored day keeps its `mode`.
+families' must-haves, with both kundlis and 18+ gunas on every path. A stored day keeps its `mode`; asked in the other
+mode, an untouched day is made again once a fate day, after that only its opened paths stay.
 """
 from __future__ import annotations
 
@@ -54,6 +56,9 @@ CHOOSER_MAX_BRINGS = 2
 # Fates and brings quick-pool people only; {mode: 'rishta'} brings rishta-pool people who fit both families' wishes.
 MODE_QUICK = "quick"
 MODE_RISHTA = "rishta"
+# An untouched day is made again for the other mode at most this often a fate day (fatesMemory.modeSwitch): a new day
+# reads the pool, blurs photos, may call the AI and spends other people's exposure, so flipping modes must not remake it.
+MODE_SWITCH_REMAKES = 1
 POOLS_CONFIG_TTL_SEC = 600
 _pools_config: Dict[str, Any] = {"at": 0.0, "quickMaleMinAge": fe.QUICK_MALE_MIN_AGE}
 
@@ -104,28 +109,36 @@ def _add_exposure(db, key: str, uids: List[str]) -> None:
             logger.warning("fates exposure write failed", exc_info=True)
 
 
-def _ai_allowed(db, uid: str, key: str) -> bool:
-    """Counts one AI call against today's cap; False once the cap is reached."""
-    if not AI_ENABLED:
-        return False
+def _today_n(memory: Dict[str, Any], field: str, key: str) -> int:
+    """Today's value of a per-day counter in fatesMemory, {day, n}; 0 when it was counted on another day."""
+    c = memory.get(field) or {}
+    return int(c.get("n") or 0) if isinstance(c, dict) and c.get("day") == key else 0
+
+
+def _take_today(db, uid: str, key: str, field: str, cap: int) -> bool:
+    """Counts one use of a per-day allowance in fatesMemory/{uid}.{field} ({day, n}) in a transaction; False once
+    today's cap is reached, or when the count can't be written (then nothing is spent)."""
     from google.cloud import firestore as fs
     ref = db.document(f"fatesMemory/{uid}")
 
     @fs.transactional
     def take(tx) -> bool:
-        mem = ref.get(transaction=tx).to_dict() or {}
-        calls = mem.get("aiCalls") or {}
-        n = int(calls.get("n") or 0) if calls.get("day") == key else 0
-        if n >= AI_DAILY_CAP:
+        n = _today_n(ref.get(transaction=tx).to_dict() or {}, field, key)
+        if n >= cap:
             return False
-        tx.set(ref, {"aiCalls": {"day": key, "n": n + 1}}, merge=True)
+        tx.set(ref, {field: {"day": key, "n": n + 1}}, merge=True)
         return True
 
     try:
         return take(db.transaction())
     except Exception:
-        logger.warning("fates ai cap check failed", exc_info=True)
+        logger.warning("fates %s count failed", field, exc_info=True)
         return False
+
+
+def _ai_allowed(db, uid: str, key: str) -> bool:
+    """Counts one AI call against today's cap; False once the cap is reached."""
+    return AI_ENABLED and _take_today(db, uid, key, "aiCalls", AI_DAILY_CAP)
 
 
 @dataclass
@@ -624,13 +637,17 @@ def viewer_block(mode: str, pub: Dict[str, Any], priv: Dict[str, Any], today: st
     return fe.quick_viewer_block(priv)
 
 
-def _reconcile_mode(ref, doc: Optional[Dict[str, Any]], mode: str) -> Optional[Dict[str, Any]]:
+def _reconcile_mode(db, ref, doc: Optional[Dict[str, Any]], mode: str, memory: Dict[str, Any], uid: str,
+                    key: str) -> Optional[Dict[str, Any]]:
     """A fate day belongs to one mode. When the app asks in the other one (an update during the day, a second phone),
-    nothing unopened from the old mode is shown: an untouched day is made again, otherwise only the opened paths stay."""
+    nothing unopened from the old mode is shown. An untouched day is made again (None), but only MODE_SWITCH_REMAKES
+    times a fate day; otherwise only the opened paths stay, which after that one remake may be none: an empty day in
+    the new mode, looked at again by the quiet-day re-check like any empty day."""
     if not doc or _doc_mode(doc) == mode:
         return doc
     opened = {k: v for k, v in (doc.get("paths") or {}).items() if (v or {}).get("opened")}
-    if not opened:
+    if not opened and _today_n(memory, "modeSwitch", key) < MODE_SWITCH_REMAKES \
+            and _take_today(db, uid, key, "modeSwitch", MODE_SWITCH_REMAKES):
         ref.delete()
         return None
     order = [p for p in doc.get("order", []) if p in opened]
@@ -661,7 +678,7 @@ def fates_today(body: Optional[TodayRequest] = Body(default=None), authorization
     if fe.VERIFIED_ONLY and not viewer.face_verified:
         return _verify_first(db, viewer, memory, key, now_ms, premium, accuracy, priv)
     ref = db.document(f"dailyFates/{uid}__{key}")
-    doc = _reconcile_mode(ref, ref.get().to_dict(), mode)
+    doc = _reconcile_mode(db, ref, ref.get().to_dict(), mode, memory, uid, key)
     if doc and not doc.get("order") and _older_than(doc.get("createdAtIso"), EMPTY_DAY_RECHECK_HOURS):
         # A quiet day is looked at again a few hours later: someone new may have joined since.
         ref.delete()
@@ -694,18 +711,31 @@ def _verify_reason(priv: Dict[str, Any]) -> str:
     return "" if reason in ("", "ok") else reason
 
 
+def _teaser_counts(teaser: Any, key: str) -> Dict[str, int]:
+    """Today's verify-teaser counts per mode from fatesMemory.verifyTeaser = {day, n: {quick, rishta}}; a plain number
+    is a count stored before 1.0.8, when only the dating Fates existed."""
+    if not isinstance(teaser, dict) or teaser.get("day") != key:
+        return {}
+    n = teaser.get("n")
+    if isinstance(n, dict):
+        return {m: int(v or 0) for m, v in n.items() if m in (MODE_QUICK, MODE_RISHTA)}
+    return {MODE_QUICK: int(n or 0)}
+
+
 def _verify_first(db, viewer: fe.Person, memory: Dict[str, Any], key: str, now_ms: int, premium: bool,
                   accuracy: Dict[str, Any], priv: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Daily Fates is for verified people only. Before that, only how many verified people near the
-    viewer Mithu could bring (counted once a day, no one is picked and nothing is stored as a fate)."""
-    teaser = memory.get("verifyTeaser") or {}
+    viewer Mithu could bring (counted once a day per mode, no one is picked and nothing is stored as a fate)."""
     mode = MODE_RISHTA if viewer.rishta else MODE_QUICK
-    if teaser.get("day") == key and (teaser.get("mode") or MODE_QUICK) == mode:
-        n = int(teaser.get("n") or 0)
+    counts = _teaser_counts(memory.get("verifyTeaser"), key)
+    if mode in counts:
+        n = counts[mode]
     else:
         n = len(_candidates(db, viewer, now_ms, memory))
         try:
-            db.document(f"fatesMemory/{viewer.uid}").set({"verifyTeaser": {"day": key, "n": n, "mode": mode}}, merge=True)
+            # The whole map is replaced, so another day's count of the other mode never stays.
+            db.document(f"fatesMemory/{viewer.uid}").set({"verifyTeaser": {"day": key, "n": {**counts, mode: n}}},
+                                                          merge=["verifyTeaser"])
         except Exception:
             logger.warning("fates verify teaser cache failed", exc_info=True)
     _stat(db, key, needsVerification=1)
