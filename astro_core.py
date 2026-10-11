@@ -1,4 +1,5 @@
-"""Panchang, birth charts, Vimshottari dashas, family day lines and good dates (muhurat guide).
+"""Panchang, birth charts, Vimshottari dashas, family day lines, the week ahead, big sky events (sign
+ingresses of Jupiter, Saturn and Rahu) and good dates (muhurat guide).
 
 Pure computation on Swiss Ephemeris, sidereal Lahiri, no I/O: astro_api.py serves it over HTTP.
 Times are local to the place asked for. Panchang rules follow the common North Indian practice:
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import swisseph as swe
 
+import fates_astro_chart
 from fates_astro import NAKSHATRAS, RASHIS, manglik_status
 
 swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
@@ -460,6 +462,16 @@ def upcoming(start: Date, days: int, lat: float, lon: float, tz_name: str, limit
 
 
 # ------------------------------------------------------------------ birth chart and dashas
+# "I don't know my birth time" answered with a part of the day (users/{uid}.birthTimeApprox): the Moon-only chart
+# is drawn for the middle of that part instead of noon. It never gives a Lagna, and the chart stays "approximate".
+APPROX_TIMES: Dict[str, Tuple[int, int]] = {"morning": (9, 0), "afternoon": (14, 30), "evening": (19, 0), "night": (3, 0)}
+
+
+def approx_time(key: Any) -> Optional[Tuple[int, int]]:
+    """The clock time a birthTimeApprox answer stands for, or None for anything else."""
+    return APPROX_TIMES.get(str(key or "").strip().lower())
+
+
 def birth_moment(date: Tuple[int, int, int], time: Optional[Tuple[int, int]], place: Optional[Dict[str, Any]]) -> datetime:
     tz = zone(place.get("tz") if place else None)
     h, mi = time if time else (12, 0)
@@ -530,8 +542,10 @@ RASHI_NATURE = [
 
 
 def birth_chart(date: Tuple[int, int, int], time: Optional[Tuple[int, int]], place: Optional[Dict[str, Any]],
-                now: Optional[datetime] = None) -> Dict[str, Any]:
-    born = birth_moment(date, time, place)
+                now: Optional[datetime] = None, approx: Optional[str] = None) -> Dict[str, Any]:
+    """approx: users/{uid}.birthTimeApprox, used only when time is None (see APPROX_TIMES)."""
+    approx_t = None if time else approx_time(approx)
+    born = birth_moment(date, time or approx_t, place)
     jd = jd_of(born)
     planets = []
     for code, name, body in PLANETS:
@@ -559,29 +573,59 @@ def birth_chart(date: Tuple[int, int, int], time: Optional[Tuple[int, int]], pla
     mang = manglik_status(chart_like)
     now = now or datetime.now(timezone.utc)
     ds = dashas(moon["lon"], born, now)
-    precision = "exact" if lagna is not None else ("time" if time else "date")
+    precision = "exact" if lagna is not None else ("time" if time else ("approximate" if approx_t else "date"))
     # Without a time the Moon may sit up to ~6.5 deg away: its nakshatra (and so the dasha dates) can shift.
     moon_sure = True
+    options: Optional[List[List[int]]] = None
     if not time:
         tz = born.tzinfo
         lo = sid(jd_of(datetime(date[0], date[1], date[2], 0, 0, tzinfo=tz)), swe.MOON)
         hi = sid(jd_of(datetime(date[0], date[1], date[2], 23, 59, tzinfo=tz)), swe.MOON)
         moon_sure = int(lo // NAK_SPAN) == int(hi // NAK_SPAN)
-    return {
+        options = moon_options(date, place, (moon["rashi"], moon["nak"]))
+    moon_out: Dict[str, Any] = {
+        "rashi": moon["rashi"], "rashiName": RASHIS[moon["rashi"]][0], "rashiEnglish": RASHIS[moon["rashi"]][1],
+        "nakshatra": NAKSHATRAS[moon["nak"]][0], "nak": moon["nak"],
+        "pada": int((moon["lon"] % NAK_SPAN) // (NAK_SPAN / 4)) + 1, "sure": moon_sure,
+        "vh": moon_half(moon["rashi"], moon["lon"]),
+    }
+    if options is not None:
+        moon_out["options"] = options
+    out = {
         "precision": precision, "timeKnown": time is not None, "lagna": lagna,
         "lagnaName": RASHIS[lagna][0] if lagna is not None else None,
         "lagnaEnglish": RASHIS[lagna][1] if lagna is not None else None,
         "basis": "lagna" if lagna is not None else "moon",
         "planets": planets,
-        "moon": {"rashi": moon["rashi"], "rashiName": RASHIS[moon["rashi"]][0], "rashiEnglish": RASHIS[moon["rashi"]][1],
-                 "nakshatra": NAKSHATRAS[moon["nak"]][0], "nak": moon["nak"],
-                 "pada": int((moon["lon"] % NAK_SPAN) // (NAK_SPAN / 4)) + 1, "sure": moon_sure},
+        "moon": moon_out,
         "sun": {"rashi": planets[0]["rashi"], "rashiName": RASHIS[planets[0]["rashi"]][0], "rashiEnglish": RASHIS[planets[0]["rashi"]][1]},
         "manglik": mang,
         "dasha": ds,
         "dashaApproximate": not time,
         "lines": chart_lines(lagna, moon, planets[0], ds, mang, time is not None),
+        "transits": transits(moon["rashi"], now, sure=len({o[0] for o in options or [[moon["rashi"]]]}) == 1),
     }
+    if approx_t:
+        out["timeApprox"] = str(approx).strip().lower()
+    return out
+
+
+def moon_options(date: Tuple[int, int, int], place: Optional[Dict[str, Any]], own: Tuple[int, int]) -> List[List[int]]:
+    """Every (rashi, nakshatra) the Moon takes on a birth day without a known time, the chart's own Moon first.
+    The same scan as fates_astro_chart.chart_from_birth, so the app, the match and the site agree."""
+    out = [[own[0], own[1]]]
+    for r, n in fates_astro_chart.chart_from_birth(date, None, place)["options"]:
+        if [r, n] not in out:
+            out.append([r, n])
+    return out
+
+
+def moon_half(rashi: int, lon: float) -> Optional[int]:
+    """Which half of Dhanu or Makara the Moon is in (0 = first 15 degrees, 1 = the rest): Vashya splits those two
+    signs. None for every other sign."""
+    if rashi not in (8, 9):
+        return None
+    return 0 if (lon % 30.0) < 15.0 else 1
 
 
 def _month_year(iso: str) -> str:
@@ -669,11 +713,282 @@ def day_line(name: str, relation: str, natal_rashi: int, natal_nak: int, today_r
     return {"text": text, "tone": "good" if good else ("gentle" if hard else "steady"), "house": house, "tara": tara}
 
 
+# ------------------------------------------------------------------ the week ahead
+# Chandra gochara themes: the Moon counted from the birth Moon sign (the same table the daily horoscope uses).
+HOUSE_THEMES = {
+    1: "mood, self-care and fresh starts",
+    2: "money, family and how you speak",
+    3: "courage, messages and initiative",
+    4: "home, comfort and inner peace",
+    5: "romance, creativity and fun",
+    6: "work routines, health habits and small hurdles",
+    7: "partnerships and one-to-one connections",
+    8: "a sensitive day (Chandrashtama): patience and caution",
+    9: "luck, blessings and learning",
+    10: "career, visibility and duty",
+    11: "gains, friends and wishes coming true",
+    12: "rest, spending and letting go",
+}
+
+# One second-person line per house for the reader's own week. A hard day is "sensitive" or "quiet", never "bad".
+SELF_LINES = {
+    1: "A personal day for you: good for self-care and fresh starts.",
+    2: "Family talk, good food and money matters go well for you.",
+    3: "You have extra courage: good for calls, messages and taking the first step.",
+    4: "You'll want home comforts: keep the evening calm and close to family.",
+    5: "A light, creative day for you: good for romance, hobbies and fun.",
+    6: "You get things done: good for routines, health habits and pending work.",
+    7: "You connect easily with people: good for meeting someone or a long talk.",
+    8: "A sensitive day for you: go slow, be patient and plan an early night.",
+    9: "A lucky day for you: blessings from elders, learning and good news.",
+    10: "You shine at work: a good day to be seen and to finish duties.",
+    11: "Friends bring you gains and good news; wishes come closer.",
+    12: "A day for you to rest: go easy on spending and let old worries go.",
+}
+
+# Best days of the week by the Moon's house from the birth Moon: (key, houses, quiet). Two days at most each.
+BEST_RULES = (("love", frozenset({5, 7, 9, 11}), False),
+              ("work", frozenset({3, 6, 10, 11}), False),
+              ("quiet", frozenset({4, 8, 12}), True))
+BEST_MAX = 2
+
+
+def week_tone(house: int, tara: int) -> str:
+    """The day_line rule, plus the 8th house from the birth Moon (Chandrashtama), which is always a gentle day."""
+    if house == 8:
+        return "gentle"
+    if house in HOUSE_GOOD and tara not in TARA_HARD:
+        return "good"
+    if house in HOUSE_HARD and tara in TARA_HARD:
+        return "gentle"
+    return "steady"
+
+
+def _tithi_label(n: int) -> str:
+    name, paksha = tithi_name(n)
+    return name if n in (15, 30) else f"{paksha} {name}"
+
+
+def week_days(natal_rashi: int, natal_nak: int, monday: Date, lat: float, lon: float, tz: str,
+              name: Optional[str] = None, relation: str = "") -> List[Dict[str, Any]]:
+    """Seven days from monday: the Moon at sunrise + 6 h against the birth Moon gives the house, the tara and the
+    tone. The line is the reader's own (SELF_LINES) or, for a profile made for someone else (name given), the
+    family line with that name. The day's tithi is the one running at sunrise."""
+    tzz = zone(tz)
+    la, lo = round(float(lat), 3), round(float(lon), 3)
+    group = RELATION_GROUP.get((relation or "").strip().lower(), "any")
+    who = (name or "").strip()[:30]
+    out: List[Dict[str, Any]] = []
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        f = _day_frame(d.year, d.month, d.day, la, lo, tzz.key)
+        ml = moon_lon(f["sunrise"] + 0.25)
+        rashi, nak = int(ml // 30.0) % 12, int(ml // NAK_SPAN) % 27
+        house = (rashi - natal_rashi) % 12 + 1
+        tara = ((nak - natal_nak) % 27) % 9 + 1
+        if who:
+            t = LINES[house]
+            line = (t.get(group) or t["any"]).format(n=who)
+        else:
+            line = SELF_LINES[house]
+        out.append({"date": d.isoformat(), "weekday": WEEKDAYS[d.weekday()], "house": house, "tara": tara,
+                    "tone": week_tone(house, tara), "line": line, "tithi": _tithi_label(tithi_at(f["sunrise"])),
+                    "moonSign": RASHIS[rashi][0]})
+    return out
+
+
+def best_days(days: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """{love, work, quiet}: up to two dates each. Love and work skip gentle days and take good days first; quiet
+    days take the gentlest first. Each list is in date order."""
+    rank = {"good": 0, "steady": 1, "gentle": 2}
+    out: Dict[str, List[str]] = {}
+    for key, houses, quiet in BEST_RULES:
+        pool = [d for d in days if d["house"] in houses and (quiet or d["tone"] != "gentle")]
+        pool.sort(key=lambda d: ((-rank[d["tone"]]) if quiet else rank[d["tone"]], d["date"]))
+        out[key] = sorted(d["date"] for d in pool[:BEST_MAX])
+    return out
+
+
+# ------------------------------------------------------------------ big sky events (Jupiter, Saturn, Rahu)
+IST = ZoneInfo("Asia/Kolkata")
+SKY_BODIES = (("Jupiter", swe.JUPITER), ("Saturn", swe.SATURN), ("Rahu", swe.MEAN_NODE))
+SKY_DAYS = 450
+
+
+def _sign_at(jd: float, body: int) -> int:
+    return int(sid(jd, body) // 30.0) % 12
+
+
+def _crossing(body: int, lo: float, hi: float, sign_lo: int) -> float:
+    """The moment between lo and hi (a day apart) when body leaves sign_lo, to about a second."""
+    for _ in range(28):
+        mid = (lo + hi) / 2
+        if _sign_at(mid, body) == sign_lo:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def _ingress(planet: str, frm: int, to: int, jd: float) -> Dict[str, Any]:
+    at = moment_of(jd, IST)
+    # Jupiter and Saturn going back a sign are retrograde; the mean Rahu always moves back through the signs.
+    back = (frm - to) % 12 == 1
+    return {"planet": planet, "sign": to, "signName": RASHIS[to][0], "signEnglish": RASHIS[to][1], "from": frm,
+            "date": at.date().isoformat(), "atIso": at.isoformat(timespec="minutes"),
+            "retro": back and planet != "Rahu"}
+
+
+@lru_cache(maxsize=32)
+def _ingress_scan(start_ord: int, days: int) -> Tuple[Dict[str, Any], ...]:
+    start = Date.fromordinal(start_ord)
+    jd0 = jd_of(datetime(start.year, start.month, start.day, tzinfo=IST))
+    found: List[Dict[str, Any]] = []
+    for planet, body in SKY_BODIES:
+        prev = _sign_at(jd0, body)
+        for i in range(1, days + 1):
+            s = _sign_at(jd0 + i, body)
+            if s != prev:
+                found.append(_ingress(planet, prev, s, _crossing(body, jd0 + i - 1, jd0 + i, prev)))
+                prev = s
+    found.sort(key=lambda e: e["atIso"])
+    return tuple(found)
+
+
+def sky_events(start: Date, days: int = SKY_DAYS) -> List[Dict[str, Any]]:
+    """Sign ingresses of Jupiter, Saturn and the mean Rahu from start (IST midnight) for days, by time."""
+    return [dict(e) for e in _ingress_scan(start.toordinal(), int(days))]
+
+
+def _today_ist() -> Date:
+    return datetime.now(IST).date()
+
+
+# Scanned once at import for the next 450 days (a few thousand ephemeris calls, well under a second).
+SKY_EVENTS_START = _today_ist()
+SKY_EVENTS: List[Dict[str, Any]] = sky_events(SKY_EVENTS_START, SKY_DAYS)
+
+
+def sky_events_between(first: Date, last: Date) -> List[Dict[str, Any]]:
+    """Ingresses dated (IST) first..last, both included: from SKY_EVENTS when it covers the range."""
+    if SKY_EVENTS_START <= first and last < SKY_EVENTS_START + timedelta(days=SKY_DAYS):
+        pool = SKY_EVENTS
+    else:
+        pool = sky_events(first, (last - first).days + 2)
+    a, b = first.isoformat(), last.isoformat()
+    return [dict(e) for e in pool if a <= e["date"] <= b]
+
+
+def ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+# Positive themes for a big planet arriving in a house counted from the birth Moon (never fear, never "dosha").
+SKY_HOUSE_THEMES = {
+    1: "you, your health and fresh starts",
+    2: "family, savings and kind words",
+    3: "courage, siblings and short trips",
+    4: "home, mother and peace of mind",
+    5: "love, children and creativity",
+    6: "work routines and good health habits",
+    7: "marriage and partnerships",
+    8: "shared money and inner growth",
+    9: "luck, elders' blessings and learning",
+    10: "career and standing",
+    11: "gains, friends and wishes",
+    12: "rest, travel and letting go",
+}
+SKY_PLANET_LINES = {
+    "Jupiter": "a warm year for {theme} begins",
+    "Saturn": "slow, steady effort on {theme} pays off",
+    "Rahu": "a time of fresh ideas around {theme} begins",
+}
+
+
+def sky_line(event: Dict[str, Any], natal_rashi: Optional[int], name: Optional[str] = None) -> str:
+    """'Jupiter moves into Simha, your 5th house from the Moon: a warm year for love, children and creativity
+    begins.' name: the person a managed profile is for ("Ananya's 5th house"). Without a birth Moon only the move."""
+    head = f"{event['planet']} moves into {event['signName']}"
+    if natal_rashi is None:
+        return f"{head} ({event['signEnglish']})."
+    house = (event["sign"] - natal_rashi) % 12 + 1
+    theme = SKY_PLANET_LINES[event["planet"]].format(theme=SKY_HOUSE_THEMES[house])
+    whose = f"{name.strip()}'s" if name and name.strip() else "your"
+    return f"{head}, {whose} {ordinal(house)} house from the Moon: {theme}."
+
+
+# ------------------------------------------------------------------ transits for the chart
+SADE_SATI_PHASE = {12: 1, 1: 2, 2: 3}   # Saturn's sign counted from the birth Moon sign -> phase
+
+
+@lru_cache(maxsize=64)
+def _final_exit(body: int, sign: int, start_ord: int, horizon: int = 1200) -> Optional[float]:
+    """When body leaves sign for the last time within horizon days of start (retrograde returns included)."""
+    start = Date.fromordinal(start_ord)
+    jd0 = jd_of(datetime(start.year, start.month, start.day, tzinfo=IST))
+    last_in = None
+    for i in range(horizon + 1):
+        if _sign_at(jd0 + i, body) == sign:
+            last_in = i
+    if last_in is None or last_in == horizon:
+        return None
+    return _crossing(body, jd0 + last_in, jd0 + last_in + 1, sign)
+
+
+def _short_date(d: Date) -> str:
+    return f"{d.day} {d:%b %Y}"
+
+
+def transits(natal_rashi: int, now: Optional[datetime] = None, sure: bool = True) -> List[Dict[str, Any]]:
+    """Sade Sati (Saturn in the 12th, 1st or 2nd sign from the birth Moon: phases 1-3, until Saturn leaves that
+    sign for good) and the next Jupiter ingress with its house from the birth Moon. sure=False: the birth Moon
+    sign itself is not certain (no birth time)."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    out: List[Dict[str, Any]] = []
+    try:
+        jd = jd_of(now)
+        sat = _sign_at(jd, swe.SATURN)
+        phase = SADE_SATI_PHASE.get((sat - natal_rashi) % 12 + 1)
+        if phase:
+            item: Dict[str, Any] = {"kind": "sade_sati", "title": f"Sade Sati · phase {phase} of 3", "phase": phase,
+                                    "text": "Slow, steady years: effort pays.", "sign": sat, "signName": RASHIS[sat][0]}
+            exit_jd = _final_exit(swe.SATURN, sat, now.astimezone(IST).date().toordinal())
+            if exit_jd is not None:
+                item["until"] = moment_of(exit_jd, IST).date().isoformat()
+            if not sure:
+                item["approximate"] = True
+            out.append(item)
+        today = now.astimezone(IST).date()
+        stamp = now.astimezone(IST).isoformat(timespec="minutes")
+        nxt = next((e for e in sky_events_between(today, today + timedelta(days=SKY_DAYS - 1))
+                    if e["planet"] == "Jupiter" and e["atIso"] > stamp), None)
+        if nxt:
+            house = (nxt["sign"] - natal_rashi) % 12 + 1
+            when = Date.fromisoformat(nxt["date"])
+            item = {"kind": "jupiter", "title": f"Jupiter moves into {nxt['signName']} · {_short_date(when)}",
+                    "date": nxt["date"], "house": house, "sign": nxt["sign"], "signName": nxt["signName"],
+                    "text": f"Your {ordinal(house)} house from the Moon: "
+                            f"{SKY_PLANET_LINES['Jupiter'].format(theme=SKY_HOUSE_THEMES[house])}."}
+            if not sure:
+                item["approximate"] = True
+            out.append(item)
+    except Exception:   # a transit must never cost the chart
+        return out
+    return out
+
+
 # ------------------------------------------------------------------ good dates (muhurat guide)
 EVENTS: Dict[str, Dict[str, Any]] = {
     "wedding": {"title": "Wedding", "naks": {3, 4, 9, 11, 12, 14, 16, 18, 20, 25, 26},
                 "tithis": {2, 3, 5, 7, 10, 11, 12, 13, 16, 17, 18, 20, 22, 25},
                 "days": {0, 2, 3, 4}, "season": True, "planets": True},
+    # Roka / sagai: the wedding's nakshatras, tithis and weekdays, and its season; no Venus/Jupiter check
+    # (the conservative choice from the content design; needs the owner's or a pandit's sign-off).
+    "engagement": {"title": "Roka / engagement", "naks": {3, 4, 9, 11, 12, 14, 16, 18, 20, 25, 26},
+                   "tithis": {2, 3, 5, 7, 10, 11, 12, 13, 16, 17, 18, 20, 22, 25},
+                   "days": {0, 2, 3, 4}, "season": True, "planets": False},
     "griha_pravesh": {"title": "Griha pravesh (housewarming)", "naks": {3, 4, 11, 13, 16, 20, 22, 23, 25, 26},
                       "tithis": {2, 3, 5, 7, 10, 11, 12, 13, 17, 18, 20, 22},
                       "days": {0, 2, 3, 4, 5}, "season": True, "planets": False},
@@ -779,8 +1094,15 @@ def _blocked(jd: float, ev: Dict[str, Any], b: Optional[Dict[str, Any]] = None) 
         for body, name, orb in ((swe.VENUS, "Venus", 10.0), (swe.JUPITER, "Jupiter", 11.0)):
             d = abs((sid(jd, body) - sun + 180.0) % 360.0 - 180.0)
             if d < orb:
-                return f"{name} is combust (too close to the Sun)"
+                return f"{name} is too close to the Sun (combust): families traditionally skip these weeks"
     return None
+
+
+SEASON_BLOCKS = ("Kharmas", "Adhik maas", "Chaturmas")
+
+
+def _is_season_block(reason: Optional[str]) -> bool:
+    return bool(reason) and reason.startswith(SEASON_BLOCKS)
 
 
 def _pieces(rise: float, next_rise: float, b: Optional[Dict[str, Any]]) -> List[Tuple[float, float, int, int]]:
@@ -844,6 +1166,7 @@ def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_nam
                            jd_of(datetime(last.year, last.month, last.day, tzinfo=tz)) + 1.5)
     found: List[Dict[str, Any]] = []
     blocked_note: Optional[str] = None
+    season_note: Optional[str] = None
     for i in range(days):
         d = start + timedelta(days=i)
         if d.weekday() not in ev["days"]:
@@ -855,6 +1178,8 @@ def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_nam
         why_block = _blocked(f["sunrise"], ev, bounds)
         if why_block:
             blocked_note = blocked_note or why_block
+            if season_note is None and _is_season_block(why_block):
+                season_note = why_block
             continue
         w0, w1, tns, nks = max(wins, key=lambda w: w[1] - w[0])
         reasons = [_and([NAKSHATRAS[n][0] for n in nks]) + (" nakshatra" if len(nks) == 1 else " nakshatras"),
@@ -880,6 +1205,7 @@ def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_nam
         # Dated by the calendar day the window starts on, the way muhurat lists print it.
         on = s_t.date()
         item = {"date": on.isoformat(), "weekday": WEEKDAYS[on.weekday()], "score": score, "reasons": reasons,
+                "naks": sorted(nks), "tithis": sorted(tns),
                 "window": {"start": s_t.strftime("%H:%M"), "end": e_t.strftime("%H:%M"),
                            "endsNextDay": e_t.date() > on, "night": s_t >= set_t or e_t <= rise_t},
                 "rahuKaal": {"start": rahu[0].strftime("%H:%M"), "end": rahu[1].strftime("%H:%M")} if on == d else None,
@@ -894,5 +1220,7 @@ def good_days(event: str, start: Date, days: int, lat: float, lon: float, tz_nam
     best = sorted(sorted(found, key=lambda x: (-x["score"], x["date"]))[:3], key=lambda x: x["date"])
     return {"event": event if event in EVENTS else "griha_pravesh", "title": ev["title"], "days": found,
             "best": [b["date"] for b in best], "blockedNote": blocked_note if not found else None,
+            # The first season pause (Kharmas, Adhik maas, Chaturmas) met in the window, even when days were found.
+            "seasonNote": season_note,
             "note": "A traditional guide from the panchang. For the exact muhurat of a wedding or griha pravesh, "
                     "confirm the time with your family pandit."}
