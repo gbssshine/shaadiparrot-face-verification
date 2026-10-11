@@ -114,8 +114,9 @@ FESTIVALS: List[Dict[str, Any]] = [
        source="WB 4188-F(P2)"),
     _e("2026-11-08", "bandi_chhor_divas", "Bandi Chhor Divas", "The release of Guru Hargobind Ji: diyas and kirtan at the gurdwara.",
        "Happy Bandi Chhor Divas", faiths=("sikh",), source="panchang (Diwali day)"),
-    _e("2026-11-09", "govardhan", "Govardhan Puja", "Annakut: a mountain of food offered to Krishna.",
-       "Happy Govardhan Puja", faiths=_H, source="DoPT RH 2026"),
+    _e("2026-11-10", "govardhan", "Govardhan Puja", "Annakut: a mountain of food offered to Krishna.",
+       "Happy Govardhan Puja", faiths=_H, office="Central list: 9 November",
+       source="panchang (Shukla Pratipada at Delhi sunrise; Amavasya ends 9 Nov 12:32 IST); DoPT RH 2026: 9 Nov"),
     _e("2026-11-11", "bhai_dooj", "Bhai Dooj", "Tilak for brothers, blessings for sisters.", "Happy Bhai Dooj",
        faiths=_H),
     _e("2026-11-11", "bhai_phonta", "Bhai Phonta", "Sisters put a phonta on their brothers' foreheads and wish them a long life.",
@@ -410,6 +411,17 @@ LEGACY_IDS: FrozenSet[str] = frozenset({
     "mahalaya",
 })
 
+# Where this table words an old day differently, 1.0.7 apps keep the old wording: the old shape has no officeNote
+# and no separate Pongal row, so the old name or note still carries them. Keyed by (date, id); the only change
+# 1.0.7 apps see is Durga Puja 2026 on its corrected day.
+LEGACY_TEXT: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("2027-01-15", "sankranti"): {"name": "Makar Sankranti · Pongal"},
+    ("2028-01-15", "sankranti"): {"name": "Makar Sankranti · Pongal"},
+    ("2027-03-10", "eid_ul_fitr"): {"note": "Depends on the moon sighting (10 or 11 March)."},
+    ("2027-03-22", "holi"): {"note": "Colours day (some lists say 23 March)."},
+    ("2027-05-17", "bakrid"): {"note": "Depends on the moon sighting."},
+}
+
 _TIER_RANK = {"major": 3, "faith": 2, "regional": 2, "national": 1}
 _VRAT_TIME = {"pradosh": "pradosh", "sankashti": "moonrise"}
 
@@ -698,14 +710,14 @@ def upcoming(start: Date, days: int, lat: float, lon: float, tz_name: str,
 def legacy_merged(start: Date, days: int, lat: float, lon: float, tz_name: str, limit: int = 8, *,
                   vrats: Optional[VratsFn]) -> List[Dict[str, Any]]:
     """The old single list for 1.0.7 apps (astro_api `upcoming`): the old festivals and every monthly vrat, merged
-    by date, in exactly the old shape {date, id, name, note, kind, type, inDays}. Same rules as before, on this
-    table's dates (Durga Puja 2026 on its corrected day)."""
+    by date, in exactly the old shape {date, id, name, note, kind, type, inDays}. Same rules and the old wording
+    (LEGACY_TEXT), on this table's dates (Durga Puja 2026 on its corrected day)."""
     end = start + timedelta(days=days)
     legacy = [e for e in FESTIVALS if e["id"] in LEGACY_IDS and start <= _day(e) < end]
     vr = [v for v in (vrats(start, days, lat, lon, tz_name) if vrats is not None else [])
           if not _covered(v, legacy)]
     items = [{"date": e["date"], "id": e["id"], "name": e["name"], "note": e["note"], "kind": e["id"],
-              "type": "festival"} for e in legacy] + vr
+              "type": "festival", **LEGACY_TEXT.get((e["date"], e["id"]), {})} for e in legacy] + vr
     items.sort(key=lambda i: (i["date"], i["type"] != "festival"))
     for i in items:
         i["inDays"] = (Date.fromisoformat(i["date"]) - start).days

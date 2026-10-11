@@ -127,6 +127,21 @@ def test_office_notes_where_the_central_list_differs():
     assert by_id("holi")["2027-03-22"]["officeNote"] == "Central government holiday: 23 March"
     assert "2027-03-21" in by_id("holika_dahan")
     assert by_id("sankranti")["2027-01-15"]["officeNote"] == "Central list: 14 January"
+    assert by_id("govardhan")["2026-11-10"]["officeNote"] == "Central list: 9 November"
+
+
+def test_govardhan_is_shukla_pratipada_at_delhi_sunrise():
+    # 2026: Amavasya runs to 12:32 IST on 9 Nov (the DoPT RH date), Pratipada holds at sunrise on 10 Nov.
+    assert sorted(by_id("govardhan")) == ["2026-11-10", "2027-10-30"]
+    for d in by_id("govardhan"):
+        t = ac.panchang(date.fromisoformat(d), *DELHI)["tithi"]
+        assert (t["paksha"], t["name"]) == ("Shukla", "Pratipada"), d
+        day_before = ac.panchang(date.fromisoformat(d) - timedelta(days=1), *DELHI)["tithi"]
+        assert day_before["name"] == "Amavasya", d
+    assert by_id("govardhan")["2027-10-30"]["officeNote"] is None
+    # Mithu wishes it on the panchang day, not a day early
+    assert af.observance_for(date(2026, 11, 10), ["hindu"], None).startswith("Govardhan Puja")
+    assert "Govardhan" not in af.observance_for(date(2026, 11, 9), ["hindu"], None)
 
 
 def test_christian_days_follow_easter():
@@ -161,7 +176,7 @@ def test_south_and_regional_days_of_the_audit_list():
     assert "2027-09-12" in by_id("onam") and "2027-04-14" in by_id("puthandu")
     assert "2027-08-13" in by_id("varalakshmi_vratam")
     for id_, day in (("kojagari_lakshmi_puja", "2026-10-25"), ("valmiki_jayanti", "2026-10-26"),
-                     ("kali_puja", "2026-11-08"), ("bandi_chhor_divas", "2026-11-08"), ("govardhan", "2026-11-09"),
+                     ("kali_puja", "2026-11-08"), ("bandi_chhor_divas", "2026-11-08"), ("govardhan", "2026-11-10"),
                      ("bhai_phonta", "2026-11-11"), ("guru_teg_bahadur", "2026-11-24"), ("hazarat_ali", "2026-12-23"),
                      ("christmas_eve", "2026-12-24"), ("guru_gobind_singh", "2027-01-15"), ("pongal", "2027-01-15"),
                      ("ramzan_start", "2027-02-09"), ("ash_wednesday", "2027-02-10"), ("shivaji_jayanti", "2027-02-19"),
@@ -370,26 +385,49 @@ def test_no_vrat_function_means_no_fasts():
 
 
 # ------------------------------------------------------------------ the old list (1.0.7 apps)
-@pytest.mark.parametrize("start", [date(2026, 11, 15), date(2026, 12, 1), date(2027, 6, 1), date(2027, 8, 1),
-                                   date(2027, 9, 1)])
+# 2027-01-10, 2027-03-08, 2027-05-10 and 2028-01-10 reach the days whose wording 1.0.7 keeps (LEGACY_TEXT).
+@pytest.mark.parametrize("start", [date(2026, 11, 15), date(2026, 12, 1), date(2027, 1, 10), date(2027, 3, 8),
+                                   date(2027, 5, 10), date(2027, 6, 1), date(2027, 8, 1), date(2027, 9, 1),
+                                   date(2028, 1, 10)])
 @pytest.mark.parametrize("place", [DELHI, BLR], ids=["delhi", "bengaluru"])
 def test_legacy_merged_equals_the_old_list(start, place):
     assert af.legacy_merged(start, 40, *place, limit=8, vrats=ac.vrats_between) == ac.upcoming(start, 40, *place, limit=8)
 
 
+def test_the_sample_days_reach_the_reworded_days():
+    seen = set()
+    for start in (date(2027, 1, 10), date(2027, 3, 8), date(2027, 5, 10), date(2028, 1, 10)):
+        seen |= {(i["date"], i["id"]) for i in ac.upcoming(start, 40, *DELHI, limit=8) if i["type"] == "festival"}
+    assert set(af.LEGACY_TEXT) <= seen
+
+
 def test_the_old_list_changes_only_where_it_was_wrong():
-    old = {(f["date"], f["id"]): f for f in ac.FESTIVALS}
-    new = {(e["date"], e["id"]): e for e in af.FESTIVALS if e["id"] in af.LEGACY_IDS}
-    assert set(old) - set(new) == {("2026-10-17", "durga_puja")}
-    assert set(new) - set(old) == {("2026-10-18", "durga_puja")}
-    changed = {k for k in set(old) & set(new) if (old[k]["name"], old[k]["note"]) != (new[k]["name"], new[k]["note"])}
-    # Pongal is now its own Tamil day; moon-sighting notes say "Expected"; Holi's office date moved to officeNote.
-    assert changed == {("2027-01-15", "sankranti"), ("2028-01-15", "sankranti"), ("2027-03-10", "eid_ul_fitr"),
-                       ("2027-05-17", "bakrid"), ("2027-03-22", "holi")}
+    """1.0.7 apps get the old list word for word; the only change is Durga Puja 2026 moving from 17 Oct (Shashthi)
+    to 18 Oct (Saptami)."""
+    first, last = date(2026, 10, 11), max(date.fromisoformat(e["date"]) for e in af.FESTIVALS)
+    days = (last - first).days + 1
+    new = af.legacy_merged(first, days, *DELHI, limit=10_000, vrats=None)
+    old = [{**f, "kind": f["id"], "type": "festival", "inDays": (date.fromisoformat(f["date"]) - first).days}
+           for f in ac.FESTIVALS if first <= date.fromisoformat(f["date"]) <= last]
+    moved = ("2026-10-18", "durga_puja")
+    assert [i for i in new if (i["date"], i["id"]) != moved] == [i for i in old if (i["date"], i["id"]) != ("2026-10-17", "durga_puja")]
+    old_puja = next(i for i in old if (i["date"], i["id"]) == ("2026-10-17", "durga_puja"))
+    new_puja = next(i for i in new if (i["date"], i["id"]) == moved)
+    assert new_puja == {**old_puja, "date": "2026-10-18", "inDays": old_puja["inDays"] + 1}
+    # The table words these days anew (Pongal its own Tamil day, "Expected" moon notes, Holi's office date in
+    # officeNote); LEGACY_TEXT keeps the old words for exactly these and nothing else.
+    table = {(e["date"], e["id"]): e for e in af.FESTIVALS if e["id"] in af.LEGACY_IDS}
+    old_by_key = {(f["date"], f["id"]): f for f in ac.FESTIVALS}
+    reworded = {k for k in set(table) & set(old_by_key)
+                if (table[k]["name"], table[k]["note"]) != (old_by_key[k]["name"], old_by_key[k]["note"])}
+    assert reworded == set(af.LEGACY_TEXT)
     items = af.legacy_merged(date(2026, 10, 11), 40, *DELHI, limit=30, vrats=ac.vrats_between)
     assert ("2026-10-18", "durga_puja") in {(i["date"], i.get("id")) for i in items}
     assert all(set(i) == {"date", "id", "name", "note", "kind", "type", "inDays"}
                for i in items if i["type"] == "festival")
+    # Tamil 1.0.7 users still see Pongal: in the old Sankranti name
+    jan = af.legacy_merged(date(2027, 1, 10), 40, *DELHI, vrats=None)
+    assert next(i for i in jan if i["id"] == "sankranti")["name"] == "Makar Sankranti · Pongal"
 
 
 # ------------------------------------------------------------------ TODAY_OBSERVANCE
