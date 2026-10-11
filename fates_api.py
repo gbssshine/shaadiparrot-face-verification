@@ -7,6 +7,9 @@ Data (all server-only, the app talks to these endpoints and never reads the coll
 Someone who accepted the viewer as a fate ("chose you") is brought into the viewer's own paths the
 next morning, one a day: that is the free way to meet them. Parrot+ or a crown shows them at once.
 A fate day starts at 07:30 IST, when the morning push goes out.
+Two modes (plan §2 C1): /today without a mode (1.0.7 apps send {}) is the dating Fates and brings only people in the
+quick pool; {mode: 'rishta'} (1.0.8, a profile that wants marriage) brings only rishta-pool people who fit both
+families' must-haves, with both kundlis and 18+ gunas on every path. A stored day keeps its `mode`.
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import BaseModel
 
 import fates_ai
@@ -47,6 +50,12 @@ AI_DAILY_CAP = int(os.getenv("FATES_AI_DAILY_CAP") or "6")
 CHOOSER_CHECKS = 8
 CHOSEN_LIST_LIMIT = 20
 CHOOSER_MAX_BRINGS = 2
+# Fates modes (plan §2 C1). A request without a mode (1.0.7, or a 1.0.8 app without a marriage profile) is the dating
+# Fates and brings quick-pool people only; {mode: 'rishta'} brings rishta-pool people who fit both families' wishes.
+MODE_QUICK = "quick"
+MODE_RISHTA = "rishta"
+POOLS_CONFIG_TTL_SEC = 600
+_pools_config: Dict[str, Any] = {"at": 0.0, "quickMaleMinAge": fe.QUICK_MALE_MIN_AGE}
 
 
 STAT_SHARDS = 10
@@ -190,13 +199,47 @@ def _chart(profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def load_person(db, uid: str, public: Optional[Dict[str, Any]] = None) -> Tuple[fe.Person, Dict[str, Any], Dict[str, Any]]:
+def _load(db, uid: str, public: Optional[Dict[str, Any]] = None) -> Tuple[fe.Person, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """(person, publicProfiles doc, profiles doc, users doc)."""
     pub = public if public is not None else _doc(db, f"publicProfiles/{uid}")
     priv = _doc(db, f"profiles/{uid}")
     usr = _doc(db, f"users/{uid}")
     person = fe.person_from_docs(uid, pub, priv, usr)
     person.chart = _chart({**pub, **usr, **priv})
+    return person, pub, priv, usr
+
+
+def load_person(db, uid: str, public: Optional[Dict[str, Any]] = None) -> Tuple[fe.Person, Dict[str, Any], Dict[str, Any]]:
+    person, _, priv, usr = _load(db, uid, public)
     return person, priv, usr
+
+
+def quick_male_min_age(db) -> int:
+    """serverState/pools.quickMaleMinAge: from what age men are in the quick pool (default 21; the owner may set
+    18..99). Cached for 10 minutes; after a failed read the last value is kept and the read is tried a minute later."""
+    now = time.time()
+    if now - float(_pools_config["at"]) < POOLS_CONFIG_TTL_SEC:
+        return int(_pools_config["quickMaleMinAge"])
+    try:
+        v = (db.document("serverState/pools").get().to_dict() or {}).get("quickMaleMinAge")
+        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and 18 <= v <= 99
+        _pools_config.update(at=now, quickMaleMinAge=int(v) if ok else fe.QUICK_MALE_MIN_AGE)
+    except Exception:
+        logger.warning("fates pools config read failed", exc_info=True)
+        _pools_config["at"] = now - POOLS_CONFIG_TTL_SEC + 60
+    return int(_pools_config["quickMaleMinAge"])
+
+
+def _doc_mode(doc: Optional[Dict[str, Any]]) -> str:
+    """The mode a stored day was made in (days stored before 1.0.8 are dating days)."""
+    return MODE_RISHTA if (doc or {}).get("mode") == MODE_RISHTA else MODE_QUICK
+
+
+def _mode_fits(viewer: fe.Person, cand: fe.Person, pub: Dict[str, Any], priv: Dict[str, Any], today: str, qmin: int) -> bool:
+    """The candidate is in the viewer's pool and passes the mode's rules (fates_engine.candidate_gate)."""
+    if viewer.rishta:
+        fe.rishta_ready(cand)
+    return fe.candidate_gate(viewer, cand, pub, priv, today, qmin) is None
 
 
 def _ids(db, path: str, limit: int = 2000) -> set:
@@ -216,10 +259,16 @@ def _candidates(db, viewer: fe.Person, now_ms: int, memory: Dict[str, Any]) -> L
     cutoff = (datetime.now(timezone.utc) - timedelta(days=SEEN_COOLDOWN_DAYS)).date().isoformat()
     seen = memory.get("seen") or {}
     excluded |= {u for u, v in seen.items() if str((v or {}).get("day", "")) >= cutoff}
+    today = fe.ist_day()
+    qmin = quick_male_min_age(db)
+    pool_key = "inRishta" if viewer.rishta else "inQuick"
 
     try:
         from google.cloud.firestore_v1.base_query import FieldFilter
         q = db.collection("publicProfiles").where(filter=FieldFilter("isDiscoverable", "==", True))
+        if viewer.rishta:
+            # Only cards the functions indexed into the rishta pool (pools_of still checks the age day below).
+            q = q.where(filter=FieldFilter("feedRishta", "==", True))
         # Equality filters on two fields need no composite index (Firestore merges single-field indexes).
         if viewer.looking_for in ("male", "female"):
             q = q.where(filter=FieldFilter("gender", "==", viewer.looking_for.capitalize()))
@@ -236,6 +285,9 @@ def _candidates(db, viewer: fe.Person, now_ms: int, memory: Dict[str, Any]) -> L
         if s.id == viewer.uid or s.id in excluded:
             continue
         pub = s.to_dict() or {}
+        # The pool first (dating: the quick pool only; rishta mode: the rishta pool only), from the server-written index.
+        if not fe.pools_of(pub, today, qmin)[pool_key]:
+            continue
         p = fe.person_from_docs(s.id, pub)
         # Cheap public checks first; the private docs are only read for people who pass them.
         if not p.photos or not (fe._wants(viewer, p) and fe._wants(p, viewer)):
@@ -254,7 +306,10 @@ def _candidates(db, viewer: fe.Person, now_ms: int, memory: Dict[str, Any]) -> L
         logger.exception("fates batch read failed")
         return people
     for uid, pub in quick:
-        p = fe.person_from_docs(uid, pub, privs.get(uid), users.get(uid))
+        priv = privs.get(uid) or {}
+        p = fe.person_from_docs(uid, pub, priv, users.get(uid))
+        if not _mode_fits(viewer, p, pub, priv, today, qmin):
+            continue
         if fe.hard_filter(viewer, p, now_ms) is None:
             p.chart = _chart({**pub, **users.get(uid, {}), **privs.get(uid, {})})
             people.append(p)
@@ -307,7 +362,9 @@ def _chooser_pair(db, viewer: fe.Person, uid: str, now_ms: int, memory: Dict[str
         return None
     if _answered(db, viewer.uid, uid):
         return None
-    cand, _, _ = load_person(db, uid)
+    cand, pub, priv, _ = _load(db, uid)
+    if not _mode_fits(viewer, cand, pub, priv, fe.ist_day(), quick_male_min_age(db)):
+        return None
     if fe.hard_filter(viewer, cand, now_ms) is not None:
         return None
     pair = fe.evaluate_pair(viewer, cand, now_ms, _match_fn)
@@ -441,6 +498,7 @@ def generate(db, viewer: fe.Person, memory: Dict[str, Any], key: str, now_ms: in
     _stat(db, key, generated=1, **{f"paths{len(order)}": 1}, poolTotal=len(pool))
     return {
         "uid": viewer.uid, "dayKey": key, "createdAtIso": _now_iso(), "closesAtIso": day_closes_at(key).isoformat(),
+        "mode": MODE_RISHTA if viewer.rishta else MODE_QUICK,
         "paths": paths, "order": order, "openedCount": 0, "poolSize": len(pool),
         "chooserUid": chooser_uid if chooser_route in paths else None,
     }
@@ -517,7 +575,7 @@ def client_view(doc: Dict[str, Any], memory: Dict[str, Any], premium: bool, accu
         out_paths.append(item)
     opened = int(doc.get("openedCount") or 0)
     return {
-        "ok": True, "dayKey": key, "closesAtIso": doc.get("closesAtIso"), "paths": out_paths,
+        "ok": True, "dayKey": key, "closesAtIso": doc.get("closesAtIso"), "paths": out_paths, "mode": _doc_mode(doc),
         "opensLeft": _allowance(opened, extra["count"], premium), "premium": premium,
         "canUnlock": {"ad": not extra["ad"], "crown": True},
         "streak": _streak_value(memory, key), "accuracy": accuracy,
@@ -549,19 +607,56 @@ class DecisionRequest(BaseModel):
     dayKey: Optional[str] = None   # the day the path belongs to (a decision sent just after 07:30 IST is yesterday's)
 
 
+class TodayRequest(BaseModel):
+    mode: Optional[str] = None      # "rishta" from 1.0.8 for a profile that wants marriage; anything else = dating
+
+
+def request_mode(body: Optional[TodayRequest]) -> str:
+    return MODE_RISHTA if body is not None and str(body.mode or "").strip().lower() == MODE_RISHTA else MODE_QUICK
+
+
+def viewer_block(mode: str, pub: Dict[str, Any], priv: Dict[str, Any], today: str) -> Optional[str]:
+    """Who may have today's Fates in this mode (plan §2 C1): rishta mode needs profiles.marriageIntent ('needs_intent')
+    and, for a man's own profile, 21 years ('groom_age'); the dating Fates are only for one's own profile ('no_quick')."""
+    if mode == MODE_RISHTA:
+        return fe.rishta_viewer_block(priv, pub, today)
+    return fe.quick_viewer_block(priv)
+
+
+def _reconcile_mode(ref, doc: Optional[Dict[str, Any]], mode: str) -> Optional[Dict[str, Any]]:
+    """A fate day belongs to one mode. When the app asks in the other one (an update during the day, a second phone),
+    nothing unopened from the old mode is shown: an untouched day is made again, otherwise only the opened paths stay."""
+    if not doc or _doc_mode(doc) == mode:
+        return doc
+    opened = {k: v for k, v in (doc.get("paths") or {}).items() if (v or {}).get("opened")}
+    if not opened:
+        ref.delete()
+        return None
+    order = [p for p in doc.get("order", []) if p in opened]
+    ref.update({"paths": opened, "order": order, "mode": mode})
+    return {**doc, "paths": opened, "order": order, "mode": mode}
+
+
 @router.post("/today")
-def fates_today(authorization: Optional[str] = Header(default=None)):
+def fates_today(body: Optional[TodayRequest] = Body(default=None), authorization: Optional[str] = Header(default=None)):
     uid = _d().verify_uid(authorization)
     db = _db()
     key = day_key()
     now_ms = int(time.time() * 1000)
-    viewer, priv, usr = load_person(db, uid)
+    mode = request_mode(body)
+    viewer, pub, priv, usr = _load(db, uid)
     memory = _doc(db, f"fatesMemory/{uid}")
     premium = _d().is_premium(usr, priv, datetime.now(timezone.utc))
+    accuracy = _accuracy(viewer, {**usr, **priv})
+    blocked = viewer_block(mode, pub, priv, fe.ist_day())
+    if blocked:
+        return _empty_view(memory, key, premium, accuracy, mode, blocked)
+    if mode == MODE_RISHTA:
+        fe.rishta_ready(viewer, viewer=True)
     if fe.VERIFIED_ONLY and not viewer.face_verified:
-        return _verify_first(db, viewer, memory, key, now_ms, premium, _accuracy(viewer, {**usr, **priv}), priv)
+        return _verify_first(db, viewer, memory, key, now_ms, premium, accuracy, priv)
     ref = db.document(f"dailyFates/{uid}__{key}")
-    doc = ref.get().to_dict()
+    doc = _reconcile_mode(ref, ref.get().to_dict(), mode)
     if doc and not doc.get("order") and _older_than(doc.get("createdAtIso"), EMPTY_DAY_RECHECK_HOURS):
         # A quiet day is looked at again a few hours later: someone new may have joined since.
         ref.delete()
@@ -570,10 +665,20 @@ def fates_today(authorization: Optional[str] = Header(default=None)):
         doc = generate(db, viewer, memory, key, now_ms)
         doc = _store_generation(db, doc, key)
         memory = _doc(db, f"fatesMemory/{uid}")
-    return client_view(doc, memory, premium, _accuracy(viewer, {**usr, **priv}))
+    return client_view(doc, memory, premium, accuracy)
 
 
 EMPTY_DAY_RECHECK_HOURS = 3
+
+
+def _empty_view(memory: Dict[str, Any], key: str, premium: bool, accuracy: Dict[str, Any], mode: str,
+                reason: str) -> Dict[str, Any]:
+    """No Fates in this mode for this viewer (nobody is picked or stored): 'needs_intent', 'groom_age' or 'no_quick'."""
+    return {
+        "ok": True, "dayKey": key, "closesAtIso": day_closes_at(key).isoformat(), "paths": [], "mode": mode,
+        "reason": reason, "opensLeft": 0, "premium": premium, "canUnlock": {"ad": False, "crown": False},
+        "streak": _streak_value(memory, key), "accuracy": accuracy,
+    }
 
 
 def _verify_reason(priv: Dict[str, Any]) -> str:
@@ -589,17 +694,18 @@ def _verify_first(db, viewer: fe.Person, memory: Dict[str, Any], key: str, now_m
     """Daily Fates is for verified people only. Before that, only how many verified people near the
     viewer Mithu could bring (counted once a day, no one is picked and nothing is stored as a fate)."""
     teaser = memory.get("verifyTeaser") or {}
-    if teaser.get("day") == key:
+    mode = MODE_RISHTA if viewer.rishta else MODE_QUICK
+    if teaser.get("day") == key and (teaser.get("mode") or MODE_QUICK) == mode:
         n = int(teaser.get("n") or 0)
     else:
         n = len(_candidates(db, viewer, now_ms, memory))
         try:
-            db.document(f"fatesMemory/{viewer.uid}").set({"verifyTeaser": {"day": key, "n": n}}, merge=True)
+            db.document(f"fatesMemory/{viewer.uid}").set({"verifyTeaser": {"day": key, "n": n, "mode": mode}}, merge=True)
         except Exception:
             logger.warning("fates verify teaser cache failed", exc_info=True)
     _stat(db, key, needsVerification=1)
     return {
-        "ok": True, "dayKey": key, "closesAtIso": day_closes_at(key).isoformat(), "paths": [],
+        "ok": True, "dayKey": key, "closesAtIso": day_closes_at(key).isoformat(), "paths": [], "mode": mode,
         "needsVerification": True, "verifiedNearby": n,
         # "photos_changed": verified, but the photos aren't the ones checked (the app re-checks them by itself);
         # otherwise the last check's reason ("main_photo_not_you", "photo_3_not_you", ...) or "".
@@ -682,6 +788,7 @@ def fates_open(body: OpenRequest, authorization: Optional[str] = Header(default=
     # The report is plain math and returns at once; the AI verdict comes from /fates/verdict while the
     # person reads the first scenes.
     viewer, _, _ = load_person(db, uid)
+    viewer.rishta = _doc_mode(doc) == MODE_RISHTA     # the report compares what families compare in rishta mode
     pair = _pair_for(db, viewer, p["targetUid"], int(time.time() * 1000))
     ref.update({f"paths.{body.path}.report": fe.report(viewer, body.path, pair)})
     doc = ref.get().to_dict() or doc
@@ -707,6 +814,7 @@ def fates_verdict(body: VerdictRequest, authorization: Optional[str] = Header(de
     if p.get("verdict"):
         return {"ok": True, "verdict": p["verdict"], "why": p.get("why") or ""}
     viewer, _, _ = load_person(db, uid)
+    viewer.rishta = _doc_mode(doc) == MODE_RISHTA
     pair = _pair_for(db, viewer, p["targetUid"], int(time.time() * 1000))
     pair.chose_you = bool((p.get("teaser") or {}).get("choseYou"))
     facts = fe.facts_for_ai(viewer, body.path, pair)
@@ -850,10 +958,13 @@ def fates_chosen(authorization: Optional[str] = Header(default=None)):
     db = _db()
     key = day_key()
     now_ms = int(time.time() * 1000)
-    viewer, priv, usr = load_person(db, uid)
+    viewer, pub, priv, usr = _load(db, uid)
     premium = _d().is_premium(usr, priv, datetime.now(timezone.utc))
     memory = _doc(db, f"fatesMemory/{uid}")
     today = _doc(db, f"dailyFates/{uid}__{key}")
+    # Who Mithu can bring follows today's mode (before today's paths exist: rishta for a profile that wants marriage).
+    if today.get("mode") == MODE_RISHTA or (not today and fe.rishta_viewer_block(priv, pub, fe.ist_day()) is None):
+        fe.rishta_ready(viewer, viewer=True)
     in_today = {p.get("targetUid"): (path, p) for path, p in (today.get("paths") or {}).items()}
     likes = _incoming_fate_likes(db, uid)
     revealed = memory.get("revealed") or {}

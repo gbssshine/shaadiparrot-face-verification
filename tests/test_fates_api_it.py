@@ -195,3 +195,142 @@ def test_a_removed_verification_stops_opening(env):
         assert today["needsVerification"] is True and today["verifyReason"] == "review_rejected"
     finally:
         db.document(f"profiles/{uid}").set({"faceVerified": True, "isFaceVerified": True, "faceVerifiedReason": "ok"}, merge=True)
+
+
+# ======================================================================================================================
+# 1.0.8: rishta mode ({mode: 'rishta'}) and the pools (plan §2 C1). Seeded after the dating tests above (their day is
+# already made), with their own uids.
+# ======================================================================================================================
+RISHTA_INDEX = {"feedRishta": True, "feedRishtaFromDay": "2017-01-01", "feedQuick": False, "feedQuickFromDay": "2017-01-01"}
+CONSENT = {"marriageIntent": True, "intentConsentAtIso": "2026-10-01T00:00:00+00:00", "intentConsentVersion": "intent-2026-10"}
+RISHTA_ONLY = {"priya", "kavya", "lowguna", "jainonly", "notyet"}
+# Women a dating viewer without a stated intent may get: the 1.0.7 cards above ("friendsonly" clashes only with a
+# "serious" viewer) and the ones in the quick pool.
+QUICK_POOL = {"anaya", "meera", "tanisha", "riya", "friendsonly", "quickonly", "bothok"}
+
+
+@pytest.fixture(scope="module")
+def rishta_env(env):
+    db = env["db"]
+    active = (NOW - timedelta(hours=2)).isoformat()
+
+    def seed(uid, birth, pub=None, priv=None):
+        photo = f"https://example.com/{uid}.jpg"
+        card = {"uid": uid, "firstName": uid.title(), "age": 27, "gender": "Female", "lookingForGender": "Male",
+                "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True, "isFaceVerified": True,
+                "photos": [photo], "religion": "Hindu", "community": "Kannada", "maritalStatus": "Never married",
+                "diet": "Vegetarian", "familyValues": "Moderate", "education": "Master's",
+                "languages": ["Kannada", "English"], "interests": ["Music", "Travel"], "bio": f"I am {uid}."}
+        card.update(pub or {})
+        db.document(f"publicProfiles/{uid}").set(card)
+        db.document(f"profiles/{uid}").set({"birthDate": birth, "birthTime": "10:15", "birthCityName": "Bengaluru",
+                                             "birthCountryIso2": "IN", "faceVerified": True, "faceVerifiedPhotos": [photo],
+                                             "gender": "female", **(priv or {})})
+        db.document(f"users/{uid}").set({"lastAppOpenAtUtcIso": active})
+
+    # Candidates; the gunas are with the viewers' birth (1996-11-20 06:30, Bengaluru).
+    seed("priya", "1999-08-02", RISHTA_INDEX, {**CONSENT, "profileFor": "self"})                      # 33 gunas
+    seed("kavya", "1999-10-23", {**RISHTA_INDEX, "profileFor": "daughter"},                            # 33, made by a parent
+         {"marriageIntent": True, "consentDeclaredAtIso": "2026-10-01T00:00:00+00:00", "profileFor": "daughter",
+          "creatorRelation": "Mother", "lifeStage": "MarriedKids"})
+    seed("bothok", "1999-06-02", {**RISHTA_INDEX, "feedQuick": True},                                  # 31.5, both pools
+         {**CONSENT, "profileFor": "self", "quickSwipeOk": True})
+    seed("lowguna", "1999-03-16", RISHTA_INDEX, {**CONSENT, "profileFor": "self"})                    # 8.5 gunas
+    seed("jainonly", "1999-04-09", RISHTA_INDEX,                                                       # her family's must-have
+         {**CONSENT, "profileFor": "self", "pref_religions": ["Jain"], "pref_strict": ["religions"]})
+    seed("quickonly", "1999-01-16")                                                                    # a 1.0.7 card
+    seed("notyet", "1999-08-23", {**RISHTA_INDEX, "feedRishtaFromDay": "2099-01-01"}, {**CONSENT, "profileFor": "self"})
+    seed("hidden", "1999-01-23", {**RISHTA_INDEX, "photoPrivacy": "accepted",
+                                   "photos": ["https://example.com/users/hidden/blur/a.jpg"]}, {**CONSENT, "profileFor": "self"})
+
+    viewers = {}
+
+    def viewer(name, priv):
+        token, uid = _token(name)
+        photo = f"https://example.com/{name}.jpg"
+        db.document(f"publicProfiles/{uid}").set({
+            "uid": uid, "firstName": name.title(), "age": 29, "gender": "Male", "lookingForGender": "Female",
+            "cityName": "Bengaluru", "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "isFaceVerified": True,
+            "photos": [photo], "religion": "Hindu", "community": "Kannada", "maritalStatus": "Never married",
+            "diet": "Vegetarian", "familyValues": "Traditional", "education": "Bachelor's",
+            "languages": ["Kannada", "English"], "interests": ["Music", "Cricket"]})
+        db.document(f"profiles/{uid}").set({"birthDate": "1996-11-20", "birthTime": "06:30", "birthCityName": "Bengaluru",
+                                             "birthCountryIso2": "IN", "gender": "male", "faceVerified": True,
+                                             "faceVerifiedPhotos": [photo], **priv})
+        db.document(f"users/{uid}").set({"lastAppOpenAtUtcIso": active})
+        viewers[name] = {"uid": uid, "h": {"Authorization": f"Bearer {token}"}}
+
+    viewer("rohan", {**CONSENT, "profileFor": "self"})                          # wants marriage: rishta mode
+    viewer("vikram", {**CONSENT, "profileFor": "self"})                         # the same, asks in both modes
+    viewer("dev", {"profileFor": "self"})                                        # a dating account
+    viewer("sam", {"profileFor": "self"})                                        # asks for rishta without intent
+    viewer("kid", {**CONSENT, "profileFor": "self", "birthDate": "2006-01-01"})  # a groom of 20
+    viewer("mom", {"marriageIntent": True, "consentDeclaredAtIso": "2026-10-01T00:00:00+00:00", "profileFor": "son"})
+    yield {**env, "v": viewers}
+
+
+def _targets(env, uid, day):
+    doc = env["db"].document(f"dailyFates/{uid}__{day}").get().to_dict() or {}
+    return doc, {p["targetUid"] for p in (doc.get("paths") or {}).values()}
+
+
+def test_rishta_mode_brings_only_rishta_people_who_fit_both_ways(rishta_env):
+    c, v = rishta_env["client"], rishta_env["v"]["rohan"]
+    r = c.post("/fates/today", json={"mode": "rishta"}, headers=v["h"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mode"] == "rishta" and body["paths"] and "reason" not in body
+    doc, targets = _targets(rishta_env, v["uid"], body["dayKey"])
+    assert doc["mode"] == "rishta"
+    assert targets and targets <= {"priya", "kavya", "bothok"}
+    assert all((p["teaser"].get("gunas") or 0) >= 18 for p in body["paths"])    # 18+ gunas on every path
+    again = c.post("/fates/today", json={"mode": "rishta"}, headers=v["h"]).json()
+    assert [p["path"] for p in again["paths"]] == [p["path"] for p in body["paths"]]
+
+
+def test_a_rishta_report_compares_what_families_compare(rishta_env):
+    c, v = rishta_env["client"], rishta_env["v"]["rohan"]
+    today = c.post("/fates/today", json={"mode": "rishta"}, headers=v["h"]).json()
+    path = today["paths"][0]["path"]
+    r = c.post("/fates/open", json={"path": path}, headers=v["h"])
+    assert r.status_code == 200, r.text
+    rep = next(p for p in r.json()["paths"] if p["path"] == path)["report"]
+    rows = {row["key"]: row["status"] for row in rep["home"]["rows"]}
+    assert {"marital", "food", "family_values", "education"} <= set(rows)
+    assert rows["marital"] == "aligns" and rows["food"] == "aligns" and rows["education"] == "aligns"
+    assert "lifeStage" not in str(rep) and "pref_" not in str(rep)
+
+
+def test_dating_fates_never_bring_a_family_made_or_marriage_only_profile(rishta_env):
+    c, v = rishta_env["client"], rishta_env["v"]["dev"]
+    for kwargs in ({}, {"json": {}}):                                            # no body, and the {} that 1.0.7 sends
+        r = c.post("/fates/today", headers=v["h"], **kwargs)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["mode"] == "quick" and "reason" not in body and body["paths"]
+        _, targets = _targets(rishta_env, v["uid"], body["dayKey"])
+        assert not targets & (RISHTA_ONLY | {"hidden"})
+        assert targets <= QUICK_POOL
+
+
+def test_rishta_mode_viewer_rules(rishta_env):
+    c, vs, db = rishta_env["client"], rishta_env["v"], rishta_env["db"]
+    for name, body_json, reason in (("sam", {"mode": "rishta"}, "needs_intent"), ("kid", {"mode": "rishta"}, "groom_age"),
+                                    ("mom", {}, "no_quick")):
+        r = c.post("/fates/today", json=body_json, headers=vs[name]["h"])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["paths"] == [] and body["reason"] == reason and body["opensLeft"] == 0
+        assert not db.document(f"dailyFates/{vs[name]['uid']}__{body['dayKey']}").get().exists   # nothing stored
+
+
+def test_a_mode_switch_never_shows_the_other_modes_unopened_people(rishta_env):
+    c, v = rishta_env["client"], rishta_env["v"]["vikram"]
+    dating = c.post("/fates/today", json={}, headers=v["h"]).json()                 # an old app first
+    assert dating["mode"] == "quick" and dating["paths"]
+    _, first = _targets(rishta_env, v["uid"], dating["dayKey"])
+    assert first <= QUICK_POOL
+    rishta = c.post("/fates/today", json={"mode": "rishta"}, headers=v["h"]).json()  # then 1.0.8, nothing opened yet
+    assert rishta["mode"] == "rishta"
+    doc, targets = _targets(rishta_env, v["uid"], rishta["dayKey"])
+    assert doc["mode"] == "rishta" and targets <= {"priya", "kavya", "bothok"}
