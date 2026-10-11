@@ -7,6 +7,7 @@
   POST /astro/good-days   dates that suit an event (wedding, griha pravesh, naming...) by the panchang
   POST /astro/question    Mithu's question of the day: vote once, then see your city and India
   POST /astro/places      city search for the panchang place and for birth places (India first)
+  POST /astro/scores      36-guna score of me with each rishta card in my list (only the score leaves the server)
 
 Data (server-only): dailyQuestions/{dayKey} vote counts, dailyQuestionVotes/{dayKey}__{uid},
 astroReports/{uid}__{hash} written readings. Birth details sent for other people are used for the
@@ -15,6 +16,7 @@ answer and not stored.
 from __future__ import annotations
 
 import hashlib
+import re
 import logging
 import threading
 import time
@@ -136,6 +138,10 @@ class GoodDaysReq(BaseModel):
 class QuestionReq(BaseModel):
     vote: Optional[int] = None
     place: Optional[PlaceIn] = None
+
+
+class ScoresReq(BaseModel):
+    uids: List[str] = Field(default_factory=list, max_length=40)
 
 
 class PlacesReq(BaseModel):
@@ -514,3 +520,50 @@ def places(body: PlacesReq, authorization: Optional[str] = Header(default=None))
         out.append({"name": _title(city), "state": _title(state or ""), "countryIso2": ccode,
                     "lat": lat, "lon": lon, "tz": tz or "Asia/Kolkata"})
     return {"ok": True, "places": out}
+
+
+# ------------------------------------------------------------------ /scores
+_UID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+_scores_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_SCORES_TTL = 6 * 3600.0
+
+
+@router.post("/scores")
+def scores(body: ScoresReq, authorization: Optional[str] = Header(default=None)):
+    uid = _auth(authorization)
+    merged, _, _ = _own_profile(uid)
+    if not fc._parse_date(merged.get("birthDate")):
+        return {"ok": True, "scores": {}, "missing": "me"}
+    want = [u for u in dict.fromkeys(body.uids) if isinstance(u, str) and _UID_RE.match(u) and u != uid][:40]
+    out: Dict[str, Any] = {}
+    now = time.monotonic()
+    todo = []
+    for u in want:
+        hit = _scores_cache.get(f"{uid}|{u}")
+        if hit and now - hit[0] < _SCORES_TTL:
+            out[u] = hit[1]
+        else:
+            todo.append(u)
+    db = _d().db()
+    if todo and db is not None:
+        try:
+            me_chart, _ = _chart_for(merged)
+            me_gender = _gender(merged.get("gender"))
+            refs = [db.collection("profiles").document(u) for u in todo]
+            for snap in db.get_all(refs):
+                if not snap.exists:
+                    continue
+                p = snap.to_dict() or {}
+                if not fc._parse_date(p.get("birthDate")):
+                    continue
+                c, _ = _chart_for(p)
+                m = fates_astro.match_charts(me_chart, c, me_gender, _gender(p.get("gender")))
+                score = {"total": m["total"], "min": m["totalMin"], "max": m["totalMax"]}
+                out[snap.id] = score
+                _scores_cache[f"{uid}|{snap.id}"] = (now, score)
+        except Exception:
+            logger.warning("scores failed", exc_info=True)
+        if len(_scores_cache) > 20000:
+            for k in [k for k, v in _scores_cache.items() if now - v[0] > _SCORES_TTL]:
+                _scores_cache.pop(k, None)
+    return {"ok": True, "scores": out}

@@ -177,3 +177,44 @@ def test_places_search(client):
     names = [p["name"] for p in r.json()["places"]]
     assert names[0] == "Bengaluru"
     assert client.post("/astro/places", json={"q": "b"}, headers=H).json()["places"] == []
+
+
+def test_scores_without_db_is_empty(client):
+    r = client.post("/astro/scores", json={"uids": ["abcdefgh", "../bad"]}, headers=H)
+    assert r.status_code == 200 and r.json()["scores"] == {}
+
+
+def test_scores_with_profiles():
+    class Snap:
+        def __init__(self, id_, d):
+            self.id, self._d, self.exists = id_, d, d is not None
+
+        def to_dict(self):
+            return self._d
+
+    class Doc:
+        def __init__(self, id_):
+            self.id = id_
+
+    class Col:
+        def document(self, id_):
+            return Doc(id_)
+
+    class Db:
+        def collection(self, name):
+            return Col()
+
+        def get_all(self, refs):
+            data = {"bride1234": {"birthDate": "1996-04-11", "gender": "Female"}, "nobirth12": {"gender": "Female"}}
+            return [Snap(r.id, data.get(r.id)) for r in refs]
+
+    me = {"firstName": "Rahul", "gender": "Male", "birthDate": "1993-09-02"}
+    astro_api.configure(astro_api.Deps(
+        db=lambda: Db(), verify_uid=lambda h: "me123456", resolve_place=lambda p: None, places_query=main._places_query,
+        load_user_docs=lambda uid: (me, {}, me), is_premium=lambda *a: False, complete=lambda *a, **k: ("", ""),
+        take_rate=lambda *a: True))
+    app = FastAPI()
+    app.include_router(astro_api.router)
+    r = TestClient(app).post("/astro/scores", json={"uids": ["bride1234", "nobirth12", "ghost1234"]}, headers=H)
+    sc = r.json()["scores"]
+    assert list(sc) == ["bride1234"] and 0 <= sc["bride1234"]["total"] <= 36
