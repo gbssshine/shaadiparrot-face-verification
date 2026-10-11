@@ -1,8 +1,9 @@
-"""Face verification end to end: challenge, liveness, face match, review, duplicates, retention, withdraw.
+"""Face verification end to end: challenge, liveness, face match, review, duplicates, retention, withdraw, and the
+person's own consent to a profile a parent or relative made for them.
 
 Runs against the Firestore + Auth + Storage emulators (see test_fates_api_it.py; the Storage one on 9199 unless
 FIREBASE_STORAGE_EMULATOR_HOST says otherwise). Cloud Vision and the face model are replaced by fakes keyed by
-the selfie's name, so the server's own logic is what's tested.
+the selfie's name, so the server's own logic is what's tested. The consent rule's own tests (no emulator) run always.
 """
 import os
 import urllib.parse
@@ -11,9 +12,7 @@ from types import SimpleNamespace as NS
 import pytest
 import requests
 
-pytestmark = pytest.mark.skipif(
-    not (os.getenv("FIRESTORE_EMULATOR_HOST") and os.getenv("FIREBASE_AUTH_EMULATOR_HOST")),
-    reason="needs the Firestore, Auth and Storage emulators")
+HAVE_EMULATORS = bool(os.getenv("FIRESTORE_EMULATOR_HOST") and os.getenv("FIREBASE_AUTH_EMULATOR_HOST"))
 
 PROJECT = os.getenv("GCLOUD_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or "demo-fates"
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", PROJECT)
@@ -58,6 +57,8 @@ def _url(path: str) -> str:
 
 @pytest.fixture(scope="module")
 def env():
+    if not HAVE_EMULATORS:
+        pytest.skip("needs the Firestore, Auth and Storage emulators")
     import main
     import face_match
     from fastapi.testclient import TestClient
@@ -65,9 +66,12 @@ def env():
 
     requests.delete(f"http://{os.environ['FIRESTORE_EMULATOR_HOST']}/emulator/v1/projects/{PROJECT}/databases/(default)/documents")
 
+    # The fakes below are undone when this module is done, so later test files see the real functions.
+    mp = pytest.MonkeyPatch()
+
     # A selfie's bytes say what it shows: "<face>|<pose>|<n>" (n keeps every upload unique).
     blobs = {}
-    main._download_image_bytes = lambda url, max_mb=10: blobs[url]
+    mp.setattr(main, "_download_image_bytes", lambda url, max_mb=10: blobs[url])
 
     def vision(data):
         face, pose = data.decode().split("|")[:2]
@@ -77,16 +81,16 @@ def env():
                bounding_poly=NS(vertices=verts))
         return "VERY_UNLIKELY", "VERY_UNLIKELY", "VERY_UNLIKELY", [f]
 
-    main._detect_faces_and_safety_from_bytes = vision
-    face_match.available = lambda: True
-    face_match.decode = lambda data: data.decode().split("|")[0]
-    face_match.mirror = lambda key: key                      # the fake faces look the same either way
-    face_match.face_features = lambda key: [vec(key)] if key else []
+    mp.setattr(main, "_detect_faces_and_safety_from_bytes", vision)
+    mp.setattr(face_match, "available", lambda: True)
+    mp.setattr(face_match, "decode", lambda data: data.decode().split("|")[0])
+    mp.setattr(face_match, "mirror", lambda key: key)                    # the fake faces look the same either way
+    mp.setattr(face_match, "face_features", lambda key: [vec(key)] if key else [])
     photos = {}
-    main._own_photos = lambda uid: photos.get(uid, [])
-    main._photo_faces = lambda urls: [[vec(urllib.parse.unquote(u.rsplit("/", 1)[-1]).rsplit("/", 1)[-1].rsplit(".", 1)[0])]
-                                      for u in urls]
-    main._cohort_scores = lambda uid, front: []
+    mp.setattr(main, "_own_photos", lambda uid: photos.get(uid, []))
+    mp.setattr(main, "_photo_faces", lambda urls: [
+        [vec(urllib.parse.unquote(u.rsplit("/", 1)[-1]).rsplit("/", 1)[-1].rsplit(".", 1)[0])] for u in urls])
+    mp.setattr(main, "_cohort_scores", lambda uid, front: [])
     main._templates.update(at=0.0, full=0.0, since="", v={})
 
     client = TestClient(main.app)
@@ -95,11 +99,11 @@ def env():
     gcs = main._gcs().bucket(BUCKET)
     counter = {"n": 0}
 
-    def user(name, photo_face=None):
+    def user(name, photo_face=None, profile_for=None):
         token, uid = _token(name)
         photos[uid] = [f"https://firebasestorage.googleapis.com/v0/b/{BUCKET}/o/users%2F{uid}%2Fphotos%2F{photo_face or name}.jpg"]
         db.document(f"publicProfiles/{uid}").set({"uid": uid, "gender": "Female", "photos": photos[uid]})
-        db.document(f"profiles/{uid}").set({"firstName": name})
+        db.document(f"profiles/{uid}").set({"firstName": name, **({"profileFor": profile_for} if profile_for else {})})
         return uid, {"Authorization": f"Bearer {token}"}
 
     def selfies(uid, steps, face, poses=None):
@@ -113,12 +117,13 @@ def env():
             urls.append(_url(path))
         return urls
 
-    def attempt(uid, h, face, poses=None):
+    def attempt(uid, h, face, poses=None, **extra):
         start = client.post("/verify-face-start", headers=h, json={"consent": "face-test"})
         assert start.status_code == 200, start.text
         ch = start.json()
         urls = selfies(uid, ch["steps"], face, poses(ch["steps"]) if poses else None)
-        r = client.post("/verify-face-live", headers=h, json={"challengeId": ch["challengeId"], "selfies": urls})
+        r = client.post("/verify-face-live", headers=h,
+                        json={"challengeId": ch["challengeId"], "selfies": urls, **extra})
         return r, ch, urls
 
     def left(uid):
@@ -126,6 +131,7 @@ def env():
 
     yield NS(client=client, db=db, user=user, attempt=attempt, selfies=selfies, left=left, photos=photos, main=main)
     client.__exit__(None, None, None)
+    mp.undo()
 
 
 def test_a_challenge_is_random_short_lived_and_used_once(env):
@@ -275,3 +281,57 @@ def test_the_duplicate_cache_reads_only_what_changed(env):
     after = m._verified_templates()
     assert "approved_later" in after and "still_pending" not in after
     assert set(before) <= set(after)
+
+
+# ------------------------------------------------------------------ the person's own consent (managed profiles)
+CONSENT_KEYS = {"personConsentAtIso", "personConsentVia", "personConsentTextVersion"}
+
+
+def test_the_consent_rule():
+    import main
+    now = "2026-10-11T09:00:00Z"
+    got = main._person_consent_fields("daughter", True, "pc-2026-10", "ok", now)
+    assert got == {"personConsentAtIso": now, "personConsentVia": "face_check", "personConsentTextVersion": "pc-2026-10"}
+    for relation in ("son", "daughter", "brother", "sister", "relative", "friend", " Son "):
+        assert main._person_consent_fields(relation, True, "v1", "ok", now) is not None
+    for relation in ("self", "", None, "none", "father"):
+        assert main._person_consent_fields(relation, True, "v1", "ok", now) is None       # not made for someone else
+    assert main._person_consent_fields("son", False, "v1", "ok", now) is None              # not asked on the screen
+    for status in ("failed", "in_review"):
+        assert main._person_consent_fields("son", True, "v1", status, now) is None         # only a passed check
+    odd = main._person_consent_fields("son", True, "c1-2026-10<script>/../" + "x" * 80, "ok", now)
+    assert odd["personConsentTextVersion"] == ("c1-2026-10script.." + "x" * 80)[:40]
+    assert main._person_consent_fields("son", True, None, "ok", now)["personConsentTextVersion"] == ""
+
+
+def test_old_apps_send_no_consent_fields():
+    import main
+    body = main.VerifyFaceLiveRequest(challengeId="c", selfies=["a", "b", "c"])
+    assert body.personConsent is False and body.consentTextVersion == ""
+
+
+def test_a_passed_check_on_a_managed_profile_records_the_persons_consent(env):
+    uid, h = env.user("managed_daughter", profile_for="daughter")
+    r, _, _ = env.attempt(uid, h, "managed_daughter", personConsent=True, consentTextVersion="pc-2026-10")
+    assert r.json()["status"] == "ok"
+    prof = env.db.document(f"profiles/{uid}").get().to_dict()
+    assert prof["personConsentVia"] == "face_check" and prof["personConsentTextVersion"] == "pc-2026-10"
+    assert prof["personConsentAtIso"] and prof["faceVerified"] is True
+    rec = env.db.document(f"faceVerifications/{uid}").get().to_dict()
+    assert {k: rec[k] for k in CONSENT_KEYS} == {k: prof[k] for k in CONSENT_KEYS}      # the same batch, copied
+    card = env.db.document(f"publicProfiles/{uid}").get().to_dict()
+    assert not CONSENT_KEYS & set(card)                                                  # never on the card
+
+
+def test_no_consent_without_a_pass_a_managed_profile_or_the_ask(env):
+    own, h1 = env.user("own_profile", profile_for="self")
+    assert env.attempt(own, h1, "own_profile", personConsent=True, consentTextVersion="pc")[0].json()["status"] == "ok"
+    failed, h2 = env.user("managed_failed", profile_for="son")
+    r, _, _ = env.attempt(failed, h2, "managed_failed", poses=lambda steps: ["front"] * len(steps),
+                          personConsent=True, consentTextVersion="pc")
+    assert r.json()["status"] == "failed"
+    unasked, h3 = env.user("managed_unasked", profile_for="sister")
+    assert env.attempt(unasked, h3, "managed_unasked")[0].json()["status"] == "ok"
+    for uid in (own, failed, unasked):
+        assert not CONSENT_KEYS & set(env.db.document(f"profiles/{uid}").get().to_dict()), uid
+        assert not CONSENT_KEYS & set(env.db.document(f"faceVerifications/{uid}").get().to_dict()), uid
