@@ -553,23 +553,30 @@ def pref_misses(prefs: Dict[str, Any], other: Person, own_manglik: str) -> List[
 
 
 def must_haves(prefs: Dict[str, Any]) -> set:
-    """Which preferences hide people: the "Must have" marks (religion and marital status when never saved) plus the
-    ones that are must-haves by what they say. Work and height never hide anyone."""
+    """Which preferences hide people from my own list: the "Must have" marks (religion and marital status when never
+    saved) plus the ones that are must-haves by what they say. Work and height never hide anyone."""
     strict = prefs.get("strict")
     marked = DEFAULT_STRICT if strict is None else [t for t in strict if t in STRICT_TOKENS]
     return set(marked) | set(ALWAYS_MUST)
 
 
+def marked_must_haves(prefs: Dict[str, Any]) -> set:
+    """The parts a family marked "Must have" itself (pref_strict, only the toggled ones): the only wishes that hide
+    their profile from others (matching owner decision 3). Never the defaults and never ALWAYS_MUST."""
+    strict = prefs.get("strict")
+    return set() if strict is None else {t for t in strict if t in STRICT_TOKENS}
+
+
 def _pref_gate(viewer: Person, cand: Person) -> Optional[str]:
-    """Partner preferences both ways (rishta mode). My must-haves follow the default rule; theirs count only when
-    their family saved pref_strict (the copy that says must-haves hide both ways). Unknown values pass.
+    """Partner preferences both ways (rishta mode). My must-haves follow the default rule; theirs are only the parts
+    their family marked "Must have" (the copy that says marked parts hide both ways). Unknown values pass.
     Returns None, or why the candidate is left out."""
     mine = must_haves(viewer.prefs)
     for t in pref_misses(viewer.prefs, cand, viewer.manglik):
         if t in mine:
             return f"pref_{t}"
-    if cand.prefs.get("strict") is not None:
-        theirs = must_haves(cand.prefs)
+    theirs = marked_must_haves(cand.prefs)
+    if theirs:
         for t in pref_misses(cand.prefs, viewer, cand.manglik):
             if t in theirs:
                 return f"their_pref_{t}"
@@ -685,7 +692,8 @@ def pools_of(card: Optional[Dict[str, Any]], today_day: str, quick_male_min_age:
     """The Python mirror of feed.ts poolsOf (plan §2 C1), read from the server-written card index:
     - inRishta: feedRishta is true and today has reached feedRishtaFromDay (21 for men, 18 for women). A card
       without feedRishta is never in rishta.
-    - inQuick: feedQuick is true and today has reached feedQuickFromDay. A card indexed before 1.0.8 (no feedQuick)
+    - inQuick: feedQuick is true and today has reached feedQuickFromDay (a string; '' = already old enough, a missing
+      day = not in quick, as the JS comparison is). A card indexed before 1.0.8 (no feedQuick)
       uses the legacy rule from its own facts: made for oneself, not marked for marriage, and old enough
       (men quick_male_min_age, everyone else 18)."""
     card = card or {}
@@ -697,8 +705,10 @@ def pools_of(card: Optional[Dict[str, Any]], today_day: str, quick_male_min_age:
         in_quick = (_norm(card.get("profileFor")) in SELF_PROFILE and card.get("marriageIntent") is not True
                     and card_age(card, day) >= min_age)
     else:
+        # C1 `todayDay >= feedQuickFromDay`: in JS a missing or null day compares false, so only a string day
+        # ('' too) opens it.
         quick_from = card.get("feedQuickFromDay")
-        in_quick = card.get("feedQuick") is True and day >= (quick_from if isinstance(quick_from, str) else "")
+        in_quick = card.get("feedQuick") is True and isinstance(quick_from, str) and day >= quick_from
     return {"inRishta": bool(in_rishta), "inQuick": bool(in_quick)}
 
 

@@ -314,14 +314,21 @@ def test_dating_fates_never_bring_a_family_made_or_marriage_only_profile(rishta_
 
 
 def test_rishta_mode_viewer_rules(rishta_env):
+    import fates_api
     c, vs, db = rishta_env["client"], rishta_env["v"], rishta_env["db"]
-    for name, body_json, reason in (("sam", {"mode": "rishta"}, "needs_intent"), ("kid", {"mode": "rishta"}, "groom_age"),
-                                    ("mom", {}, "no_quick")):
-        r = c.post("/fates/today", json=body_json, headers=vs[name]["h"])
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["paths"] == [] and body["reason"] == reason and body["opensLeft"] == 0
-        assert not db.document(f"dailyFates/{vs[name]['uid']}__{body['dayKey']}").get().exists   # nothing stored
+    day = fates_api.day_key()
+    # Plan §2 C1: rishta-mode Fates refuse like getRishtas and swipeAction, a 403 with the reason as the detail.
+    for name, reason in (("sam", "needs_intent"), ("kid", "groom_age")):
+        r = c.post("/fates/today", json={"mode": "rishta"}, headers=vs[name]["h"])
+        assert r.status_code == 403, r.text
+        assert r.json() == {"detail": reason}
+        assert not db.document(f"dailyFates/{vs[name]['uid']}__{day}").get().exists        # nothing stored
+    # Dating mode for a family-made profile: an empty day (1.0.7 reads any other 403 as a server error).
+    r = c.post("/fates/today", json={}, headers=vs["mom"]["h"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["paths"] == [] and body["reason"] == "no_quick" and body["opensLeft"] == 0
+    assert not db.document(f"dailyFates/{vs['mom']['uid']}__{body['dayKey']}").get().exists
 
 
 def test_a_mode_switch_never_shows_the_other_modes_unopened_people(rishta_env):

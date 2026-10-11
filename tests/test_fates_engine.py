@@ -488,6 +488,9 @@ POOL_VECTORS = [
     ("quick from a later day", {"gender": "Male", "feedQuick": True, "feedQuickFromDay": "2027-01-01"}, TODAY, 21, False, False),
     ("quick with an unknown birth day", {"gender": "Female", "feedQuick": True, "feedQuickFromDay": ""}, TODAY, 21, False, True),
     ("indexed as not quick", {"gender": "Female", "age": 30, "feedQuick": False, "feedQuickFromDay": ""}, TODAY, 21, False, False),
+    # C1 `todayDay >= feedQuickFromDay`: a missing or null day compares false in JS, so the age gate stays shut.
+    ("quick without feedQuickFromDay", {"gender": "Male", "age": 19, "feedQuick": True}, TODAY, 21, False, False),
+    ("quick with a null feedQuickFromDay", {"gender": "Male", "age": 19, "feedQuick": True, "feedQuickFromDay": None}, TODAY, 21, False, False),
 ]
 
 
@@ -752,18 +755,31 @@ def test_work_only_ranks():
 
 
 def test_their_wishes_hide_only_when_they_saved_must_haves():
-    me = rp("me", {}, religion="Hindu", caste="Bhumihar")
+    me = rp("me", {}, religion="Hindu", caste="Bhumihar", marital_status="Divorced", diet="Non-vegetarian")
     jain_only = {"pref_religions": ["Jain"]}
     assert fe._pref_gate(me, rp("c", jain_only)) is None                                 # pref_strict never saved
+    assert fe._pref_gate(me, rp("c", {**jain_only, "pref_strict": []})) is None          # saved, nothing marked
     assert fe._pref_gate(me, rp("c", {**jain_only, "pref_strict": ["religions"]})) == "their_pref_religions"
     assert fe._pref_gate(me, rp("c", {**jain_only, "pref_strict": ["diets"]})) is None
-    castes = {"pref_castes": ["Brahmin"]}
-    assert fe._pref_gate(me, rp("c", castes)) is None
-    assert fe._pref_gate(me, rp("c", {**castes, "pref_strict": []})) == "their_pref_castes"
-    # Their Manglik "Must match" is held against their own Manglik.
-    mine = rp("me", {}, manglik="Yes")
-    assert fe._pref_gate(mine, rp("c", {"pref_manglik": "match", "pref_strict": []}, manglik="No")) == "their_pref_manglik"
-    assert fe._pref_gate(mine, rp("c", {"pref_manglik": "match"}, manglik="No")) is None
+    assert fe._pref_gate(me, rp("c", {"pref_maritalStatuses": ["Never married"], "pref_strict": ["maritalStatuses"]})) \
+        == "their_pref_maritalStatuses"
+    assert fe._pref_gate(me, rp("c", {"pref_diets": ["Vegetarian"], "pref_strict": ["diets"]})) == "their_pref_diets"
+
+
+def test_their_unmarkable_wishes_never_hide_my_profile():
+    """Matching owner decision 3: only parts a family marked "Must have" hide their profile. Caste, Manglik, income and
+    children have no toggle, so on their side they never hide anyone, whatever pref_strict holds."""
+    me = rp("me", {}, religion="Hindu", caste="Bhumihar", manglik="Yes", income="0-2L", children="Yes, living together")
+    wishes = {"pref_castes": ["Brahmin"], "pref_manglik": "match", "pref_incomeMinLakh": 20, "pref_childrenOk": "none"}
+    for strict in (None, [], ["religions", "maritalStatuses", "diets", "communities", "education"],
+                   ["castes", "manglik", "income", "children"]):                         # unmarkable tokens are ignored
+        doc = wishes if strict is None else {**wishes, "pref_strict": strict}
+        assert fe._pref_gate(me, rp("c", doc, manglik="No")) is None, strict
+    # The same wishes are still must-haves on my own side.
+    mine = rp("me", {"pref_castes": ["Brahmin"]}, caste="Bhumihar")
+    assert fe._pref_gate(mine, rp("c", {}, caste="Rajput")) == "pref_castes"
+    assert fe.marked_must_haves({"strict": None}) == set()
+    assert fe.marked_must_haves({"strict": ["castes", "religions", "professions"]}) == {"religions"}
 
 
 def test_my_must_haves_come_first_in_the_reason():
@@ -1035,6 +1051,29 @@ def test_request_mode_and_viewer_rules(api):
     assert api.viewer_block("rishta", {}, SELF_GROOM, TODAY) is None
     assert api.viewer_block("quick", {}, {"profileFor": "none"}, TODAY) == "no_quick"
     assert api.viewer_block("quick", {}, SELF_GROOM, TODAY) is None
+
+
+def test_today_refuses_rishta_mode_with_a_403_and_dating_gets_an_empty_day(api, monkeypatch):
+    """Plan §2 C1: rishta-mode Fates answer 403 'needs_intent' / 'groom_age' (like getRishtas and swipeAction); the
+    dating Fates of a family-made profile stay a 200 empty day ('no_quick'), which 1.0.7 already shows."""
+    from fastapi import HTTPException
+    privs = {"sam": {"profileFor": "self", "gender": "male", "birthDate": "1996-01-01"},
+             "kid": {**SELF_GROOM, "birthDate": "2006-01-01"},
+             "mom": {"marriageIntent": True, "consentDeclaredAtIso": "2026-10-01T00:00:00Z", "profileFor": "son"}}
+    db = FakeDb({f"profiles/{u}": p for u, p in privs.items()})
+    who = {"uid": ""}
+    monkeypatch.setattr(api, "_deps", api.Deps(db=lambda: db, verify_uid=lambda h: who["uid"],
+                                                complete=lambda *a, **k: ("{}", "stop"), resolve_place=lambda p: None,
+                                                is_premium=lambda *a: False))
+    for uid, reason in (("sam", "needs_intent"), ("kid", "groom_age")):
+        who["uid"] = uid
+        with pytest.raises(HTTPException) as err:
+            api.fates_today(api.TodayRequest(mode="rishta"), authorization="Bearer x")
+        assert (err.value.status_code, err.value.detail) == (403, reason)
+    who["uid"] = "mom"
+    body = api.fates_today(None, authorization="Bearer x")
+    assert body["paths"] == [] and body["reason"] == "no_quick" and body["mode"] == "quick"
+    assert not [k for k in db.data if k.startswith("dailyFates/")]                      # nothing picked or stored
 
 
 def test_a_day_made_in_the_other_mode_never_shows_its_unopened_people(api):

@@ -617,7 +617,8 @@ def request_mode(body: Optional[TodayRequest]) -> str:
 
 def viewer_block(mode: str, pub: Dict[str, Any], priv: Dict[str, Any], today: str) -> Optional[str]:
     """Who may have today's Fates in this mode (plan §2 C1): rishta mode needs profiles.marriageIntent ('needs_intent')
-    and, for a man's own profile, 21 years ('groom_age'); the dating Fates are only for one's own profile ('no_quick')."""
+    and, for a man's own profile, 21 years ('groom_age'), each a 403; the dating Fates are only for one's own profile
+    ('no_quick', an empty day)."""
     if mode == MODE_RISHTA:
         return fe.rishta_viewer_block(priv, pub, today)
     return fe.quick_viewer_block(priv)
@@ -649,7 +650,11 @@ def fates_today(body: Optional[TodayRequest] = Body(default=None), authorization
     premium = _d().is_premium(usr, priv, datetime.now(timezone.utc))
     accuracy = _accuracy(viewer, {**usr, **priv})
     blocked = viewer_block(mode, pub, priv, fe.ist_day())
+    if blocked and mode == MODE_RISHTA:
+        # Plan §2 C1: rishta-mode Fates refuse like getRishtas and swipeAction, 403 'needs_intent' / 'groom_age'.
+        raise HTTPException(status_code=403, detail=blocked)
     if blocked:
+        # Dating mode for a family-made profile ('no_quick'): an empty day, as 1.0.7 reads any other 403 as an error.
         return _empty_view(memory, key, premium, accuracy, mode, blocked)
     if mode == MODE_RISHTA:
         fe.rishta_ready(viewer, viewer=True)
@@ -673,7 +678,7 @@ EMPTY_DAY_RECHECK_HOURS = 3
 
 def _empty_view(memory: Dict[str, Any], key: str, premium: bool, accuracy: Dict[str, Any], mode: str,
                 reason: str) -> Dict[str, Any]:
-    """No Fates in this mode for this viewer (nobody is picked or stored): 'needs_intent', 'groom_age' or 'no_quick'."""
+    """No dating Fates for this viewer (nobody is picked or stored): 'no_quick'. Rishta mode refuses with a 403."""
     return {
         "ok": True, "dayKey": key, "closesAtIso": day_closes_at(key).isoformat(), "paths": [], "mode": mode,
         "reason": reason, "opensLeft": 0, "premium": premium, "canUnlock": {"ad": False, "crown": False},
