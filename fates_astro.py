@@ -4,13 +4,21 @@ Tables were cross-checked in Sept 2026 against AstroSage and Prokerala software 
 independent published tables (see docs in tests/ashtakoota_fixtures.json). Every matrix here is
 [boy][girl]. Raw koota points are kept as the software shows them; dosha cancellations are reported
 separately and never change the 36-point total.
+
+Manglik (audit 9, plan C3): a status per chart, "yes" | "partial" | "no" | "check". Only the Lagna gives a
+full "yes"; Mars counted from the Moon or Venus alone is "partial"; without the Lagna (no birth time or
+place) it stays "check", never a verdict; the common cancellations make it "no".
 """
 from __future__ import annotations
 
+from datetime import datetime
 from itertools import product
 from typing import Any, Dict, List, Optional, Tuple
 
-from fates_astro_chart import chart_for_profile, chart_from_birth, house_from  # noqa: F401  (re-exported)
+import swisseph as swe
+
+import fates_astro_chart as _fc
+from fates_astro_chart import _parse_date, _parse_time, house_from  # noqa: F401  (house_from is re-exported)
 
 # ---------------------------------------------------------------- nakshatras 0..26
 NAKSHATRAS: List[Tuple[str, str, str, str]] = [   # name, gana, nadi, yoni animal
@@ -74,6 +82,14 @@ GANA = [[6, 6, 0], [5, 6, 0], [1, 0, 6]]
 
 BHAKOOT_BAD = {2: "2/12", 12: "2/12", 5: "5/9", 9: "5/9", 6: "6/8", 8: "6/8"}
 MANGLIK_HOUSES = {1, 2, 4, 7, 8, 12}
+MANGLIK_FULL_HOUSES = {1, 4, 7, 8, 12}   # from the Lagna; the 2nd alone is partial
+# The commonly published house-sign exceptions: Mars in these signs in that house is not Manglik.
+MANGLIK_SIGN_EXCEPTIONS = {1: {0}, 2: {2, 5}, 4: {0, 7}, 7: {3, 9}, 8: {8, 11}, 12: {1, 6}}
+MARS_OWN_OR_EXALTED = {0, 7, 9}           # Mesha, Vrischika (own), Makara (exalted)
+JUPITER_ON_MARS = {1, 5, 7, 9}            # Mars with Jupiter, or in the 5th, 7th or 9th house from it (its aspects)
+CANCEL_OWN_SIGN = "Mars in its own or exalted sign"
+CANCEL_JUPITER = "Jupiter with or aspecting Mars"
+MOON_KEYS_MANGLIK = {"yes": "yes", "partial": "mild", "no": "no", "check": "unknown"}
 
 KOOTA_MAX = {"Varna": 1, "Vashya": 2, "Tara": 3, "Yoni": 4, "Graha Maitri": 5, "Gana": 6, "Bhakoot": 7, "Nadi": 8}
 
@@ -160,36 +176,103 @@ def gana_dosha(pts: Dict[str, float]) -> Optional[Dict[str, Any]]:
     return {"name": "Gana dosha", "present": True, "cancelled": False, "why": "Your temperaments differ: give each other room."}
 
 
+def _sign_exception(label: str) -> str:
+    return f"Mars's sign is an accepted exception for its house from {'Venus' if label == 'Venus' else 'the ' + label}"
+
+
 def manglik_status(chart: Dict[str, Any]) -> Dict[str, Any]:
+    """One chart's Manglik (plan C3). Keeps the old fields (manglik, mild, from, cancelledBy) for 1.0.7 apps
+    and adds status ("yes" | "partial" | "no" | "check"), cancelReasons and sure (the Lagna is known).
+
+    - Mars in a Manglik house from the Lagna (1, 4, 7, 8, 12): "yes"; the 2nd house from the Lagna: "partial".
+    - Only from the Moon or Venus: "partial".
+    - No Lagna (no birth time or place): "check", whatever the Moon and Venus say.
+    - Cancellations make it "no": Mars in its own or exalted sign, Jupiter with or aspecting Mars, and the
+      house-sign exceptions (MANGLIK_SIGN_EXCEPTIONS), which drop the house they apply to.
+    The reasons never name a sign or a house, so a rishta member's side gives nothing of their chart away.
+    """
+    lagna = chart.get("lagna")
+    sure = lagna is not None
     mars = chart.get("marsRashi")
     if mars is None:
-        return {"manglik": False, "mild": False, "from": []}
+        return {"manglik": False, "mild": False, "from": [], "status": "check", "cancelReasons": [], "sure": False}
     refs = []
-    for label, ref in (("Lagna", chart.get("lagna")), ("Moon", chart.get("rashi")), ("Venus", chart.get("venusRashi"))):
+    for label, ref in (("Lagna", lagna), ("Moon", chart.get("rashi")), ("Venus", chart.get("venusRashi"))):
         h = house_from(mars, ref)
         if h in MANGLIK_HOUSES:
             refs.append((label, h))
-    if not refs:
-        return {"manglik": False, "mild": False, "from": []}
-    # Mars in its own sign (Mesha, Vrischika) or exalted (Makara) is widely held to cancel it.
-    if mars in (0, 7, 9):
-        return {"manglik": False, "mild": False, "from": [r[0] for r in refs], "cancelledBy": "Mars in its own or exalted sign"}
-    mild = all(h == 2 for _, h in refs)
-    return {"manglik": True, "mild": mild, "from": [r[0] for r in refs]}
+    kept = [(label, h) for label, h in refs if mars not in MANGLIK_SIGN_EXCEPTIONS[h]]
+    excepted = [_sign_exception(label) for label, h in refs if mars in MANGLIK_SIGN_EXCEPTIONS[h]]
+    whole = []
+    if mars in MARS_OWN_OR_EXALTED:
+        whole.append(CANCEL_OWN_SIGN)
+    jupiter = chart.get("jupiterRashi")
+    if jupiter is not None and house_from(mars, jupiter) in JUPITER_ON_MARS:
+        whole.append(CANCEL_JUPITER)
+
+    # Something to cancel: a house found, or an unknown Lagna that could still give one.
+    reasons = (whole if (refs or not sure) else []) + excepted
+    if whole and (refs or not sure):
+        status = "no"
+    elif not sure:
+        status = "check"
+    elif not kept:
+        status = "no"
+    else:
+        lagna_house = next((h for label, h in kept if label == "Lagna"), None)
+        status = "yes" if lagna_house in MANGLIK_FULL_HOUSES else "partial"
+
+    manglik = bool(kept) and not whole
+    out: Dict[str, Any] = {
+        "manglik": manglik, "mild": manglik and all(h == 2 for _, h in kept),
+        "from": [label for label, _ in (kept if manglik else refs)],
+    }
+    if status == "no" and reasons:
+        out["cancelledBy"] = reasons[0]
+    out.update({"status": status, "cancelReasons": reasons, "sure": sure})
+    return out
+
+
+MANGLIK_CHECK_WHY = ("The Manglik check needs both birth times and places, because it counts Mars from the Lagna. "
+                     "Until then it stays a check, not a verdict.")
 
 
 def manglik_dosha(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """The Manglik row of a match. status: "clear" | "cancelled" | "present" | "check" ("check" when either side
+    is "check": never "present" without both Lagnas). present/cancelled keep their meaning for 1.0.7 apps."""
     ma, mb = manglik_status(a), manglik_status(b)
-    strong_a, strong_b = ma["manglik"] and not ma["mild"], mb["manglik"] and not mb["mild"]
-    lagna_note = "" if a.get("lagna") is not None and b.get("lagna") is not None else " (from Moon and Venus; a birth time adds the Lagna check)"
-    if not ma["manglik"] and not mb["manglik"]:
-        return {"name": "Manglik", "present": False, "cancelled": False, "why": "Neither of you is Manglik" + lagna_note + "."}
-    if ma["manglik"] and mb["manglik"]:
-        return {"name": "Manglik", "present": True, "cancelled": True, "why": "You are both Manglik, which cancels it out."}
-    if not (strong_a or strong_b):
-        return {"name": "Manglik", "present": True, "cancelled": True, "why": "A mild Manglik placement (2nd house only) on one side."}
-    who = "You are" if strong_a else "They are"
-    return {"name": "Manglik", "present": True, "cancelled": False, "why": f"{who} Manglik and the other isn’t{lagna_note}. Many families ask a pandit about this."}
+    sa, sb = ma["status"], mb["status"]
+    if "check" in (sa, sb):
+        # 1.0.7 apps still read present/cancelled: the old Moon-and-Venus reading, with the new cancellations.
+        strong_a, strong_b = ma["manglik"] and not ma["mild"], mb["manglik"] and not mb["mild"]
+        present = ma["manglik"] or mb["manglik"]
+        cancelled = present and ((ma["manglik"] and mb["manglik"]) or not (strong_a or strong_b))
+        return {"name": "Manglik", "present": present, "cancelled": cancelled, "why": MANGLIK_CHECK_WHY, "status": "check"}
+    ya, yb = sa in ("yes", "partial"), sb in ("yes", "partial")
+    if not ya and not yb:
+        return {"name": "Manglik", "present": False, "cancelled": False, "why": "Neither of you is Manglik.", "status": "clear"}
+    if ya and yb:
+        return {"name": "Manglik", "present": True, "cancelled": True, "why": "You are both Manglik, which cancels it out.",
+                "status": "cancelled"}
+    if "yes" not in (sa, sb):
+        return {"name": "Manglik", "present": True, "cancelled": True, "status": "cancelled",
+                "why": "A partial Manglik placement on one side only, which most families don’t count as a dosha."}
+    who = "You are" if sa == "yes" else "They are"
+    return {"name": "Manglik", "present": True, "cancelled": False, "status": "present",
+            "why": f"{who} Manglik and the other isn’t. Worth knowing: many families talk it over with a pandit."}
+
+
+def moon_keys(chart: Dict[str, Any]) -> Dict[str, Any]:
+    """What getRishtas needs to work out the 36 gunas without the astro server (matching §1/§3):
+    main = [rashi, nak, half], where half (1 from 15 deg) matters only for Dhanu and Makara (the Vashya split);
+    options = every [rashi, nak] the day allows; manglik in the matching vocabulary (yes | mild | no | unknown,
+    from the C3 status yes | partial | no | check)."""
+    r, n = int(chart["rashi"]), int(chart["nak"])
+    lon = chart.get("moonLon")
+    half = 1 if r in (8, 9) and lon is not None and float(lon) % 30.0 >= 15.0 else 0
+    options = [[int(o[0]), int(o[1])] for o in (chart.get("options") or [[r, n]])]
+    return {"main": [r, n, half], "options": options, "exact": chart.get("precision") == "exact",
+            "manglik": MOON_KEYS_MANGLIK[manglik_status(chart)["status"]]}
 
 
 # ---------------------------------------------------------------- words
@@ -251,21 +334,26 @@ def _moon(chart: Dict[str, Any], rashi: Optional[int] = None, nak: Optional[int]
             "lon": chart.get("moonLon") if rashi is None else None, "pada": chart.get("pada") if rashi is None else None}
 
 
+def gender_roles(a_gender: str, b_gender: str) -> List[bool]:
+    """Who is the groom, as a list of "a is the boy" runs: one run when the genders say it, both directions
+    (averaged by the 36 gunas; the first one taken by porutham) when they are the same or unknown."""
+    if a_gender == "male" and b_gender != "male":
+        return [True]
+    if b_gender == "male" and a_gender != "male":
+        return [False]
+    if a_gender == "female" and b_gender not in ("female",):
+        return [False]
+    return [True, False]
+
+
 def match_charts(a: Dict[str, Any], b: Dict[str, Any], a_gender: str, b_gender: str) -> Dict[str, Any]:
     """a = the viewer. Roles follow gender; same or unknown genders average both directions."""
-    if a_gender == "male" and b_gender != "male":
-        orientations = [True]
-    elif b_gender == "male" and a_gender != "male":
-        orientations = [False]
-    elif a_gender == "female" and b_gender not in ("female",):
-        orientations = [False]
-    else:
-        orientations = [True, False]
+    roles = gender_roles(a_gender, b_gender)
 
     ma, mb = _moon(a), _moon(b)
 
     def score(x: Dict[str, Any], y: Dict[str, Any]) -> Dict[str, float]:
-        runs = [koota_points(x, y) if o else koota_points(y, x) for o in orientations]
+        runs = [koota_points(x, y) if o else koota_points(y, x) for o in roles]
         return {k: sum(r[k] for r in runs) / len(runs) for k in KOOTA_MAX}
 
     pts = score(ma, mb)
@@ -276,7 +364,7 @@ def match_charts(a: Dict[str, Any], b: Dict[str, Any], a_gender: str, b_gender: 
     opts_b = [(o[0], o[1]) for o in b.get("options") or [[b["rashi"], b["nak"]]]]
     totals = [sum(score(_moon(a, ra, na), _moon(b, rb, nb)).values()) for (ra, na), (rb, nb) in product(opts_a, opts_b)]
 
-    a_is_boy = orientations[0]
+    a_is_boy = roles[0]
     boy, girl = (ma, mb) if a_is_boy else (mb, ma)
     kootas = [{"name": k, "points": pts[k], "max": KOOTA_MAX[k], "meaning": _meaning(k, pts[k], boy, girl, a_is_boy)} for k in KOOTA_MAX]
     doshas = [nadi_dosha(ma, mb), bhakoot_dosha(boy, girl), manglik_dosha(a, b)]
@@ -296,3 +384,36 @@ def match_people(a, b) -> Optional[Dict[str, Any]]:
     if not a.chart or not b.chart:
         return None
     return match_charts(a.chart, b.chart, a.gender, b.gender)
+
+
+# ---------------------------------------------------------------- charts
+def _jupiter_rashi(date: Tuple[int, int, int], time: Optional[Tuple[int, int]], place: Optional[Dict[str, Any]]) -> int:
+    """Jupiter's sidereal sign at the same moment fates_astro_chart uses (local noon without a time)."""
+    tz = _fc._zone(place.get("tz") if place else None)
+    h, mi = time if time else (12, 0)
+    jd = _fc._jd(datetime(date[0], date[1], date[2], h, mi, tzinfo=tz))
+    return int(_fc._lon(jd, swe.JUPITER) // 30.0) % 12
+
+
+def chart_from_birth(date: Tuple[int, int, int], time: Optional[Tuple[int, int]],
+                     place: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """fates_astro_chart.chart_from_birth plus jupiterRashi, which the Manglik cancellations need."""
+    chart = _fc.chart_from_birth(date, time, place)
+    try:
+        chart["jupiterRashi"] = _jupiter_rashi(date, time, place)
+    except Exception:   # the chart still works; only the Jupiter cancellation is skipped
+        pass
+    return chart
+
+
+def chart_for_profile(profile: Dict[str, Any], resolve_place) -> Optional[Dict[str, Any]]:
+    """fates_astro_chart.chart_for_profile, with Jupiter (see chart_from_birth)."""
+    date = _parse_date(profile.get("birthDate"))
+    if not date:
+        return None
+    place = None
+    try:
+        place = resolve_place(profile)
+    except Exception:
+        place = None
+    return chart_from_birth(date, _parse_time(profile.get("birthTime")), place)

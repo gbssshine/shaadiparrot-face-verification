@@ -1,0 +1,751 @@
+{
+ "note": "Cross-check of porutham.py against Prokerala's Tamil-system porutham, checked 2026-10-11. 'agrees' pairs match Prokerala on every item's pass/fail, so on the count, Rajju and Vedha exactly (tests assert it). The other pairs keep their known per-item variant differences (variantDiffs), so any change to the tables shows up as a test failure instead of a silent drift.",
+ "source": {
+  "name": "Prokerala Thirumana Porutham (Tamil system, star-based form)",
+  "url": "https://www.prokerala.com/astrology/thirumana-porutham.php",
+  "method": "POST girl_star and boy_star (0-based nakshatra; 'n-p' with the 0-based pada for the nine stars split between two signs), p=1, locale=en, system=tamil",
+  "checked": "2026-10-11"
+ },
+ "levels": "Prokerala's Result column: Good and Excellent = agrees, Satisfactory = partly (still agrees), Bad = no. prokeralaCount = how many of the ten are not Bad (Nadi and Varna, which Prokerala adds, are left out). prokeralaPoints is its own 0/0.5/1 points total, kept for reference only.",
+ "knownVariants": {
+  "rajju": "Prokerala's star-based form marked Rajju Good for every pair we sent, including pairs in the same Rajju group of the published table (Ashwini and Magha, both Pada) and even the same star (Ashwini with Ashwini, checked 2026-10-11). porutham.py follows the published grouping and the 1.0.8 design (same Rajju = no); Rajju exceptions (aarohana/avarohana, same sign) are not applied.",
+  "rasi": "Prokerala accepts more sign counts than the design's {1, 7, 9, 10, 11}: the 6th (Vrishabha girl, Tula boy, both ruled by Venus) and the 5th (Mesha girl, Simha boy) came back Good.",
+  "rasi_adhipathi": "Prokerala marked the lords Mars (girl) and Sun (boy), Moon and Mars, Jupiter and Mars Bad, and Mercury (girl) with Jupiter (boy) Good, while porutham.py uses the Graha Maitri table of fates_astro (friends agree, neutral partly).",
+  "dina": "Prokerala gave the same star Ashwini Bad (the design's same-star list has it as partly) and the 22nd star (Ashwini girl, Shravana boy) Good.",
+  "vasya_gana": "Prokerala calls some Vasya and Gana cells Satisfactory where the design says no (Mesha girl with a Makara or Kumbha boy; Manushya girl with a Rakshasa boy)."
+ },
+ "pairs": [
+  {
+   "id": "rohini-vrishabha_girl__swati-tula_boy",
+   "girl": {
+    "rashi": 1,
+    "nak": 3,
+    "star": "Rohini",
+    "sign": "Vrishabha",
+    "prokeralaOption": "3"
+   },
+   "boy": {
+    "rashi": 6,
+    "nak": 14,
+    "star": "Swati",
+    "sign": "Tula",
+    "prokeralaOption": "14"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Satisfactory",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Satisfactory",
+    "rajju": "Good",
+    "vedha": "Bad"
+   },
+   "prokeralaPoints": "6.5",
+   "prokeralaCount": 7,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi",
+    "rajju"
+   ]
+  },
+  {
+   "id": "ashwini-mesha_girl__magha-simha_boy",
+   "girl": {
+    "rashi": 0,
+    "nak": 0,
+    "star": "Ashwini",
+    "sign": "Mesha",
+    "prokeralaOption": "0"
+   },
+   "boy": {
+    "rashi": 4,
+    "nak": 9,
+    "star": "Magha",
+    "sign": "Simha",
+    "prokeralaOption": "9"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Bad",
+    "mahendra": "Good",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Bad",
+    "vasya": "Satisfactory",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "9",
+   "prokeralaCount": 7,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi",
+    "rasi_adhipathi",
+    "rajju"
+   ]
+  },
+  {
+   "id": "pushya-karka_girl__anuradha-vrischika_boy",
+   "girl": {
+    "rashi": 3,
+    "nak": 7,
+    "star": "Pushya",
+    "sign": "Karka",
+    "prokeralaOption": "7"
+   },
+   "boy": {
+    "rashi": 7,
+    "nak": 16,
+    "star": "Anuradha",
+    "sign": "Vrischika",
+    "prokeralaOption": "16"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Good",
+    "mahendra": "Good",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Bad",
+    "vasya": "Good",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "9",
+   "prokeralaCount": 8,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi",
+    "rasi_adhipathi",
+    "rajju"
+   ]
+  },
+  {
+   "id": "hasta-kanya_girl__shravana-makara_boy",
+   "girl": {
+    "rashi": 5,
+    "nak": 12,
+    "star": "Hasta",
+    "sign": "Kanya",
+    "prokeralaOption": "12"
+   },
+   "boy": {
+    "rashi": 9,
+    "nak": 21,
+    "star": "Shravana",
+    "sign": "Makara",
+    "prokeralaOption": "21"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Good",
+    "mahendra": "Good",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "10",
+   "prokeralaCount": 8,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi",
+    "rajju"
+   ]
+  },
+  {
+   "id": "mula-dhanu_girl__bharani-mesha_boy",
+   "girl": {
+    "rashi": 8,
+    "nak": 18,
+    "star": "Mula",
+    "sign": "Dhanu",
+    "prokeralaOption": "18"
+   },
+   "boy": {
+    "rashi": 0,
+    "nak": 1,
+    "star": "Bharani",
+    "sign": "Mesha",
+    "prokeralaOption": "1"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Bad",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Bad",
+    "rasi_adhipathi": "Bad",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7",
+   "prokeralaCount": 5,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi_adhipathi"
+   ]
+  },
+  {
+   "id": "shatabhisha-kumbha_girl__ardra-mithuna_boy",
+   "girl": {
+    "rashi": 10,
+    "nak": 23,
+    "star": "Shatabhisha",
+    "sign": "Kumbha",
+    "prokeralaOption": "23"
+   },
+   "boy": {
+    "rashi": 2,
+    "nak": 5,
+    "star": "Ardra",
+    "sign": "Mithuna",
+    "prokeralaOption": "5"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Bad",
+    "mahendra": "Good",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Bad",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7",
+   "prokeralaCount": 6,
+   "agrees": false,
+   "variantDiffs": [
+    "rajju"
+   ]
+  },
+  {
+   "id": "purva_phalguni-simha_girl__uttara_bhadrapada-meena_boy",
+   "girl": {
+    "rashi": 4,
+    "nak": 10,
+    "star": "Purva Phalguni",
+    "sign": "Simha",
+    "prokeralaOption": "10"
+   },
+   "boy": {
+    "rashi": 11,
+    "nak": 25,
+    "star": "Uttara Bhadrapada",
+    "sign": "Meena",
+    "prokeralaOption": "25"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Good",
+    "mahendra": "Satisfactory",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Bad"
+   },
+   "prokeralaPoints": "8",
+   "prokeralaCount": 7,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi",
+    "rajju"
+   ]
+  },
+  {
+   "id": "swati-tula_girl__shatabhisha-kumbha_boy",
+   "girl": {
+    "rashi": 6,
+    "nak": 14,
+    "star": "Swati",
+    "sign": "Tula",
+    "prokeralaOption": "14"
+   },
+   "boy": {
+    "rashi": 10,
+    "nak": 23,
+    "star": "Shatabhisha",
+    "sign": "Kumbha",
+    "prokeralaOption": "23"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Bad",
+    "mahendra": "Good",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Bad",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "8",
+   "prokeralaCount": 6,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi",
+    "rajju"
+   ]
+  },
+  {
+   "id": "punarvasu-mithuna_girl__chitra-tula_boy",
+   "girl": {
+    "rashi": 2,
+    "nak": 6,
+    "star": "Punarvasu",
+    "sign": "Mithuna",
+    "prokeralaOption": "6-0"
+   },
+   "boy": {
+    "rashi": 6,
+    "nak": 13,
+    "star": "Chitra",
+    "sign": "Tula",
+    "prokeralaOption": "13-2"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Bad",
+    "mahendra": "Bad",
+    "stree_deergha": "Bad",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "8",
+   "prokeralaCount": 6,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi"
+   ]
+  },
+  {
+   "id": "revati-meena_girl__ashlesha-karka_boy",
+   "girl": {
+    "rashi": 11,
+    "nak": 26,
+    "star": "Revati",
+    "sign": "Meena",
+    "prokeralaOption": "26"
+   },
+   "boy": {
+    "rashi": 3,
+    "nak": 8,
+    "star": "Ashlesha",
+    "sign": "Karka",
+    "prokeralaOption": "8"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Bad",
+    "mahendra": "Good",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Bad",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7",
+   "prokeralaCount": 6,
+   "agrees": false,
+   "variantDiffs": [
+    "rajju"
+   ]
+  },
+  {
+   "id": "jyeshtha-vrischika_girl__mrigashira-vrishabha_boy",
+   "girl": {
+    "rashi": 7,
+    "nak": 17,
+    "star": "Jyeshtha",
+    "sign": "Vrischika",
+    "prokeralaOption": "17"
+   },
+   "boy": {
+    "rashi": 1,
+    "nak": 4,
+    "star": "Mrigashira",
+    "sign": "Vrishabha",
+    "prokeralaOption": "4-0"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Bad",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Excellent",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "8",
+   "prokeralaCount": 7,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "shravana-makara_girl__uttara_phalguni-simha_boy",
+   "girl": {
+    "rashi": 9,
+    "nak": 21,
+    "star": "Shravana",
+    "sign": "Makara",
+    "prokeralaOption": "21"
+   },
+   "boy": {
+    "rashi": 4,
+    "nak": 11,
+    "star": "Uttara Phalguni",
+    "sign": "Simha",
+    "prokeralaOption": "11-0"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Satisfactory",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Bad",
+    "rasi_adhipathi": "Bad",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7.5",
+   "prokeralaCount": 6,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "ashwini-mesha_girl__chitra-tula_boy",
+   "girl": {
+    "rashi": 0,
+    "nak": 0,
+    "star": "Ashwini",
+    "sign": "Mesha",
+    "prokeralaOption": "0"
+   },
+   "boy": {
+    "rashi": 6,
+    "nak": 13,
+    "star": "Chitra",
+    "sign": "Tula",
+    "prokeralaOption": "13-2"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Bad",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7",
+   "prokeralaCount": 6,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "hasta-kanya_girl__revati-meena_boy",
+   "girl": {
+    "rashi": 5,
+    "nak": 12,
+    "star": "Hasta",
+    "sign": "Kanya",
+    "prokeralaOption": "12"
+   },
+   "boy": {
+    "rashi": 11,
+    "nak": 26,
+    "star": "Revati",
+    "sign": "Meena",
+    "prokeralaOption": "26"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Good",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Satisfactory",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "11",
+   "prokeralaCount": 9,
+   "agrees": false,
+   "variantDiffs": [
+    "rasi_adhipathi"
+   ]
+  },
+  {
+   "id": "rohini-vrishabha_girl__uttara_ashadha-makara_boy",
+   "girl": {
+    "rashi": 1,
+    "nak": 3,
+    "star": "Rohini",
+    "sign": "Vrishabha",
+    "prokeralaOption": "3"
+   },
+   "boy": {
+    "rashi": 9,
+    "nak": 20,
+    "star": "Uttara Ashadha",
+    "sign": "Makara",
+    "prokeralaOption": "20-1"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Good",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Bad",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "8",
+   "prokeralaCount": 7,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "vishakha-tula_girl__bharani-mesha_boy",
+   "girl": {
+    "rashi": 6,
+    "nak": 15,
+    "star": "Vishakha",
+    "sign": "Tula",
+    "prokeralaOption": "15-0"
+   },
+   "boy": {
+    "rashi": 0,
+    "nak": 1,
+    "star": "Bharani",
+    "sign": "Mesha",
+    "prokeralaOption": "1"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Bad",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Excellent",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "8",
+   "prokeralaCount": 6,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "chitra-kanya_girl__rohini-vrishabha_boy",
+   "girl": {
+    "rashi": 5,
+    "nak": 13,
+    "star": "Chitra",
+    "sign": "Kanya",
+    "prokeralaOption": "13-0"
+   },
+   "boy": {
+    "rashi": 1,
+    "nak": 3,
+    "star": "Rohini",
+    "sign": "Vrishabha",
+    "prokeralaOption": "3"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Bad",
+    "mahendra": "Bad",
+    "stree_deergha": "Satisfactory",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "9",
+   "prokeralaCount": 7,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "pushya-karka_girl__revati-meena_boy",
+   "girl": {
+    "rashi": 3,
+    "nak": 7,
+    "star": "Pushya",
+    "sign": "Karka",
+    "prokeralaOption": "7"
+   },
+   "boy": {
+    "rashi": 11,
+    "nak": 26,
+    "star": "Revati",
+    "sign": "Meena",
+    "prokeralaOption": "26"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Good",
+    "mahendra": "Bad",
+    "stree_deergha": "Good",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "10",
+   "prokeralaCount": 8,
+   "agrees": true,
+   "variantDiffs": []
+  },
+  {
+   "id": "ashwini-mesha_girl__shravana-makara_boy",
+   "girl": {
+    "rashi": 0,
+    "nak": 0,
+    "star": "Ashwini",
+    "sign": "Mesha",
+    "prokeralaOption": "0"
+   },
+   "boy": {
+    "rashi": 9,
+    "nak": 21,
+    "star": "Shravana",
+    "sign": "Makara",
+    "prokeralaOption": "21"
+   },
+   "prokerala": {
+    "dina": "Good",
+    "gana": "Good",
+    "mahendra": "Good",
+    "stree_deergha": "Good",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Bad",
+    "vasya": "Good",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "10",
+   "prokeralaCount": 9,
+   "agrees": false,
+   "variantDiffs": [
+    "dina",
+    "vasya"
+   ]
+  },
+  {
+   "id": "bharani-mesha_girl__shatabhisha-kumbha_boy",
+   "girl": {
+    "rashi": 0,
+    "nak": 1,
+    "star": "Bharani",
+    "sign": "Mesha",
+    "prokeralaOption": "1"
+   },
+   "boy": {
+    "rashi": 10,
+    "nak": 23,
+    "star": "Shatabhisha",
+    "sign": "Kumbha",
+    "prokeralaOption": "23"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Satisfactory",
+    "mahendra": "Bad",
+    "stree_deergha": "Good",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Bad",
+    "vasya": "Good",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7.5",
+   "prokeralaCount": 7,
+   "agrees": false,
+   "variantDiffs": [
+    "gana",
+    "vasya"
+   ]
+  },
+  {
+   "id": "ashwini-mesha_girl__ashwini-mesha_boy",
+   "girl": {
+    "rashi": 0,
+    "nak": 0,
+    "star": "Ashwini",
+    "sign": "Mesha",
+    "prokeralaOption": "0"
+   },
+   "boy": {
+    "rashi": 0,
+    "nak": 0,
+    "star": "Ashwini",
+    "sign": "Mesha",
+    "prokeralaOption": "0"
+   },
+   "prokerala": {
+    "dina": "Bad",
+    "gana": "Good",
+    "mahendra": "Bad",
+    "stree_deergha": "Bad",
+    "yoni": "Good",
+    "rasi": "Good",
+    "rasi_adhipathi": "Good",
+    "vasya": "Bad",
+    "rajju": "Good",
+    "vedha": "Good"
+   },
+   "prokeralaPoints": "7",
+   "prokeralaCount": 6,
+   "agrees": false,
+   "variantDiffs": [
+    "dina",
+    "rajju"
+   ]
+  }
+ ]
+}

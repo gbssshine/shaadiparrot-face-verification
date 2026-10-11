@@ -283,10 +283,11 @@ PUBLIC = {"firstName": "Asha", "gender": "Female", "cityName": "Bengaluru", "lat
 USER = {"gender": "Female", "birthDate": "1994-08-21", "lifeStage": "single"}
 
 
-def make_client(profile=PROFILE, public=PUBLIC, user=USER, db=None, premium=False):
+def make_client(profile=PROFILE, public=PUBLIC, user=USER, db=None, premium=False, complete=None):
     astro_api._hits.clear()
     astro_api._report_hits.clear()
     astro_api._scores_cache.clear()
+    astro_api._moon_written.clear()
     astro_api.configure(astro_api.Deps(
         db=lambda: db,
         verify_uid=lambda h: ME if h == "Bearer ok" else (_ for _ in ()).throw(astro_api.HTTPException(401)),
@@ -294,7 +295,7 @@ def make_client(profile=PROFILE, public=PUBLIC, user=USER, db=None, premium=Fals
         places_query=main._places_query,
         load_user_docs=lambda uid: (dict(profile), dict(public), dict(user)) if uid == ME else ({}, {}, {}),
         is_premium=lambda u, p, now: premium,
-        complete=lambda *a, **k: ("## The short answer\nA warm match.", "stop"),
+        complete=complete or (lambda *a, **k: ("## The short answer\nA warm match.", "stop")),
         take_rate=lambda *a: True,
     ))
     app = FastAPI()
@@ -377,6 +378,26 @@ def test_match_any_pair(client):
     assert 0 <= m["total"] <= 36 and len(m["kootas"]) == 8
     assert m["a"]["name"] == "Rahul" and m["verdict"]["word"]
     assert not any("You are" in d["why"] for d in m["doshas"])
+    # The 10 South Indian poruthams come with every match.
+    p = m["porutham"]
+    assert [i["key"] for i in p["items"]] == ["dina", "gana", "mahendra", "stree_deergha", "yoni", "rasi",
+                                              "rasi_adhipathi", "vasya", "rajju", "vedha"]
+    assert 0 <= p["countMin"] <= p["count"] <= p["countMax"] <= 10 and p["verdict"]["word"]
+    assert all(i["level"] in ("good", "fair", "no") for i in p["items"])
+    # Manglik (C3): without Neha's birth time her side is a check, unless a cancellation holds whatever the
+    # Lagna is (here one does); the row is never "present" while a side is a check.
+    mang = next(d for d in m["doshas"] if d["name"] == "Manglik")
+    sa, sb = m["a"]["manglik"]["status"], m["b"]["manglik"]["status"]
+    assert m["b"]["manglik"]["sure"] is False and m["a"]["manglik"]["sure"] is True
+    assert (sa, sb, mang["status"]) == ("no", "no", "clear")   # 22 Jul 1997: Jupiter aspects her Mars
+    assert m["b"]["manglik"]["cancelledBy"] == "Jupiter with or aspecting Mars"
+    # 5 Dec 1997, no time: Mars is Manglik from her Moon and Venus. 1.0.7 used to show a red "present" here.
+    r2 = client.post("/astro/match", json={
+        "a": {"name": "Rahul", "gender": "male", "birthDate": "1995-01-10", "birthTime": "06:30", "birthCity": "Delhi"},
+        "b": {"name": "Neha", "gender": "female", "birthDate": "1997-12-05"}}, headers=H).json()["match"]
+    assert r2["b"]["manglik"]["status"] == "check" and r2["b"]["manglik"]["manglik"] is True
+    row = next(d for d in r2["doshas"] if d["name"] == "Manglik")
+    assert row["status"] == "check" and "stays a check, not a verdict" in row["why"]
 
 
 def test_match_me_with_someone(client):
@@ -386,6 +407,9 @@ def test_match_me_with_someone(client):
 
 def test_report_needs_parrot_plus(client):
     r = client.post("/astro/match/report", json={"b": {"name": "Vikram", "gender": "male", "birthDate": "1992-02-14"}}, headers=H)
+    assert r.status_code == 402
+    r = client.post("/astro/match/report", json={"b": {"name": "Vikram", "gender": "male", "birthDate": "1992-02-14"},
+                                                 "system": "porutham"}, headers=H)
     assert r.status_code == 402
 
 
@@ -485,6 +509,19 @@ def test_member_match_reads_their_profile_on_the_server():
     assert m["bMoon"]["pada"] == 0 and m["bMoon"]["nakshatra"]
     for secret in ("1996", "04-11", "05:20", "Jaipur"):   # nothing of their birth details comes back
         assert secret not in r.text
+    # The porutham part is there and carries no longitude, pada, options or birth field.
+    p = m["porutham"]
+    assert len(p["items"]) == 10 and p["bRajju"]
+
+    def keys_of(v):
+        if isinstance(v, dict):
+            return set(v) | {k for x in v.values() for k in keys_of(x)}
+        if isinstance(v, list):
+            return {k for x in v for k in keys_of(x)}
+        return set()
+    assert not keys_of(p) & {"lon", "moonLon", "pada", "options", "birthDate", "birthTime", "birthCityName",
+                             "lagna", "marsRashi", "jupiterRashi"}
+    assert "jupiterRashi" not in r.text and "options" not in r.text
     # Their chart would give the birth moment away; good dates may count them in.
     assert c.post("/astro/chart", json={"person": {"uid": "bride1234"}}, headers=H).status_code == 403
     g = c.post("/astro/good-days", json={"event": "wedding", "days": 120, "people": [{"me": True}, {"uid": "bride1234"}]},
@@ -548,3 +585,330 @@ def test_family_context_sends_ages_not_birth_dates(monkeypatch):
     ctx = main._family_context("u1")
     assert "Riya (Daughter, age 7, Moon " in ctx and "Papa (Father)" in ctx and "Odd (Son)" in ctx
     assert born not in ctx and "born" not in ctx
+
+
+# ------------------------------------------------------------------ porutham readings, scores, Moon keys (W1-S-ASTRO)
+VIKRAM = {"name": "Vikram", "gender": "male", "birthDate": "1992-02-14", "birthTime": "09:10", "birthCity": "Chennai",
+          "birthState": "Tamil Nadu"}
+
+
+def _reports(db):
+    return {p: d for p, d in db.docs.items() if p.startswith("astroReports/")}
+
+
+def test_report_facts_and_keys_per_system():
+    calls = []
+
+    def complete(msgs, *a, **k):
+        calls.append(msgs)
+        return "## The short answer\nA warm match.", "stop"
+
+    db = FakeDb()
+    c = make_client(db=db, premium=True, complete=complete)
+    north = c.post("/astro/match/report", json={"b": VIKRAM}, headers=H).json()
+    assert north["cached"] is False and len(calls) == 1
+    # The same 36-guna facts with or without a system: the same cache key, so a stored North reading still hits.
+    again = c.post("/astro/match/report", json={"b": VIKRAM, "system": "gunas"}, headers=H).json()
+    assert again["cached"] is True and len(calls) == 1
+    assert c.post("/astro/match/report", json={"b": VIKRAM, "system": " North "}, headers=H).json()["cached"] is True
+    north_docs = _reports(db)
+    assert len(north_docs) == 1
+    (north_path, north_doc), = north_docs.items()
+    assert north_doc["system"] == "gunas" and north_doc["uid"] == ME
+    north_facts = calls[0][1]["content"]
+    assert north_facts == "FACTS: " + str(astro_api._report_facts(north["match"], False))
+    assert "'kootas'" in north_facts and calls[0][0]["content"] == astro_api.REPORT_SYSTEM
+
+    south = c.post("/astro/match/report", json={"b": VIKRAM, "system": "Porutham"}, headers=H).json()
+    assert south["cached"] is False and len(calls) == 2
+    docs = _reports(db)
+    assert len(docs) == 2
+    (south_path, south_doc), = [(p, d) for p, d in docs.items() if p != north_path]
+    assert south_doc["system"] == "porutham" and south_doc["uid"] == ME
+    facts = calls[1][1]["content"]
+    assert "'kootas'" not in facts and "'poruthams'" in facts and "'rajjuOk'" in facts and "'Nadi dosha'" not in facts
+    assert "'system': 'porutham'" in facts and "Manglik" in facts
+    system = calls[1][0]["content"]
+    assert "Speak in poruthams, never in gunas or points out of 36." in system
+    assert "Ashtakoota points" not in system
+    for heading in ("## The short answer", "## Where they click", "## Where they need patience", "## Doshas, honestly",
+                    "## Mithu's advice", "Under 330 words"):
+        assert heading in system
+    # Asked again in poruthams: the stored South reading.
+    assert c.post("/astro/match/report", json={"b": VIKRAM, "system": "porutham"}, headers=H).json()["cached"] is True
+
+
+def test_report_system_swaps_one_sentence():
+    assert astro_api._FACTS_GUNAS in astro_api.REPORT_SYSTEM
+    south = astro_api._report_system(True)
+    assert south != astro_api.REPORT_SYSTEM and astro_api._report_system(False) == astro_api.REPORT_SYSTEM
+    assert south.replace(astro_api._FACTS_PORUTHAM, astro_api._FACTS_GUNAS) == astro_api.REPORT_SYSTEM
+
+
+def test_report_without_porutham_falls_back_to_gunas(monkeypatch):
+    calls = []
+
+    def complete(msgs, *a, **k):
+        calls.append(msgs)
+        return "## The short answer\nA warm match.", "stop"
+
+    monkeypatch.setattr(astro_api.porutham, "dasa_porutham", lambda *a, **k: 1 / 0)
+    db = FakeDb()
+    c = make_client(db=db, premium=True, complete=complete)
+    r = c.post("/astro/match/report", json={"b": VIKRAM, "system": "porutham"}, headers=H).json()
+    assert "porutham" not in r["match"] and "'kootas'" in calls[0][1]["content"]
+    assert next(iter(_reports(db).values()))["system"] == "gunas"
+
+
+def test_a_porutham_failure_never_takes_the_match_down(monkeypatch):
+    monkeypatch.setattr(astro_api.porutham, "dasa_porutham", lambda *a, **k: 1 / 0)
+    c = make_client(db=FakeDb(_member_docs("bride1234")), profile={"firstName": "Rahul", "gender": "Male",
+                                                                   "birthDate": "1993-09-02"}, public={}, user={})
+    r = c.post("/astro/match", json={"b": VIKRAM}, headers=H)
+    assert r.status_code == 200, r.text
+    m = r.json()["match"]
+    assert "porutham" not in m and 0 <= m["total"] <= 36 and len(m["kootas"]) == 8
+    sc = c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H).json()["scores"]
+    assert set(sc["bride1234"]) == {"total", "min", "max"}
+
+
+def test_scores_carry_the_porutham_count():
+    db = FakeDb({**_member_docs("bride1234"), **_member_docs("after1234", birth="1997-07-22",
+                                                               profile={"birthTime": ""})})
+    c = make_client(profile={"firstName": "Rahul", "gender": "Male", "birthDate": "1993-09-02"}, public={}, user={}, db=db)
+    sc = c.post("/astro/scores", json={"uids": ["bride1234", "after1234"]}, headers=H).json()["scores"]
+    assert set(sc) == {"bride1234", "after1234"}
+    for s in sc.values():
+        assert set(s) == {"total", "min", "max", "p", "pMin", "pMax", "rajju"}   # only scores, nothing else new
+        assert 0 <= s["pMin"] <= s["p"] <= s["pMax"] <= 10 and isinstance(s["rajju"], bool)
+        assert all(isinstance(s[k], int) for k in ("p", "pMin", "pMax"))
+
+
+# ------------------------------------------------------------------ Moon keys
+class CountingDb(FakeDb):
+    def __init__(self, docs=None):
+        super().__init__(docs)
+        self.moon_writes = []
+
+    def write(self, path, data, merge):
+        if path.endswith("/feedState/moon"):
+            self.moon_writes.append(path)
+        super().write(path, data, merge)
+
+
+RAHUL_PROFILE = {"firstName": "Rahul", "gender": "Male", "birthDate": "1993-09-02", "birthTime": "06:15",
+                 "birthCityName": "Pune", "birthStateName": "Maharashtra", "birthCountryIso2": "IN"}
+RAHUL_PUBLIC = {"firstName": "Rahul", "gender": "Male", "cityName": "Pune"}
+
+
+def test_scores_remember_moon_keys_once_per_sig():
+    docs = {**_member_docs("bride1234"), **_member_docs("after1234", birth="1997-07-22")}
+    db = CountingDb(docs)
+    profile = dict(RAHUL_PROFILE)
+    c = make_client(profile=profile, public=RAHUL_PUBLIC, user={"birthDate": "1990-01-01"}, db=db)
+    c.post("/astro/scores", json={"uids": ["bride1234", "after1234"]}, headers=H)
+    assert sorted(db.moon_writes) == sorted([f"users/{ME}/feedState/moon", "users/bride1234/feedState/moon",
+                                             "users/after1234/feedState/moon"])
+    mine = db.docs[f"users/{ME}/feedState/moon"]
+    # Signed over my card under my profile, never the users doc (its birthDate differs on purpose).
+    assert mine["sig"] == astro_api._moon_sig({**RAHUL_PUBLIC, **RAHUL_PROFILE})
+    assert set(mine) == {"main", "options", "exact", "manglik", "sig", "atIso"}
+    assert mine["exact"] is True and mine["manglik"] in ("yes", "mild", "no", "unknown")
+    assert len(mine["main"]) == 3 and all(len(o) == 2 for o in mine["options"])
+    theirs = db.docs["users/bride1234/feedState/moon"]
+    assert theirs["sig"] == astro_api._moon_sig({**docs["publicProfiles/bride1234"], **docs["profiles/bride1234"]})
+    # Fresh scores again (cache cleared) with the same details: nothing is written twice.
+    astro_api._scores_cache.clear()
+    c.post("/astro/scores", json={"uids": ["bride1234", "after1234"]}, headers=H)
+    assert len(db.moon_writes) == 3
+    # I fix my birth time: my keys are written again, theirs are not.
+    profile["birthTime"] = "06:45"
+    astro_api._scores_cache.clear()
+    c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H)
+    assert db.moon_writes[3:] == [f"users/{ME}/feedState/moon"]
+    assert db.docs[f"users/{ME}/feedState/moon"]["sig"] == astro_api._moon_sig({**RAHUL_PUBLIC, **profile})
+
+
+def test_moon_keys_only_for_me_and_rishta_cards():
+    db = CountingDb(_member_docs("bride1234"))
+    c = make_client(profile=dict(RAHUL_PROFILE), public=RAHUL_PUBLIC, user={}, db=db)
+    # Typed-in people, family members and a member matched by uid: no Moon keys.
+    c.post("/astro/match", json={"b": VIKRAM}, headers=H)
+    c.post("/astro/match", json={"a": VIKRAM, "b": {"name": "Neha", "gender": "female", "birthDate": "1997-07-22"}},
+           headers=H)
+    c.post("/astro/match", json={"b": {"uid": "bride1234"}}, headers=H)
+    c.post("/astro/chart", json={"person": {"name": "Riya", "birthDate": "2018-03-02"}}, headers=H)
+    c.post("/astro/today", json={"members": [{"id": "k1", "name": "Riya", "birthDate": "2018-03-02"}]}, headers=H)
+    c.post("/astro/good-days", json={"event": "naming", "days": 30, "people": [{"name": "Baby", "birthDate": "2026-09-01"}]},
+           headers=H)
+    assert db.moon_writes == []
+    # My own chart: mine, once.
+    assert c.post("/astro/chart", json={}, headers=H).status_code == 200
+    assert c.post("/astro/chart", json={"person": {"me": True}}, headers=H).status_code == 200
+    assert db.moon_writes == [f"users/{ME}/feedState/moon"]
+
+
+def test_no_moon_keys_for_a_kundli_only_account():
+    db = CountingDb(_member_docs("bride1234"))
+    c = make_client(profile={**RAHUL_PROFILE, "profileFor": "none"}, public={}, user={}, db=db)
+    c.post("/astro/chart", json={}, headers=H)
+    c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H)
+    assert db.moon_writes == ["users/bride1234/feedState/moon"]
+    # A kundli-only card is never scored, so never written either (the _visible gate).
+    db2 = CountingDb(_member_docs("kundli123", profile={"profileFor": "none"}))
+    make_client(profile=dict(RAHUL_PROFILE), public=RAHUL_PUBLIC, user={}, db=db2).post(
+        "/astro/scores", json={"uids": ["kundli123"]}, headers=H)
+    assert "users/kundli123/feedState/moon" not in db2.docs
+
+
+def test_a_failed_moon_write_never_breaks_scores():
+    class Broken(FakeDb):
+        def batch(self):
+            raise RuntimeError("firestore down")
+
+    c = make_client(profile=dict(RAHUL_PROFILE), public=RAHUL_PUBLIC, user={}, db=Broken(_member_docs("bride1234")))
+    r = c.post("/astro/scores", json={"uids": ["bride1234"]}, headers=H)
+    assert r.status_code == 200 and "bride1234" in r.json()["scores"]
+    assert astro_api._moon_written == {}   # not marked written: the next call tries again
+    assert c.post("/astro/chart", json={}, headers=H).status_code == 200
+
+
+def test_moon_sig_rules():
+    base = {"birthDate": "1993-09-02", "birthTime": " 06:15 ", "birthCityName": "Pune", "gender": "Male"}
+    same = {**base, "birthTime": "06:15", "birthStateName": None, "firstName": "Rahul", "birthCountryIso2": 91}
+    assert astro_api._moon_sig(base) == astro_api._moon_sig(same)   # trimmed; non-strings count as empty
+    raw = "1993-09-02|06:15|Pune||||Male"
+    import hashlib
+    assert astro_api._moon_sig(base) == hashlib.sha1(raw.encode()).hexdigest()[:12]
+    assert astro_api._moon_sig({**base, "birthTime": "06:16"}) != astro_api._moon_sig(base)
+
+
+def test_moon_dedupe_dict_is_capped(monkeypatch):
+    monkeypatch.setattr(astro_api, "_MOON_MAX", 10)
+    astro_api._moon_written.clear()
+    db = FakeDb()
+    chart = fc.chart_from_birth((1990, 1, 1), None, None)
+    for i in range(25):
+        astro_api._remember_moon(db, f"user{i:04d}", {"birthDate": "1990-01-01"}, chart)
+    assert len(astro_api._moon_written) <= 10 and "user0024" in astro_api._moon_written
+    astro_api._moon_written.clear()
+
+
+def test_moon_keys_shape():
+    import fates_astro as fa
+    dhanu_late = {"rashi": 8, "nak": 19, "moonLon": 259.0, "options": [[8, 19], [8, 20]], "precision": "date",
+                  "marsRashi": 2, "venusRashi": 5, "lagna": None}
+    k = fa.moon_keys(dhanu_late)
+    assert k == {"main": [8, 19, 1], "options": [[8, 19], [8, 20]], "exact": False, "manglik": "unknown"}
+    assert fa.moon_keys({**dhanu_late, "moonLon": 248.0})["main"] == [8, 19, 0]          # first half of Dhanu
+    assert fa.moon_keys({**dhanu_late, "rashi": 9, "nak": 21, "moonLon": 287.5})["main"] == [9, 21, 1]   # Makara
+    assert fa.moon_keys({**dhanu_late, "rashi": 4, "nak": 9, "moonLon": 129.0})["main"] == [4, 9, 0]     # other signs: 0
+    assert fa.moon_keys({**dhanu_late, "moonLon": None})["main"] == [8, 19, 0]           # as Python reads options
+    # Mars in Simha; the Moon and Venus in Mithuna (Mars 3rd from them, never Manglik).
+    exact = {"rashi": 2, "nak": 5, "moonLon": 70.0, "precision": "exact", "marsRashi": 4, "venusRashi": 2,
+             "lagna": (4 - 7 + 1) % 12, "options": [[2, 5]]}                            # Mars 7th from the Lagna
+    assert fa.moon_keys(exact)["exact"] is True and fa.moon_keys(exact)["manglik"] == "yes"
+    assert fa.moon_keys({**exact, "lagna": (4 - 2 + 1) % 12})["manglik"] == "mild"        # 2nd only: partial -> mild
+    assert fa.moon_keys({**exact, "marsRashi": 0, "lagna": 0})["manglik"] == "no"          # Mars in its own sign
+    assert fa.moon_keys({"rashi": 1, "nak": 3})["options"] == [[1, 3]]
+
+
+# ------------------------------------------------------------------ tools: the guna table and the Moon-key backfill
+import importlib.util as _ilu  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_TOOLS = _Path(__file__).resolve().parents[1] / "tools"
+
+
+def _tool(name):
+    spec = _ilu.spec_from_file_location(name, _TOOLS / f"{name}.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _guna_between(table, a, b, ga, gb):
+    """What guna.ts does with gunaTable.json (the tool's docstring is the spec)."""
+    import fates_astro as fa
+    idx = {k: i for i, k in enumerate(table["keys"])}
+
+    def points(x, y):
+        runs = [table["total"][idx[x]][idx[y]] if boy else table["total"][idx[y]][idx[x]] for boy in fa.gender_roles(ga, gb)]
+        return sum(runs) / len(runs)
+
+    key = lambda m: f"{m[0]}_{m[1]}_{m[2] if len(m) > 2 else 0}"   # noqa: E731
+    total = round(points(key(a["main"]), key(b["main"])) * 2) / 2    # Python rounds half to even, as match_charts
+    opts = [points(key(oa), key(ob)) for oa in a["options"] for ob in b["options"]]
+    return total, min(opts), max(opts)
+
+
+def test_guna_export_is_deterministic_and_matches_match_charts(tmp_path):
+    import fates_astro as fa
+    tool = _tool("export_guna_table")
+    for run in ("one", "two"):
+        assert tool.main(["--out-dir", str(tmp_path / run), "--fixture", str(tmp_path / run / "fixture.json")]) == 0
+    for name in ("gunaTable.json", "fixture.json"):
+        assert (tmp_path / "one" / name).read_bytes() == (tmp_path / "two" / name).read_bytes(), name
+    # The committed fixture is today's output: regenerate it with the tool after any table change.
+    committed = _Path(__file__).resolve().parent / "guna_pairs_fixture.json"
+    assert committed.read_bytes().replace(b"\r\n", b"\n") == (tmp_path / "one" / "fixture.json").read_bytes()   # autocrlf
+    table = json.loads((tmp_path / "one" / "gunaTable.json").read_text(encoding="utf-8"))
+    assert (tmp_path / "one" / "gunaTable.json").stat().st_size < 15000
+    assert len(table["keys"]) == 42 and len(table["total"]) == 42 and all(len(r) == 42 for r in table["total"])
+    assert {"8_18_1", "8_19_0", "8_19_1", "9_21_0", "9_21_1"} <= set(table["keys"])
+    assert all(0 <= v <= 36 for row in table["total"] for v in row)
+    pairs = json.loads(committed.read_text(encoding="utf-8"))["pairs"]
+    assert len(pairs) == 300
+    for p in pairs:
+        # The table alone gives match_charts' answer for every pair...
+        assert _guna_between(table, p["a"], p["b"], p["aGender"], p["bGender"]) == (p["total"], p["totalMin"], p["totalMax"]), p
+        # ...and the fixture is match_charts' answer for charts with those Moons.
+        charts = [{"rashi": s["main"][0], "nak": s["main"][1], "moonLon": s["main"][0] * 30.0 + (22.5 if s["main"][2] else 7.5),
+                   "options": s["options"]} for s in (p["a"], p["b"])]
+        m = fa.match_charts(charts[0], charts[1], p["aGender"], p["bGender"])
+        assert (m["total"], m["totalMin"], m["totalMax"]) == (p["total"], p["totalMin"], p["totalMax"])
+    # The cases the TS port has to get right are all there.
+    genders = {(p["aGender"], p["bGender"]) for p in pairs}
+    assert {("male", "male"), ("female", "female"), ("", "")} <= genders
+    assert any(p[s]["main"][0] in (8, 9) and p[s]["main"][2] == 1 for p in pairs for s in ("a", "b"))
+    assert any(p[s]["main"][0] in (8, 9) and p[s]["main"][2] == 0 for p in pairs for s in ("a", "b"))
+    assert any(len(p["a"]["options"]) > 1 and len(p["b"]["options"]) > 1 for p in pairs)
+    assert any(float(p["total"]) % 1 == 0.5 and len(fa.gender_roles(p["aGender"], p["bGender"])) == 2 for p in pairs)
+
+
+def test_no_quarter_averages_with_todays_tables():
+    """Both directions averaged always land on a half point (Vashya and Graha Maitri are symmetric), so Python's
+    half-to-even rounding never changes a total today. If a table change breaks this, guna.ts must round half to
+    even exactly like Python, and the fixture gains .25 cases."""
+    tool = _tool("export_guna_table")
+    t = tool.table()
+    n = len(t["keys"])
+    assert all(((t["total"][i][j] + t["total"][j][i]) / 2 * 4) % 2 == 0 for i in range(n) for j in range(n))
+
+
+def test_backfill_moon_keys(capsys):
+    tool = _tool("backfill_moon_keys")
+    docs = {}
+    docs.update(_member_docs("bride1234"))
+    docs.update(_member_docs("notime123", profile={"birthTime": ""}))
+    docs.update(_member_docs("kundli123", profile={"profileFor": "none"}))
+    docs.update(_member_docs("nobirth12", birth=None))
+    docs["publicProfiles/noprof123"] = {"firstName": "Ghost"}
+    db = CountingDb(docs)
+    dry = tool.run(db, main._resolve_birth_place)
+    assert db.moon_writes == [] and "DRY RUN" in capsys.readouterr().out
+    assert (dry["cards"], dry["due"], dry["kundli_only"], dry["no_birth_date"], dry["no_profile"]) == (5, 2, 1, 1, 1)
+    done = tool.run(db, main._resolve_birth_place, apply=True)
+    assert done["written"] == 2 and sorted(db.moon_writes) == ["users/bride1234/feedState/moon", "users/notime123/feedState/moon"]
+    # Exactly what /scores writes for the same card.
+    astro_api._moon_written.clear()
+    db2 = CountingDb(_member_docs("bride1234"))
+    make_client(profile=dict(RAHUL_PROFILE), public=RAHUL_PUBLIC, user={}, db=db2).post(
+        "/astro/scores", json={"uids": ["bride1234"]}, headers=H)
+    a, b = dict(db.docs["users/bride1234/feedState/moon"]), dict(db2.docs["users/bride1234/feedState/moon"])
+    a.pop("atIso"), b.pop("atIso")
+    assert a == b
+    assert len(db.docs["users/notime123/feedState/moon"]["options"]) >= 1
+    again = tool.run(db, main._resolve_birth_place, apply=True)
+    assert again["up_to_date"] == 2 and again["written"] == 0 and len(db.moon_writes) == 2
+    assert "--apply" in tool.__doc__ and "dry run" in tool.__doc__.lower()

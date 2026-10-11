@@ -1,0 +1,273 @@
+{
+ "note": "Manglik cross-check (audit 9, plan C3), checked 2026-10-11 against AstroSage's celebrity Manglik reports. Each page gives the birth data (time zone 5.5) and where Mars sits counted from the Lagna and from the Moon; tests assert that our chart puts Mars in the same two houses. AstroSage's page applies no cancellations and leaves the 2nd house and Venus out, so its 'present' differs from our status by design: expected.status is ours (C3 rules), kept so a rule change shows up in the tests. 'Dirty Data' in AstroSage's rating means the birth time is a 12:00 placeholder: the houses are still compared on the same input.",
+ "source": {
+  "name": "AstroSage celebrity Manglik reports",
+  "url": "https://www.astrosage.com/celebrity-horoscope/<name>-manglik-report.asp",
+  "checked": "2026-10-11"
+ },
+ "charts": [
+  {
+   "id": "salman-khan",
+   "url": "https://www.astrosage.com/celebrity-horoscope/salman-khan-manglik-report.asp",
+   "birthDate": "1965-12-27",
+   "birthTime": "14:30",
+   "lat": 22.7,
+   "lon": 75.9,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Accurate",
+   "astrosage": {
+    "marsHouseFromLagna": 10,
+    "marsHouseFromMoon": 12,
+    "verdict": "not present in Lagna Chart while present in Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Mars in its own or exalted sign"
+    ]
+   }
+  },
+  {
+   "id": "shraddha-kapoor",
+   "url": "https://www.astrosage.com/celebrity-horoscope/shraddha-kapoor-manglik-report.asp",
+   "birthDate": "1989-03-03",
+   "birthTime": "12:00",
+   "lat": 18.9667,
+   "lon": 72.8333,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 1,
+    "marsHouseFromMoon": 6,
+    "verdict": "present in Lagna Chart but not in Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Jupiter with or aspecting Mars"
+    ]
+   }
+  },
+  {
+   "id": "lakshmi-rai",
+   "url": "https://www.astrosage.com/celebrity-horoscope/lakshmi-rai-manglik-report.asp",
+   "birthDate": "1989-05-05",
+   "birthTime": "12:00",
+   "lat": 13.0,
+   "lon": 77.5833,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 12,
+    "marsHouseFromMoon": 3,
+    "verdict": "present in Lagna Chart but not in Moon Chart"
+   },
+   "expected": {
+    "status": "yes",
+    "cancelReasons": []
+   }
+  },
+  {
+   "id": "easwari-rao",
+   "url": "https://www.astrosage.com/celebrity-horoscope/easwari-rao-manglik-report.asp",
+   "birthDate": "1973-06-13",
+   "birthTime": "12:00",
+   "lat": 17.1,
+   "lon": 82.2167,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 8,
+    "marsHouseFromMoon": 5,
+    "verdict": "present in Lagna Chart but not in Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Mars's sign is an accepted exception for its house from the Lagna"
+    ]
+   }
+  },
+  {
+   "id": "abu-salem",
+   "url": "https://www.astrosage.com/celebrity-horoscope/abu-salem-manglik-report.asp",
+   "birthDate": "1968-01-01",
+   "birthTime": "12:00",
+   "lat": 26.05,
+   "lon": 83.1667,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 12,
+    "marsHouseFromMoon": 2,
+    "verdict": "present in Lagna Chart but not in Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Jupiter with or aspecting Mars"
+    ]
+   }
+  },
+  {
+   "id": "madhumila",
+   "url": "https://www.astrosage.com/celebrity-horoscope/madhumila-manglik-report.asp",
+   "birthDate": "1988-05-23",
+   "birthTime": "12:00",
+   "lat": 9.75,
+   "lon": 80.0333,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 7,
+    "marsHouseFromMoon": 7,
+    "verdict": "present in Lagna Chart as well as Moon Chart"
+   },
+   "expected": {
+    "status": "yes",
+    "cancelReasons": []
+   }
+  },
+  {
+   "id": "salman-yusuff-khan",
+   "url": "https://www.astrosage.com/celebrity-horoscope/salman-yusuff-khan-manglik-report.asp",
+   "birthDate": "1985-06-12",
+   "birthTime": "12:00",
+   "lat": 13.0,
+   "lon": 77.5833,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 11,
+    "marsHouseFromMoon": 4,
+    "verdict": "not present in Lagna Chart while present in Moon Chart"
+   },
+   "expected": {
+    "status": "partial",
+    "cancelReasons": []
+   }
+  },
+  {
+   "id": "sachin-tendulkar",
+   "url": "https://www.astrosage.com/celebrity-horoscope/sachin-tendulkar-manglik-report.asp",
+   "birthDate": "1973-04-24",
+   "birthTime": "14:25",
+   "lat": 18.9667,
+   "lon": 72.8333,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Reference",
+   "astrosage": {
+    "marsHouseFromLagna": 6,
+    "marsHouseFromMoon": 2,
+    "verdict": "present neither in Lagna Chart nor in Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Mars in its own or exalted sign",
+     "Jupiter with or aspecting Mars"
+    ]
+   }
+  },
+  {
+   "id": "priyanka-chopra",
+   "url": "https://www.astrosage.com/celebrity-horoscope/priyanka-chopra-manglik-report.asp",
+   "birthDate": "1982-07-18",
+   "birthTime": "00:30",
+   "lat": 22.7833,
+   "lon": 86.2,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Reference",
+   "astrosage": {
+    "marsHouseFromLagna": 6,
+    "marsHouseFromMoon": 5,
+    "verdict": "present neither in Lagna Chart nor in Moon Chart"
+   },
+   "expected": {
+    "status": "partial",
+    "cancelReasons": []
+   }
+  },
+  {
+   "id": "virat-kohli",
+   "url": "https://www.astrosage.com/celebrity-horoscope/virat-kohli-manglik-report.asp",
+   "birthDate": "1988-11-05",
+   "birthTime": "10:28",
+   "lat": 28.65,
+   "lon": 77.2167,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 4,
+    "marsHouseFromMoon": 7,
+    "verdict": "present in Lagna Chart as well as Moon Chart"
+   },
+   "expected": {
+    "status": "yes",
+    "cancelReasons": []
+   }
+  },
+  {
+   "id": "anushka-sharma",
+   "url": "https://www.astrosage.com/celebrity-horoscope/anushka-sharma-manglik-report.asp",
+   "birthDate": "1988-05-01",
+   "birthTime": "12:00",
+   "lat": 13.0,
+   "lon": 77.5833,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 7,
+    "marsHouseFromMoon": 4,
+    "verdict": "present in Lagna Chart as well as Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Mars in its own or exalted sign",
+     "Mars's sign is an accepted exception for its house from the Lagna"
+    ]
+   }
+  },
+  {
+   "id": "kareena-kapoor",
+   "url": "https://www.astrosage.com/celebrity-horoscope/kareena-kapoor-manglik-report.asp",
+   "birthDate": "1980-09-21",
+   "birthTime": "14:17",
+   "lat": 18.9667,
+   "lon": 72.8333,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Reference",
+   "astrosage": {
+    "marsHouseFromLagna": 11,
+    "marsHouseFromMoon": 10,
+    "verdict": "present neither in Lagna Chart nor in Moon Chart"
+   },
+   "expected": {
+    "status": "partial",
+    "cancelReasons": []
+   }
+  },
+  {
+   "id": "ranbir-kapoor",
+   "url": "https://www.astrosage.com/celebrity-horoscope/ranbir-kapoor-manglik-report.asp",
+   "birthDate": "1982-09-28",
+   "birthTime": "12:00",
+   "lat": 18.9667,
+   "lon": 72.8333,
+   "tz": "Asia/Kolkata",
+   "astrosageRating": "Dirty Data",
+   "astrosage": {
+    "marsHouseFromLagna": 1,
+    "marsHouseFromMoon": 11,
+    "verdict": "present in Lagna Chart but not in Moon Chart"
+   },
+   "expected": {
+    "status": "no",
+    "cancelReasons": [
+     "Mars in its own or exalted sign"
+    ]
+   }
+  }
+ ]
+}

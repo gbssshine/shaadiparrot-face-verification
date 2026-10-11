@@ -2,20 +2,24 @@
 
   POST /astro/today       city panchang, festivals and vrats ahead, a day line for each family member
   POST /astro/chart       a birth chart (planets by house, Lagna or Moon based), Vimshottari dashas
-  POST /astro/match       36-guna match of any two people (me, someone typed in, or a rishta member), doshas
-  POST /astro/match/report Mithu's full written match reading (Parrot+), kept so it is never charged twice
+  POST /astro/match       36-guna match and the 10 South Indian poruthams of any two people (me, someone typed in,
+                          or a rishta member), doshas with the Manglik status
+  POST /astro/match/report Mithu's full written match reading (Parrot+), in gunas or (system "porutham") in
+                          poruthams, kept so it is never charged twice
   POST /astro/good-days   dates that suit an event (wedding, griha pravesh, naming...) by the panchang
   POST /astro/question    Mithu's question of the day: vote once, then see your city and India
   POST /astro/places      city search for the panchang place and for birth places (India first)
-  POST /astro/scores      36-guna score of me with each rishta card in my list (only the score leaves the server)
+  POST /astro/scores      36-guna score of me with each rishta card in my list, and the porutham count (only the
+                          scores leave the server)
 
 A rishta member (PersonIn.uid) is read from their own profile here, so their birth date, time and place never
 reach the phone. Only people the caller could see in the list are matched: a public card that isn't hidden,
 banned or suspended, and no block either way.
 
 Data (server-only): dailyQuestions/{dayKey} vote counts, dailyQuestionVotes/{dayKey}__{uid},
-astroReports/{uid}__{hash} written readings. Birth details sent for other people are used for the
-answer and not stored.
+astroReports/{uid}__{hash} written readings, users/{uid}/feedState/moon (the Moon keys getRishtas scores the
+36 gunas with, written for me and for rishta cards charted fresh in /scores). Birth details sent for other
+people are used for the answer and not stored.
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ import astro_content
 import astro_core as ac
 import fates_astro
 import fates_astro_chart as fc
+import porutham
 
 logger = logging.getLogger("shaadiparrot-cloudrun.astro")
 router = APIRouter(prefix="/astro")
@@ -154,6 +159,8 @@ class ChartReq(BaseModel):
 class MatchReq(BaseModel):
     a: Optional[PersonIn] = None
     b: PersonIn
+    # /match/report only: "porutham" writes the reading in the 10 South Indian poruthams instead of 36 gunas.
+    system: Text20 = None
 
 
 class GoodDaysReq(BaseModel):
@@ -180,12 +187,6 @@ class PlacesReq(BaseModel):
 
 
 # ------------------------------------------------------------------ the caller
-def _own_profile(uid: str) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    profile, public, user = _d().load_user_docs(uid)
-    merged = {**public, **user, **profile}
-    return merged, profile, user
-
-
 class _Me:
     """The caller's own docs (the private profile wins, then the user doc, then the public card), read at most
     once per request however many times the request needs them."""
@@ -193,14 +194,23 @@ class _Me:
     def __init__(self, uid: str):
         self.uid = uid
         self._docs: Optional[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = None
+        self._card: Dict[str, Any] = {}
 
     def docs(self) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         if self._docs is None:
-            self._docs = _own_profile(self.uid)
+            profile, public, user = _d().load_user_docs(self.uid)
+            self._docs = ({**public, **user, **profile}, profile, user)
+            self._card = {**public, **profile}
         return self._docs
 
     def merged(self) -> Dict[str, Any]:
         return self.docs()[0]
+
+    def card(self) -> Dict[str, Any]:
+        """The public card under the private profile, without the users doc: the document getRishtas signs my Moon
+        keys with (moonSig), so my own keys are always written from it."""
+        self.docs()
+        return self._card
 
 
 # ------------------------------------------------------------------ places
@@ -437,7 +447,7 @@ def _chart_for(profile: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[s
         place = None
     date = fc._parse_date(profile.get("birthDate"))
     time_ = fc._parse_time(profile.get("birthTime"))
-    return fc.chart_from_birth(date, time_, place), place
+    return fates_astro.chart_from_birth(date, time_, place), place   # with Jupiter, for the Manglik cancellations
 
 
 # ------------------------------------------------------------------ /today
@@ -479,7 +489,10 @@ def chart(body: ChartReq, authorization: Optional[str] = Header(default=None)):
     if _is_member(body.person):
         # Planets to the degree would give a member's birth date and time away: their kundli is only matched.
         raise HTTPException(status_code=403, detail="not_allowed")
-    profile, name, _ = _resolve_person(_Me(uid), body.person)
+    me = _Me(uid)
+    profile, name, _ = _resolve_person(me, body.person)
+    if body.person is None or body.person.me:
+        _remember_me(me)   # never for someone typed in or a family member
     date = fc._parse_date(profile.get("birthDate"))
     time_ = fc._parse_time(profile.get("birthTime"))
     place = None
@@ -534,6 +547,12 @@ def _match(me: _Me, body: MatchReq) -> Dict[str, Any]:
     for side, person in (("aMoon", body.a), ("bMoon", body.b)):
         if _is_member(person) and isinstance(res.get(side), dict):
             res[side]["pada"] = 0
+    # The South Indian count, from the same Moons: no longitude, pada, options or birth detail in it. A porutham
+    # bug must never take the 36 gunas down: the app shows the North page when the field is missing.
+    try:
+        res["porutham"] = porutham.dasa_porutham(ca, cb, a_gender, b_gender)
+    except Exception:
+        logger.exception("porutham failed")
     return res
 
 
@@ -558,6 +577,37 @@ REPORT_SYSTEM = (
     "## The short answer\n## Where they click\n## Where they need patience\n## Doshas, honestly\n## Mithu's advice. "
     "Under 330 words. No emoji."
 )
+_FACTS_GUNAS = "Use ONLY the facts given (Ashtakoota points, doshas, Moon signs). "
+_FACTS_PORUTHAM = ("Use ONLY the facts given (the ten South Indian poruthams with Rajju and Vedha, the Manglik check, "
+                   "Moon signs). Speak in poruthams, never in gunas or points out of 36. ")
+
+
+def _report_system(porutham_mode: bool) -> str:
+    """The same reading rules for both systems; only the sentence naming the facts changes."""
+    return REPORT_SYSTEM.replace(_FACTS_GUNAS, _FACTS_PORUTHAM) if porutham_mode else REPORT_SYSTEM
+
+
+def _report_facts(res: Dict[str, Any], porutham_mode: bool) -> Dict[str, Any]:
+    """What Mithu may use. The 36-guna facts are byte for byte what they were, so cached readings still hit; the
+    porutham facts leave the kootas, the total and the Nadi/Bhakoot doshas out and hash to another key."""
+    if not porutham_mode:
+        return {
+            "a": res["a"]["name"], "b": res["b"]["name"], "total": res["total"], "range": [res["totalMin"], res["totalMax"]],
+            "kootas": [(k["name"], k["points"], k["max"], k["meaning"]) for k in res["kootas"]],
+            "doshas": [(d["name"], d["present"], d["cancelled"], d["why"]) for d in res["doshas"]],
+            "aMoon": res["aMoon"], "bMoon": res["bMoon"], "precision": res["precision"],
+        }
+    pr = res["porutham"]
+    mang = next((d for d in res["doshas"] if d["name"] == "Manglik"), None)
+    return {
+        "system": "porutham", "a": res["a"]["name"], "b": res["b"]["name"], "count": pr["count"],
+        "range": [pr["countMin"], pr["countMax"]],
+        "poruthams": [(i["name"], i["level"], i["meaning"]) for i in pr["items"]],
+        "rajjuOk": pr["rajjuOk"], "vedhaOk": pr["vedhaOk"],
+        "manglik": (mang["name"], mang["present"], mang["cancelled"], mang["why"]) if mang else None,
+        "aMoon": res["aMoon"], "bMoon": res["bMoon"], "precision": res["precision"],
+    }
+
 
 _report_hits: Dict[str, Tuple[str, int]] = {}
 
@@ -592,12 +642,8 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
     except Exception:
         logger.exception("match failed")
         raise HTTPException(status_code=503, detail="temporarily_unavailable")
-    facts = {
-        "a": res["a"]["name"], "b": res["b"]["name"], "total": res["total"], "range": [res["totalMin"], res["totalMax"]],
-        "kootas": [(k["name"], k["points"], k["max"], k["meaning"]) for k in res["kootas"]],
-        "doshas": [(d["name"], d["present"], d["cancelled"], d["why"]) for d in res["doshas"]],
-        "aMoon": res["aMoon"], "bMoon": res["bMoon"], "precision": res["precision"],
-    }
+    porutham_mode = (body.system or "").strip().lower() == "porutham" and "porutham" in res
+    facts = _report_facts(res, porutham_mode)
     key = hashlib.sha256(repr(sorted(facts.items())).encode("utf-8")).hexdigest()[:24]
     db = _d().db()
     ref = db.collection("astroReports").document(f"{uid}__{key}") if db else None
@@ -610,7 +656,7 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
             logger.warning("report cache read failed", exc_info=True)
     if not _report_slot(uid) or not _d().take_rate(uid, "astroReport", REPORTS_PER_DAY, "day"):
         raise HTTPException(status_code=429, detail="daily_cap")
-    msgs = [{"role": "system", "content": REPORT_SYSTEM}, {"role": "user", "content": f"FACTS: {facts}"}]
+    msgs = [{"role": "system", "content": _report_system(porutham_mode)}, {"role": "user", "content": f"FACTS: {facts}"}]
     try:
         text, _ = _d().complete(msgs, 700, 0.6, "astro_match_report")
     except Exception:
@@ -621,7 +667,10 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
         raise HTTPException(status_code=503, detail="temporarily_unavailable")
     if ref is not None:
         try:
+            # "system" tells a moderator or a deletion audit which kind of reading this is; "uid" lets the
+            # account purge find it.
             ref.set({"uid": uid, "text": text, "a": res["a"]["name"], "b": res["b"]["name"], "total": res["total"],
+                     "system": "porutham" if porutham_mode else "gunas",
                      "createdAtIso": datetime.now(timezone.utc).isoformat()})
         except Exception:
             logger.warning("report cache write failed", exc_info=True)
@@ -775,10 +824,111 @@ def _trim_scores(now: float) -> None:
             _scores_cache.pop(k, None)
 
 
+# ------------------------------------------------------------------ Moon keys for getRishtas (matching §3)
+# users/{uid}/feedState/moon = {main: [rashi, nak, half], options: [[rashi, nak]...], exact, manglik, sig, atIso}.
+# Server-only (the feedState rule), deleted with users/{uid}. Written only for me and for rishta cards charted
+# fresh in /scores, never for someone typed in or a family member, never for a kundli-only account. sig is
+# _moon_sig of {**publicCard, **profile}: getRishtas computes the same sig and treats a mismatch as "kundli
+# unknown", never as a wrong score.
+_moon_written: Dict[str, Tuple[str, float]] = {}   # uid -> (sig, when): repeats are skipped
+_moon_lock = threading.Lock()
+_MOON_MAX = 20000
+
+
+def _moon_sig(doc: Dict[str, Any]) -> str:
+    """sha1 of the birth fields (trimmed strings, anything else empty), first 12 hex characters. rishtas.ts
+    moonSig must give the same."""
+    raw = "|".join((v.strip() if isinstance(v, str) else "") for v in (doc.get(k) for k in _SIG_KEYS))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _trim_moons() -> None:
+    """Called under _moon_lock: drop the oldest entries to stay under the cap."""
+    extra = len(_moon_written) - _MOON_MAX
+    if extra > 0:
+        extra = len(_moon_written) - int(_MOON_MAX * 0.9)
+        for k, _ in sorted(_moon_written.items(), key=lambda kv: kv[1][1])[:extra]:
+            _moon_written.pop(k, None)
+
+
+def _moon_due(uid: str, sig: str) -> bool:
+    with _moon_lock:
+        hit = _moon_written.get(uid)
+    return hit is None or hit[0] != sig
+
+
+def _kundli_only(doc: Dict[str, Any]) -> bool:
+    return str(doc.get("profileFor") or "").strip().lower() == "none"
+
+
+def _remember_moons(db: Any, items: List[Tuple[str, Dict[str, Any], Dict[str, Any]]]) -> int:
+    """(uid, doc, chart) -> users/{uid}/feedState/moon, in one batch; uids already written with the same sig on
+    this instance are skipped. Never raises: the scores and the chart don't depend on it."""
+    if db is None:
+        return 0
+    todo, at = [], datetime.now(timezone.utc).isoformat()
+    for uid, doc, chart in items:
+        if not chart or _kundli_only(doc):
+            continue
+        sig = _moon_sig(doc)
+        if not _moon_due(uid, sig) or any(t[0] == uid for t in todo):
+            continue
+        try:
+            todo.append((uid, sig, {**fates_astro.moon_keys(chart), "sig": sig, "atIso": at}))
+        except Exception:
+            logger.warning("moon keys failed for one profile", exc_info=True)
+    if not todo:
+        return 0
+    try:
+        batch = db.batch()
+        for uid, _, data in todo:
+            batch.set(db.collection("users").document(uid).collection("feedState").document("moon"), data)
+        batch.commit()
+    except Exception:
+        logger.warning("moon keys write failed", exc_info=True)
+        return 0
+    now = time.monotonic()
+    with _moon_lock:
+        for uid, sig, _ in todo:
+            _moon_written[uid] = (sig, now)
+        _trim_moons()
+    return len(todo)
+
+
+def _remember_moon(db: Any, uid: str, doc: Dict[str, Any], chart: Dict[str, Any]) -> bool:
+    return _remember_moons(db, [(uid, doc, chart)]) > 0
+
+
+def _my_moon_item(me: _Me, chart: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """My own (uid, doc, chart) when my keys are due. The doc is my card under my profile (never the users doc);
+    a chart worked out from other birth details than that doc's is not reused."""
+    card = me.card()
+    if _kundli_only(card) or not fc._parse_date(card.get("birthDate")):
+        return None
+    sig = _moon_sig(card)
+    if not _moon_due(me.uid, sig):
+        return None
+    if chart is None or _moon_sig(me.merged()) != sig:
+        chart, _ = _chart_for(card)
+    return me.uid, card, chart
+
+
+def _remember_me(me: _Me) -> None:
+    try:
+        item = _my_moon_item(me)
+        if item:
+            _remember_moons(_d().db(), [item])
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("my moon keys failed", exc_info=True)
+
+
 @router.post("/scores")
 def scores(body: ScoresReq, authorization: Optional[str] = Header(default=None)):
     uid = _auth(authorization)
-    merged, _, _ = _own_profile(uid)
+    me = _Me(uid)
+    merged = me.merged()
     if not fc._parse_date(merged.get("birthDate")):
         return {"ok": True, "scores": {}, "missing": "me"}
     want = [u for u in dict.fromkeys(body.uids) if isinstance(u, str) and _UID_RE.match(u) and u != uid][:40]
@@ -804,6 +954,7 @@ def scores(body: ScoresReq, authorization: Optional[str] = Header(default=None))
     if todo and not _d().take_rate(uid, "astroScores", SCORES_PER_DAY, "day"):
         todo = []   # over today's cap: the scores already worked out still show
     fresh: Dict[str, Dict[str, Any]] = {}
+    moons: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
     if todo:
         try:
             me_chart, _ = _chart_for(merged)
@@ -813,6 +964,13 @@ def scores(body: ScoresReq, authorization: Optional[str] = Header(default=None))
         except Exception:
             logger.warning("scores failed", exc_info=True)
             refs, got = [], {}
+        else:
+            try:
+                mine = _my_moon_item(me, me_chart)
+                if mine:
+                    moons.append(mine)
+            except Exception:
+                logger.warning("my moon keys failed", exc_info=True)
         for u, pr, pu in refs:
             profile, public = got.get(pr.path), got.get(pu.path)
             if profile is None or public is None or not _visible(public, profile):
@@ -820,13 +978,22 @@ def scores(body: ScoresReq, authorization: Optional[str] = Header(default=None))
             p = {**public, **profile}
             if not fc._parse_date(p.get("birthDate")):
                 continue
+            g = _gender(p.get("gender"))
             try:   # one bad profile skips only itself
                 c, _ = _chart_for(p)
-                m = fates_astro.match_charts(me_chart, c, me_gender, _gender(p.get("gender")))
+                m = fates_astro.match_charts(me_chart, c, me_gender, g)
             except Exception:
                 logger.warning("score failed for one profile", exc_info=True)
                 continue
             fresh[u] = {"total": m["total"], "min": m["totalMin"], "max": m["totalMax"]}
+            try:   # the porutham count is extra: without it the 36-guna score still shows
+                pm = porutham.dasa_porutham(me_chart, c, me_gender, g)
+                fresh[u].update({"p": pm["count"], "pMin": pm["countMin"], "pMax": pm["countMax"], "rajju": pm["rajjuOk"]})
+            except Exception:
+                logger.warning("porutham score failed for one profile", exc_info=True)
+            moons.append((u, p, c))   # charted fresh: getRishtas can score this card without the astro server
+    if moons:
+        _remember_moons(db, moons)
     if fresh:
         with _scores_lock:
             for u, s in fresh.items():
