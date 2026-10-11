@@ -574,7 +574,7 @@ def _profile_context_compact(profile: Dict[str, Any], intent: str, prefix: str =
     if not profile:
         return ""
 
-    base_keys = ["firstName", "age", "gender", "cityName", "countryName", "relationshipIntent", "languages"]
+    base_keys = ["firstName", "age", "gender", "lifeStage", "cityName", "countryName", "relationshipIntent", "languages"]
     texting_keys = base_keys + ["bio", "aboutMe", "interests", "workout", "smoking", "drinking"]
     profile_keys = base_keys + ["interests", "tags", "workout", "smoking", "drinking", "education", "jobTitle", "occupation", "bio", "aboutMe"]
     birth_keys = ["birthDate", "birthTime", "birthCityName", "birthStateName", "birthCountryName"]
@@ -1430,6 +1430,36 @@ def _is_repeated_question(user_text: str, history: List[Dict[str, Any]]) -> bool
     return bool(a) and a == _normalize_for_duplicate_check(prev)
 
 
+def _family_context(uid: str) -> str:
+    """The family the user added in the app (users/{uid}/family): who they are and their Moon sign, so Mithu
+    can talk about 'your daughter' by name. Empty when there is none."""
+    if firestore_client is None:
+        return ""
+    try:
+        docs = list(firestore_client.collection("users").document(uid).collection("family").limit(8).stream())
+    except Exception:
+        logger.warning("family context read failed", exc_info=True)
+        return ""
+    parts = []
+    for d in docs:
+        m = d.to_dict() or {}
+        name = _trim_text(str(m.get("name") or ""), 30)
+        rel = _trim_text(str(m.get("relation") or ""), 20)
+        if not name:
+            continue
+        bits = [rel] if rel else []
+        bd = str(m.get("birthDate") or "")
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", bd):
+            bits.append("born " + bd)
+            try:
+                c = fates_astro_chart.chart_from_birth((int(bd[:4]), int(bd[5:7]), int(bd[8:10])), None, None)
+                bits.append("Moon " + _ZODIAC[c["rashi"]])
+            except Exception:
+                pass
+        parts.append(f"{name} ({', '.join(bits)})" if bits else name)
+    return ("FAMILY (people the user cares about; use their names when it helps): " + "; ".join(parts)) if parts else ""
+
+
 def _build_llm_messages(
     locale: str,
     intent: str,
@@ -1440,6 +1470,7 @@ def _build_llm_messages(
     user_text: str,
     history: List[Dict[str, Any]],
     repeated_question: bool = False,
+    family_ctx: str = "",
 ) -> List[Dict[str, str]]:
     # Most stable first, so consecutive requests share a cached prefix: global rules,
     # then this user's memory, then the per-intent instructions and facts.
@@ -1453,6 +1484,8 @@ def _build_llm_messages(
     uctx = _profile_context_compact(user_profile, intent, prefix="USER")
     if uctx:
         msgs.append({"role": "system", "content": uctx})
+    if family_ctx:
+        msgs.append({"role": "system", "content": family_ctx})
 
     if intent == Intent.ASTRO:
         ua = _compute_astro_short(user_profile, label="USER_ASTRO")
@@ -1739,6 +1772,7 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         user_text=user_text,
         history=history,
         repeated_question=repeated_question,
+        family_ctx=_family_context(uid),
     )
 
     # Fold messages about to leave the prompt window into the memory, in parallel with the reply.
@@ -2568,6 +2602,7 @@ def verify_face_withdraw(authorization: Optional[str] = Header(default=None)):
 
 
 import fates_api  # noqa: E402
+import fates_astro_chart  # noqa: E402
 
 FATES_AI_TIMEOUT_SEC = int(os.getenv("FATES_AI_TIMEOUT_SEC") or "14")
 
@@ -2580,3 +2615,18 @@ fates_api.configure(fates_api.Deps(
     is_premium=_is_premium_like_client,
 ))
 app.include_router(fates_api.router)
+
+import astro_api  # noqa: E402
+
+astro_api.configure(astro_api.Deps(
+    db=lambda: firestore_client,
+    verify_uid=_verify_firebase_token_or_401,
+    resolve_place=_resolve_birth_place,
+    places_query=_places_query,
+    load_user_docs=_load_user_docs,
+    is_premium=_is_premium_like_client,
+    complete=lambda messages, max_tokens, temperature, kind: _deepseek_complete(
+        messages, max_tokens, temperature=temperature, kind=kind, timeout=FATES_AI_TIMEOUT_SEC + 6),
+    take_rate=_take_rate,
+))
+app.include_router(astro_api.router)
