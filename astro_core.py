@@ -773,10 +773,11 @@ def week_days(natal_rashi: int, natal_nak: int, monday: Date, lat: float, lon: f
               name: Optional[str] = None, relation: str = "") -> List[Dict[str, Any]]:
     """Seven days from monday: the Moon at sunrise + 6 h against the birth Moon gives the house, the tara and the
     tone. The line is the reader's own (SELF_LINES) or, for a profile made for someone else (name given), the
-    family line with that name. The day's tithi is the one running at sunrise."""
+    adult family line with that name (LINES 'any'). The week is only for the account's own profile, and a managed
+    rishta profile is always an adult, so relation (the caller passes profileFor: son, daughter, …) never picks the
+    child lines ("homework", "bedtime"); it is accepted and ignored. The day's tithi is the one running at sunrise."""
     tzz = zone(tz)
     la, lo = round(float(lat), 3), round(float(lon), 3)
-    group = RELATION_GROUP.get((relation or "").strip().lower(), "any")
     who = (name or "").strip()[:30]
     out: List[Dict[str, Any]] = []
     for i in range(7):
@@ -787,8 +788,7 @@ def week_days(natal_rashi: int, natal_nak: int, monday: Date, lat: float, lon: f
         house = (rashi - natal_rashi) % 12 + 1
         tara = ((nak - natal_nak) % 27) % 9 + 1
         if who:
-            t = LINES[house]
-            line = (t.get(group) or t["any"]).format(n=who)
+            line = LINES[house]["any"].format(n=who)
         else:
             line = SELF_LINES[house]
         out.append({"date": d.isoformat(), "weekday": WEEKDAYS[d.weekday()], "house": house, "tara": tara,

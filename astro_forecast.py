@@ -90,6 +90,8 @@ def build_week(natal_rashi: int, natal_nak: int, today: Date, place: Dict[str, A
                festivals: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """The /astro/forecast payload without ok and text: {span, periodKey, title, precision, days, best, events}.
     name: the first name of the profile when it was made for someone else (managed), else None.
+    relation: profileFor, accepted from the caller; a managed rishta profile is an adult, so the day lines are the
+    adult ones whatever it says (see astro_core.week_days).
     precision: 'exact' only for a chart with birth time and city; anything else is 'approximate'."""
     monday, nxt = week_period(today)
     days = ac.week_days(natal_rashi, natal_nak, monday, place["lat"], place["lon"], place["tz"], name=name,
