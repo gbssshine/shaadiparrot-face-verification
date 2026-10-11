@@ -1,4 +1,6 @@
 import json
+import os
+import random
 import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -406,6 +408,41 @@ def test_match_any_pair(client):
 def test_match_me_with_someone(client):
     r = client.post("/astro/match", json={"b": {"name": "Vikram", "gender": "male", "birthDate": "1992-02-14"}}, headers=H)
     assert r.status_code == 200 and r.json()["match"]["a"]["name"] == "Asha"
+
+
+def _chart_and_match_manglik(c, person):
+    astro_api._hits.clear()
+    chart = c.post("/astro/chart", json={"person": person}, headers=H)
+    match = c.post("/astro/match", json={"a": person, "b": {"name": "Vikram", "gender": "male", "birthDate": "1992-02-14"}},
+                   headers=H)
+    assert chart.status_code == 200 and match.status_code == 200, (chart.text, match.text)
+    return chart.json()["chart"], match.json()["match"]["a"]["manglik"]
+
+
+def test_chart_and_match_give_one_manglik_status(client):
+    """C3: one status per chart. /chart used to read Manglik without Jupiter, so a chart page could say 'yes'
+    where the match (and Fates, and the biodata hint) said 'no'."""
+    fixtures = json.load(open(os.path.join(os.path.dirname(__file__), "manglik_fixtures.json"), encoding="utf-8"))
+    ex = next(x for x in fixtures["charts"] if x["id"] == "shraddha-kapoor")   # 1989-03-03 12:00 Mumbai
+    person = {"name": "Shraddha", "gender": "female", "birthDate": ex["birthDate"], "birthTime": ex["birthTime"],
+              "birthCity": "Mumbai", "birthState": "Maharashtra"}
+    chart, from_match = _chart_and_match_manglik(client, person)
+    assert chart["placeKnown"] and chart["manglik"] == from_match
+    assert chart["manglik"]["status"] == ex["expected"]["status"] == "no"
+    assert chart["manglik"]["cancelReasons"] == ex["expected"]["cancelReasons"] == ["Jupiter with or aspecting Mars"]
+    # Mars sits in the Lagna, Jupiter aspects it: the Mangal line follows the cancelled status.
+    assert next(p for p in chart["planets"] if p["code"] == "Ma")["house"] == 1
+    assert [l["title"] for l in chart["lines"] if l["title"].startswith("Mangal:")] == ["Mangal: not Manglik"]
+    # Any chart, with or without a time: the two routes agree on the whole Manglik reading.
+    rng = random.Random(1011)
+    for _ in range(40):
+        p = {"name": "P", "gender": "female",
+             "birthDate": "%04d-%02d-%02d" % (rng.randint(1970, 2005), rng.randint(1, 12), rng.randint(1, 28)),
+             "birthTime": "%02d:%02d" % (rng.randint(0, 23), rng.randint(0, 59)) if rng.random() < 0.75 else "",
+             "birthCity": rng.choice(["Mumbai", "Delhi", "Chennai", "Bengaluru"])}
+        chart, from_match = _chart_and_match_manglik(client, p)
+        assert chart["manglik"] == from_match, p
+        assert (chart["manglik"]["status"] == "check") == (not p["birthTime"]), p
 
 
 def test_report_needs_parrot_plus(client):
