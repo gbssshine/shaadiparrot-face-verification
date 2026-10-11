@@ -38,6 +38,9 @@ ASK_FIRST = frozenset({"muslim", "christian", "sikh", "parsi", "jewish", "buddhi
 # The wedding season (muhurats) is a Hindu, Jain and Sikh family custom; unknown faith counts as "All of India".
 WEDDING_SEASON_FAITHS = frozenset({"hindu", "jain", "sikh"})
 DEV_UTHANI_DAYS = frozenset(f["date"] for f in ac.FESTIVALS if f["id"] == "dev_uthani")
+# Festival ids whose name is the start of a period ("Sharad Navratri begins", "Ramzan begins"): the title reads
+# "<name> tomorrow", not "<name> is tomorrow". Keyed by id, never by the displayed name (CR5).
+STARTS_A_PERIOD = frozenset({"navratri", "ramzan_start"})
 
 
 # ------------------------------------------------------------------ small readers
@@ -116,10 +119,6 @@ def _leap(y: int) -> bool:
     return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
 
 
-def _when(offset: int) -> str:
-    return "today" if offset == 0 else "tomorrow"
-
-
 def _action(type_: str, label: str, arg: Optional[str] = None) -> Dict[str, str]:
     a = {"type": type_, "label": label}
     if arg:
@@ -157,11 +156,15 @@ def _festival_note(fest: Dict[str, Any], offset: int, day: Date, place: Dict[str
     name = str(fest.get("name") or "").strip()
     if not name:
         return None
+    # An empty greeting is on purpose (astro_festivals): days of mourning or remembrance get no greeting and no
+    # share action, never a made-up "Happy …".
     greeting = str(fest.get("greeting") or "").strip().rstrip("!")
-    head = (f"{name[:-len(' begins')]} begins {_when(offset)}" if name.endswith(" begins")
-            else f"{name} is {_when(offset)}")
-    share = (f"{greeting}! Wishing you and your family a happy {name}." if greeting
-             else f"Happy {name}! Wishing you and your family joy and blessings.")
+    if str(fest.get("id") or "").strip() in STARTS_A_PERIOD:
+        head = f"{name} today" if offset == 0 else f"{name} tomorrow"
+    else:
+        head = f"{name} is today" if offset == 0 else f"{name} is tomorrow"
+    # The share line never repeats the display name ("a happy Sharad Navratri begins").
+    share = f"{greeting}! Wishing you and your family joy and blessings." if greeting else ""
     # Moon-sighting days (Eid, Muharram, …) always carry the honesty label. Rows from astro_festivals.upcoming()
     # (and the app's UpcomingDto) say it as `tentative`; the raw table entries as `moonSighting`.
     tentative = bool(fest.get("moonSighting") or fest.get("tentative"))
@@ -180,7 +183,8 @@ def _festival_note(fest: Dict[str, Any], offset: int, day: Date, place: Dict[str
         parts.append(when)
         parts.append("I'll keep the time on Today for you.")
     actions = [_action("open_panchang", "See the times")] if when else []
-    actions.append(_action("share_greeting", "Send a greeting", share))
+    if share:
+        actions.append(_action("share_greeting", "Send a greeting", share))
     return {"topic": "festival", "title": head, "text": " ".join(parts), "actions": actions}
 
 
@@ -232,7 +236,8 @@ def _p2(me: Dict[str, Any], day: Date, members: Optional[List[Any]]) -> Optional
         name = _first_name(me.get("firstName") or me.get("name"))
         off = _birthday_in(me.get("birthDate"), day)
         if name and off is not None:
-            found.append((off, 0, _person_birthday(name, str(me.get("profileFor") or ""), off)))
+            # A managed rishta profile is always an adult: the adult blessing, whatever profileFor says.
+            found.append((off, 0, _person_birthday(name, "", off)))
     else:
         off = _birthday_in(me.get("birthDate"), day)
         if off is not None:

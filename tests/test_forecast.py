@@ -72,8 +72,27 @@ def test_house_8_is_gentle_and_never_bad():
 
 def test_managed_week_uses_the_family_lines():
     d = ac.week_days(KANYA, HASTA, date(2026, 10, 12), *DELHI, name="Ananya", relation="daughter")
-    assert d[0]["line"] == "Ananya will enjoy family time and favourite food today."
+    assert d[0]["line"] == "Family talk and good food go well for Ananya today."
     assert all("Ananya" in x["line"] for x in d)
+
+
+def test_managed_week_never_reads_like_a_child():
+    # The week is the account's own profile, and a managed rishta profile is an adult (18+/21+): profileFor 'son'
+    # or 'daughter' must never bring "homework", "school" or "bedtime" lines.
+    child = {h: t["child"].format(n="Ananya") for h, t in ac.LINES.items() if "child" in t}
+    assert {5, 6, 8, 10, 12} <= set(child)
+    houses = set()
+    for relation in ("son", "daughter", "Daughter", "brother", "relative", ""):
+        for rashi in range(12):
+            for d in ac.week_days(rashi, HASTA, date(2026, 10, 12), *DELHI, name="Ananya", relation=relation):
+                houses.add(d["house"])
+                assert d["line"] == ac.LINES[d["house"]]["any"].format(n="Ananya"), (relation, d)
+                assert d["line"] not in child.values()
+                for word in ("homework", "school", "bedtime", "studies", "a hug"):
+                    assert word not in d["line"]
+    assert houses == set(range(1, 13))
+    w = af.build_week(KANYA, HASTA, date(2026, 10, 28), PLACE, name="Ananya", relation="daughter")
+    assert all(x["line"] not in child.values() for x in w["days"])
 
 
 def test_best_days_rules():

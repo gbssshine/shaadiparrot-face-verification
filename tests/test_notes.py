@@ -15,7 +15,8 @@ ME = {"firstName": "Asha", "gender": "female", "religion": "Hindu", "birthDate":
       "profileFor": "self"}
 HINDU = {"celebrates": ["hindu"], "astroMode": "full"}
 DIWALI = {"date": "2026-11-08", "id": "diwali", "name": "Diwali", "greeting": "Shubh Deepavali", "timeKind": "pradosh"}
-KARVA = {"date": "2026-10-29", "id": "karva_chauth", "name": "Karva Chauth", "timeKind": "moonrise"}
+KARVA = {"date": "2026-10-29", "id": "karva_chauth", "name": "Karva Chauth", "greeting": "Happy Karva Chauth",
+         "timeKind": "moonrise"}
 EID = {"date": "2027-03-10", "id": "eid_ul_fitr", "name": "Eid ul-Fitr", "greeting": "Eid Mubarak", "moonSighting": True}
 DEV_UTHANI = {"date": "2026-11-20", "id": "dev_uthani", "name": "Dev Uthani Ekadashi"}
 
@@ -169,6 +170,10 @@ def test_festival_tomorrow_with_the_city_moonrise():
     assert note["text"] == f"Karva Chauth is tomorrow. Moonrise in Jaipur: {mr}. I'll keep the time on Today for you."
     assert [a["type"] for a in note["actions"]] == ["open_panchang", "share_greeting"]
     assert note["actions"][1]["arg"] == "Happy Karva Chauth! Wishing you and your family joy and blessings."
+    # Without the table's greeting there is nothing to send: no made-up "Happy …" line, only the times.
+    bare = _note(date(2026, 10, 28), [{**KARVA, "greeting": ""}], place=JAIPUR)
+    assert bare["text"] == note["text"]
+    assert [a["type"] for a in bare["actions"]] == ["open_panchang"]
 
 
 def test_festival_today_with_greeting_and_pradosh_time():
@@ -176,7 +181,70 @@ def test_festival_today_with_greeting_and_pradosh_time():
     p = ac.panchang(date(2026, 11, 8), DELHI["lat"], DELHI["lon"], DELHI["tz"])
     assert note["text"].startswith(f"Shubh Deepavali! Diwali is today. Pradosh time in New Delhi: {p['sunset']}–")
     assert note["actions"][-1] == {"type": "share_greeting", "label": "Send a greeting",
-                                   "arg": "Shubh Deepavali! Wishing you and your family a happy Diwali."}
+                                   "arg": "Shubh Deepavali! Wishing you and your family joy and blessings."}
+
+
+def _fest_row(day, id_, name, greeting, faiths, *, tentative=False, category="festival", tier="faith", in_days=1):
+    """A row as astro_festivals.upcoming()['festivals'] gives it (W1-S-FEST _row)."""
+    return {"date": day, "id": id_, "kind": id_, "type": "festival", "name": name, "note": "", "greeting": greeting,
+            "tier": tier, "category": category, "faiths": list(faiths), "communities": [], "states": [],
+            "tentative": tentative, "timeKind": None, "officeNote": None, "inDays": in_days}
+
+
+# Days of mourning or remembrance: astro_festivals leaves the greeting empty on purpose.
+MUHARRAM = _fest_row("2027-06-16", "muharram", "Muharram (Ashura)", "", ["muslim"], tentative=True,
+                     category="observance")
+GOOD_FRIDAY = _fest_row("2027-03-26", "good_friday", "Good Friday", "", ["christian"], category="observance",
+                        tier="major")
+TEG_BAHADUR = _fest_row("2027-11-24", "guru_teg_bahadur", "Guru Teg Bahadur's Martyrdom Day", "", ["sikh"],
+                        category="observance")
+
+
+@pytest.mark.parametrize("row, faith, eve, text", [
+    (MUHARRAM, "muslim", date(2027, 6, 15), "Muharram (Ashura) is tomorrow. Expected, depends on the moon."),
+    (GOOD_FRIDAY, "christian", date(2027, 3, 25), "Good Friday is tomorrow."),
+    (TEG_BAHADUR, "sikh", date(2027, 11, 23), "Guru Teg Bahadur's Martyrdom Day is tomorrow."),
+])
+def test_solemn_days_get_no_greeting(row, faith, eve, text):
+    me = {**ME, "religion": faith.title()}
+    for mode in ("full", "fun"):
+        prefs = {"celebrates": [faith], "astroMode": mode}
+        note = _note(eve, [row], me=me, prefs=prefs)
+        assert note["topic"] == "festival" and note["text"] == text
+        assert note["actions"] == []
+        today = _note(eve + timedelta(days=1), [{**row, "inDays": 0}], me=me, prefs=prefs)
+        assert today["title"] == row["name"] + " is today" and today["actions"] == []
+        for n in (note, today):
+            assert "Happy" not in n["title"] + n["text"] and "Wishing" not in n["text"]
+    # astroMode 'off' gets greetings only: nothing for these days.
+    assert _note(eve, [row], me=me, prefs={"celebrates": [faith], "astroMode": "off"}) is None
+
+
+def test_days_that_begin_a_period_read_by_id():
+    navratri = _fest_row("2026-10-11", "navratri", "Sharad Navratri begins", "Happy Navratri", ["hindu"])
+    eve = _note(date(2026, 10, 10), [navratri])
+    assert eve["title"] == "Sharad Navratri begins tomorrow" and eve["text"] == "Sharad Navratri begins tomorrow."
+    assert eve["actions"] == [{"type": "share_greeting", "label": "Send a greeting",
+                               "arg": "Happy Navratri! Wishing you and your family joy and blessings."}]
+    day = _note(date(2026, 10, 11), [{**navratri, "inDays": 0}])
+    assert day["title"] == "Sharad Navratri begins today"
+    assert day["text"] == "Happy Navratri! Sharad Navratri begins today."
+
+    ramzan = _fest_row("2027-02-09", "ramzan_start", "Ramzan begins", "Ramzan Mubarak", ["muslim"], tentative=True,
+                       category="observance")
+    muslim = {**ME, "religion": "Muslim"}
+    eve = _note(date(2027, 2, 8), [ramzan], me=muslim, prefs={"celebrates": ["muslim"]})
+    assert eve["title"] == "Ramzan begins tomorrow"
+    assert eve["text"] == "Ramzan begins tomorrow. Expected, depends on the moon."
+    assert eve["actions"] == [{"type": "share_greeting", "label": "Send a greeting",
+                               "arg": "Ramzan Mubarak! Wishing you and your family joy and blessings."}]
+    off = _note(date(2027, 2, 8), [ramzan], me=muslim, prefs={"celebrates": ["muslim"], "astroMode": "off"})
+    assert off["text"] == "Ramzan begins tomorrow. Expected, depends on the moon. Ramzan Mubarak to you and your family!"
+    assert off["actions"] == eve["actions"]
+    # The share line never repeats the display name ("a happy Sharad Navratri begins", "a happy Ramzan begins").
+    for n in (eve, off, day):
+        for a in n["actions"]:
+            assert "begins" not in a["arg"]
 
 
 def test_moon_sighting_is_marked_expected():
@@ -235,6 +303,9 @@ def test_own_and_managed_birthdays():
     theirs = _note(date(2026, 9, 14), me=managed)
     assert theirs["text"] == "Ananya's birthday is tomorrow. Want a blessing line to send in the morning?"
     assert [a["type"] for a in theirs["actions"]] == ["share_blessing"]
+    # A managed rishta profile is an adult: the adult blessing, never "May you grow …".
+    assert theirs["actions"][0]["arg"] == ("Happy birthday, Ananya! Wishing you good health, happiness and many "
+                                           "blessings this year.")
     # Today's birthday beats tomorrow's; the reader's own self row in the family list isn't counted twice.
     rows = [{"id": "s", "name": "Asha", "birthDate": "1996-09-16", "me": True},
             {"id": "m2", "name": "Papa", "relation": "Father", "birthDate": "1960-09-16"}]
