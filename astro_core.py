@@ -681,9 +681,10 @@ def mangal_line(mang: Dict[str, Any], time_known: bool) -> Dict[str, str]:
             return {"title": "Mangal: not Manglik", "status": status,
                     "text": f"No Mangal dosha in your chart. Mars sits in a Manglik house, but it is cancelled ({why})."}
         return {"title": "Mangal: not Manglik", "status": status, "text": "No Mangal dosha in your chart."}
-    # "check" (and anything unknown): the Lagna isn't known, so no verdict either way.
-    need = "birth place" if time_known else "birth time"
-    return {"title": f"Mangal: Check (needs {need})", "status": "check",
+    # "check" (and anything unknown): the Lagna isn't known, so no verdict either way. One whole literal per case
+    # (CR5: never glue fragments), so each title is translated as it stands.
+    title = "Mangal: Check (needs birth place)" if time_known else "Mangal: Check (needs birth time)"
+    return {"title": title, "status": "check",
             "text": "The Manglik check counts Mars from the Lagna, which needs the time and city of birth. "
                     "Until then it is a check, not a verdict."}
 

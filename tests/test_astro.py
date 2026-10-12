@@ -505,6 +505,19 @@ def test_chart_lines_for_each_status():
     old = ac.chart_lines(None, moon, sun, ds, {"status": "check", "manglik": True, "mild": False,
                                                "from": ["Moon", "Venus"]}, False)[-1]
     assert old["title"] == "Mangal: Check (needs birth time)"
+    placeless = ac.chart_lines(None, moon, sun, ds, {"status": "check", "from": ["Moon"]}, True)[-1]
+    assert placeless["title"] == "Mangal: Check (needs birth place)" and placeless["status"] == "check"
+
+
+def test_mangal_titles_are_whole_literals():
+    # CR5: never glue fragments. Every Mangal title the app can show sits whole in the source, so a translator
+    # sees the full phrase (an f-string like "Mangal: Check (needs {need})" fails this).
+    import inspect
+    src = inspect.getsource(ac.mangal_line)
+    for title in ("Mangal: Manglik", "Mangal: Partial (Anshik)", "Mangal: not Manglik",
+                  "Mangal: Check (needs birth place)", "Mangal: Check (needs birth time)"):
+        assert f'"{title}"' in src, title
+    assert 'f"Mangal' not in src
 
 
 def test_my_own_chart_uses_my_approximate_birth_time():
