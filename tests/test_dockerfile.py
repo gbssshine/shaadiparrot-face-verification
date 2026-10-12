@@ -137,3 +137,44 @@ def test_the_checks_catch_a_missing_file():
         {"a", "b", "e", "__future__"}
     assert data_files('P = "places.sqlite3"\nQ = "assets/biodata/x.png"\nR = "see docs/x.json for more"\n'
                       'U = "https://x.org/a.json"\n') == {"places.sqlite3", "assets/biodata/x.png"}
+
+
+def test_the_biodata_assets_and_libraries_are_in_the_image():
+    """POST /astro/biodata opens its fonts and art from assets/biodata/ (biodata_pdf.FONT_FILES, APP_ICON,
+    MITHU_ART, relative to the module, so /app/assets/... in the image) and draws with fpdf2. Every file under
+    assets/ is in the repo and taken by the COPY, every font ships with its licence, and the PDF libraries are
+    pinned in requirements.txt."""
+    files = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "assets").rglob("*") if p.is_file())
+    assert any(f.startswith("assets/biodata/fonts/") for f in files)
+    for f in files:
+        assert covered(f), f"{f} is not copied into the image"
+    opened = data_files((ROOT / "biodata_pdf.py").read_text(encoding="utf-8"))
+    fonts = sorted(f for f in opened if f.endswith(".ttf"))
+    assert len(fonts) == 5 and {"assets/biodata/appicon_128.png", "assets/biodata/mithu_256.png"} <= opened
+    for f in opened:
+        if f.startswith("assets/"):         # a file, or the folder itself (biodata_pdf.ASSETS)
+            assert (ROOT / f).exists() and covered(f if (ROOT / f).is_file() else f + "/any.png"), f
+    licences = {p.name for p in (ROOT / "assets" / "biodata" / "licenses").iterdir()}
+    assert "README.md" in licences
+    for font in fonts:
+        family = Path(font).stem.split("-")[0]
+        assert any(n.startswith(family + "-") and n.endswith(".txt") for n in licences), f"no licence for {font}"
+    # No ignore file keeps the assets out of the build context.
+    for ignore in (".dockerignore", ".gcloudignore"):
+        if (ROOT / ignore).exists():
+            rules = [l.strip() for l in (ROOT / ignore).read_text(encoding="utf-8").splitlines()]
+            assert not any(r and not r.startswith(("#", "!")) and ("assets" in r or r.endswith((".ttf", ".png")))
+                           for r in rules), ignore
+    # The PDF stack, pinned exactly (fpdf2 needs Pillow, fontTools and defusedxml; biodata_pdf imports the first
+    # three by their module names fpdf, PIL and fontTools).
+    pins = {}
+    for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            name, _, version = line.partition("==")
+            assert version.strip(), f"{line} is not pinned with =="
+            pins[name.split("[")[0].strip().lower()] = version.strip()
+    for pkg in ("fpdf2", "pillow", "fonttools", "defusedxml"):
+        assert pkg in pins, pkg
+    imported = imported_names((ROOT / "biodata_pdf.py").read_text(encoding="utf-8"))
+    assert {"fpdf", "PIL", "fontTools"} <= imported
