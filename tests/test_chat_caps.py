@@ -129,6 +129,9 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "_take_rate", lambda *a, **k: True)
     monkeypatch.setattr(main, "_reserve_parrot_reply", lambda *a, **k: None)
     monkeypatch.setattr(main, "_deepseek_complete", complete)
+    # Today's festival comes from the real date (Republic Day, Diwali...): these tests pin a quiet day. The
+    # observance itself and its wiring are tested in test_biodata_pdf.py.
+    monkeypatch.setattr(main, "_today_observance", lambda doc, day=None: "none")
     client = TestClient(main.app)       # not entered: no startup (no real Vision or Firestore clients)
 
     def chat(text, caps=None, **extra):

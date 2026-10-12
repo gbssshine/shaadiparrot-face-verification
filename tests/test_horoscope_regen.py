@@ -149,6 +149,9 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "_take_lease", take_lease)
     monkeypatch.setattr(main, "_release_lease", lambda name: leases.discard(name))
     monkeypatch.setattr(main, "_run_transaction", db.run)
+    # Today's festival comes from the real date (Republic Day, Diwali...): these tests pin a quiet day. The
+    # observance itself and its wiring are tested in test_biodata_pdf.py.
+    monkeypatch.setattr(main, "_today_observance", lambda doc, day=None: "none")
     client = TestClient(main.app)       # not entered: no startup (no real Vision or Firestore clients)
 
     def ask():
