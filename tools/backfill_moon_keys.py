@@ -4,8 +4,9 @@
     python tools/backfill_moon_keys.py --apply    # writes
 
 Covers publicProfiles cards whose profile is not kundli-only (profileFor != "none") and has a birth date. The
-keys and their sig are exactly what /astro/scores writes (astro_api._moon_sig over {**card, **profile},
-fates_astro.moon_keys of the same chart), so a card that already has keys with the same sig is left alone.
+document and its sig are exactly what /astro/scores writes (astro_api._moon_sig over {**card, **profile},
+fates_astro.moon_keys_doc of the same chart: the options as {rashi, nak} maps, since Firestore refuses an array
+inside an array), so a card that already has readable keys with the same sig is left alone.
 Needs Application Default Credentials (gcloud auth application-default login) with Firestore access; the
 project comes from --project, else GOOGLE_CLOUD_PROJECT, else "shaadiparrot".
 """
@@ -76,12 +77,13 @@ def run(db: Any, resolve_place: Callable[[Dict[str, Any]], Optional[Dict[str, An
                 counts["no_birth_date"] += 1
                 continue
             sig = _sig(doc)
-            if got.get(f"users/{uid}/feedState/moon", {}).get("sig") == sig:
+            stored = got.get(f"users/{uid}/feedState/moon", {})
+            if stored.get("sig") == sig and fates_astro.moon_keys_of(stored) is not None:
                 counts["up_to_date"] += 1
                 continue
             try:
                 chart = fates_astro.chart_for_profile(doc, resolve_place)
-                data = {**fates_astro.moon_keys(chart), "sig": sig, "atIso": at}
+                data = fates_astro.moon_keys_doc(chart, sig, at)
             except Exception as e:   # one odd profile never stops the run
                 counts["errors"] += 1
                 out(f"  {uid}: {type(e).__name__}")

@@ -14,7 +14,7 @@ from __future__ import annotations
 from itertools import product
 from typing import Any, Dict, List, Sequence, Tuple
 
-from fates_astro import GRAHA_MAITRI, NAKSHATRAS, PLANETS, RASHIS, YONI, YONI_ORDER, gender_roles
+from fates_astro import GRAHA_MAITRI, NAKSHATRAS, PLANETS, RASHIS, YONI, YONI_ORDER, gender_roles, moon_option
 
 KEYS = ["dina", "gana", "mahendra", "stree_deergha", "yoni", "rasi", "rasi_adhipathi", "vasya", "rajju", "vedha"]
 NAMES = {
@@ -230,11 +230,8 @@ def _options(chart: Dict[str, Any]) -> List[Tuple[int, int]]:
     main = (int(chart["rashi"]), int(chart["nak"]))
     opts: List[Tuple[int, int]] = []
     for o in (chart.get("options") or []):
-        try:
-            pair = (int(o[0]), int(o[1]))
-        except (TypeError, ValueError, IndexError):
-            continue
-        if 0 <= pair[0] < 12 and 0 <= pair[1] < 27 and pair not in opts:
+        pair = moon_option(o)       # [r, n] or a stored {rashi, nak}; None when it is not a Moon
+        if pair is not None and pair not in opts:
             opts.append(pair)
     if main not in opts:
         opts.insert(0, main)

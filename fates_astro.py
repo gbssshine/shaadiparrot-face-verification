@@ -12,6 +12,7 @@ with the Lagna known, the common cancellations make it "no".
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from itertools import product
 from typing import Any, Dict, List, Optional, Tuple
@@ -264,17 +265,89 @@ def manglik_dosha(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
             "why": f"{who} Manglik and the other isn’t. Worth knowing: many families talk it over with a pandit."}
 
 
+_MOON_OPTION_RE = re.compile(r"(\d{1,2})_(\d{1,2})(?:_[01])?")
+
+
+def moon_option(o: Any) -> Optional[Tuple[int, int]]:
+    """One option Moon as (rashi, nak), from any form it is kept in: [r, n] (a chart's options; a Moon doc written
+    before the maps), {rashi, nak} (how users/{uid}/feedState/moon stores it: Firestore refuses an array inside an
+    array), {r, n} or "r_n" (the forms guna.ts optionPair also reads). None when it is none of these or not a Moon
+    at all (rashi 0-11, nakshatra 0-26)."""
+    try:
+        if isinstance(o, (list, tuple)):
+            r, n = int(o[0]), int(o[1])
+        elif isinstance(o, dict):
+            key = ("rashi", "nak") if ("rashi" in o or "nak" in o) else ("r", "n")
+            r, n = int(o[key[0]]), int(o[key[1]])
+        elif isinstance(o, str):
+            m = _MOON_OPTION_RE.fullmatch(o.strip())
+            if not m:
+                return None
+            r, n = int(m.group(1)), int(m.group(2))
+        else:
+            return None
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    return (r, n) if 0 <= r < 12 and 0 <= n < 27 else None
+
+
+def moon_options(chart: Dict[str, Any]) -> List[Tuple[int, int]]:
+    """Every (rashi, nak) the chart's day allows, in any form moon_option reads; the main Moon when there are none."""
+    opts = [p for p in (moon_option(o) for o in (chart.get("options") or [])) if p is not None]
+    return opts or [(int(chart["rashi"]), int(chart["nak"]))]
+
+
 def moon_keys(chart: Dict[str, Any]) -> Dict[str, Any]:
     """What getRishtas needs to work out the 36 gunas without the astro server (matching §1/§3):
     main = [rashi, nak, half], where half (1 from 15 deg) matters only for Dhanu and Makara (the Vashya split);
     options = every [rashi, nak] the day allows; manglik in the matching vocabulary (yes | mild | no | unknown,
-    from the C3 status yes | partial | no | check)."""
+    from the C3 status yes | partial | no | check). This is the in-memory form (the guna fixture is built from
+    it); the Firestore document is moon_keys_doc."""
     r, n = int(chart["rashi"]), int(chart["nak"])
     lon = chart.get("moonLon")
     half = 1 if r in (8, 9) and lon is not None and float(lon) % 30.0 >= 15.0 else 0
-    options = [[int(o[0]), int(o[1])] for o in (chart.get("options") or [[r, n]])]
+    options = [[o[0], o[1]] for o in moon_options(chart)]
     return {"main": [r, n, half], "options": options, "exact": chart.get("precision") == "exact",
             "manglik": MOON_KEYS_MANGLIK[manglik_status(chart)["status"]]}
+
+
+def moon_keys_doc(chart: Dict[str, Any], sig: str, at: str) -> Dict[str, Any]:
+    """The users/{uid}/feedState/moon document (matching §1): moon_keys with each option stored as a map
+    {rashi, nak}, because Firestore refuses an array inside an array (INVALID_ARGUMENT "Cannot convert an array
+    value in an array value"); main stays the flat [rashi, nak, half]. The one writer for /astro/scores
+    (astro_api._remember_moons) and tools/backfill_moon_keys.py; moon_keys_of reads it back."""
+    keys = moon_keys(chart)
+    return {**keys, "options": [{"rashi": int(o[0]), "nak": int(o[1])} for o in keys["options"]],
+            "sig": sig, "atIso": at}
+
+
+def moon_keys_of(doc: Any) -> Optional[Dict[str, Any]]:
+    """A stored users/{uid}/feedState/moon doc read back in the moon_keys form (options as [[rashi, nak], ...]):
+    the {rashi, nak} maps moon_keys_doc writes and the old [[rashi, nak], ...] form alike (guna.ts moonKeysOf reads
+    the same forms). Missing or empty options mean the main Moon only. None when the doc is missing or malformed:
+    the kundli then counts as unknown, never as a wrong score."""
+    if not isinstance(doc, dict):
+        return None
+    main = doc.get("main")
+    if not isinstance(main, (list, tuple)) or len(main) != 3:
+        return None
+    head, half = moon_option(main[:2]), main[2]
+    if head is None or isinstance(half, bool) or half not in (0, 1):
+        return None
+    options: List[List[int]] = []
+    raw = doc.get("options")
+    if isinstance(raw, (list, tuple)):
+        for o in raw:
+            p = moon_option(o)
+            if p is None:
+                return None
+            options.append([p[0], p[1]])
+    elif raw is not None:
+        return None
+    manglik = doc.get("manglik")
+    return {"main": [head[0], head[1], int(half)], "options": options or [[head[0], head[1]]],
+            "exact": doc.get("exact") is True,
+            "manglik": manglik if manglik in MOON_KEYS_MANGLIK.values() else "unknown"}
 
 
 # ---------------------------------------------------------------- words
@@ -361,9 +434,8 @@ def match_charts(a: Dict[str, Any], b: Dict[str, Any], a_gender: str, b_gender: 
     pts = score(ma, mb)
     total = sum(pts.values())
 
-    # Range over every Moon position the day allows when a birth time is missing.
-    opts_a = [(o[0], o[1]) for o in a.get("options") or [[a["rashi"], a["nak"]]]]
-    opts_b = [(o[0], o[1]) for o in b.get("options") or [[b["rashi"], b["nak"]]]]
+    # Range over every Moon position the day allows when a birth time is missing ([r, n] or a stored {rashi, nak}).
+    opts_a, opts_b = moon_options(a), moon_options(b)
     totals = [sum(score(_moon(a, ra, na), _moon(b, rb, nb)).values()) for (ra, na), (rb, nb) in product(opts_a, opts_b)]
 
     a_is_boy = roles[0]

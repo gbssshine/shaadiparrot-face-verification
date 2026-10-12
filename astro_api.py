@@ -1171,7 +1171,8 @@ def _trim_scores(now: float) -> None:
 
 
 # ------------------------------------------------------------------ Moon keys for getRishtas (matching §3)
-# users/{uid}/feedState/moon = {main: [rashi, nak, half], options: [[rashi, nak]...], exact, manglik, sig, atIso}.
+# users/{uid}/feedState/moon = {main: [rashi, nak, half], options: [{rashi, nak}...], exact, manglik, sig, atIso}
+# (fates_astro.moon_keys_doc: the options are maps because Firestore refuses an array inside an array).
 # Server-only (the feedState rule), deleted with users/{uid}. Written only for me and for rishta cards charted
 # fresh in /scores, never for someone typed in or a family member, never for a kundli-only account. sig is
 # _moon_sig of {**publicCard, **profile}: getRishtas computes the same sig and treats a mismatch as "kundli
@@ -1220,7 +1221,7 @@ def _remember_moons(db: Any, items: List[Tuple[str, Dict[str, Any], Dict[str, An
         if not _moon_due(uid, sig) or any(t[0] == uid for t in todo):
             continue
         try:
-            todo.append((uid, sig, {**fates_astro.moon_keys(chart), "sig": sig, "atIso": at}))
+            todo.append((uid, sig, fates_astro.moon_keys_doc(chart, sig, at)))
         except Exception:
             logger.warning("moon keys failed for one profile", exc_info=True)
     if not todo:

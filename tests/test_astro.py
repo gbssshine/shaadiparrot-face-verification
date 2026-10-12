@@ -182,6 +182,27 @@ def test_impossible_dates_are_no_dates():
 
 
 # ------------------------------------------------------------------ a small Firestore stand-in
+def nested_arrays(value, where="doc"):
+    """Every place in a value where an array sits directly inside an array: Firestore refuses such a write
+    (INVALID_ARGUMENT "Cannot convert an array value in an array value"), so the fake below refuses it too."""
+    found = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            found += nested_arrays(v, f"{where}.{k}")
+    elif isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            if isinstance(v, (list, tuple)):
+                found.append(f"{where}[{i}]")
+            found += nested_arrays(v, f"{where}[{i}]")
+    return found
+
+
+def firestore_check(path, data):
+    bad = nested_arrays(data, path)
+    if bad:
+        raise gexc.InvalidArgument(f"Cannot convert an array value in an array value: {bad[0]}")
+
+
 class FakeSnap:
     def __init__(self, ref, data):
         self.reference, self.id, self._d, self.exists = ref, ref.id, data, data is not None
@@ -236,6 +257,8 @@ class FakeBatch:
     def commit(self):
         if any(op == "create" and ref.path in self._db.docs for op, ref, _, _ in self._ops):
             raise gexc.AlreadyExists("Document already exists")
+        for _, ref, data, _ in self._ops:      # all or nothing, like Firestore
+            firestore_check(ref.path, data)
         for op, ref, data, merge in self._ops:
             self._db.write(ref.path, data, merge)
 
@@ -258,6 +281,8 @@ class FakeDb:
         return FakeBatch(self)
 
     def write(self, path, data, merge):
+        firestore_check(path, data)
+
         def apply(dst, src):
             for k, v in src.items():
                 if isinstance(v, dict):
@@ -842,7 +867,8 @@ def test_scores_remember_moon_keys_once_per_sig():
     assert mine["sig"] == astro_api._moon_sig({**RAHUL_PUBLIC, **RAHUL_PROFILE})
     assert set(mine) == {"main", "options", "exact", "manglik", "sig", "atIso"}
     assert mine["exact"] is True and mine["manglik"] in ("yes", "mild", "no", "unknown")
-    assert len(mine["main"]) == 3 and all(len(o) == 2 for o in mine["options"])
+    assert len(mine["main"]) == 3 and all(set(o) == {"rashi", "nak"} for o in mine["options"])
+    assert all(nested_arrays(d) == [] for p, d in db.docs.items() if p.endswith("/feedState/moon"))
     theirs = db.docs["users/bride1234/feedState/moon"]
     assert theirs["sig"] == astro_api._moon_sig({**docs["publicProfiles/bride1234"], **docs["profiles/bride1234"]})
     # Fresh scores again (cache cleared) with the same details: nothing is written twice.
@@ -944,6 +970,74 @@ def test_moon_keys_shape():
     assert fa.moon_keys({"rashi": 1, "nak": 3})["options"] == [[1, 3]]
 
 
+def test_the_stored_moon_doc_has_no_array_inside_an_array():
+    """Firestore refuses [[r, n], ...] (INVALID_ARGUMENT), so every write used to fail and was only logged: the
+    options are stored as {rashi, nak} maps; main stays the flat [rashi, nak, half]."""
+    import fates_astro as fa
+    no_time = fa.chart_for_profile({"birthDate": "1997-07-22"}, main._resolve_birth_place)
+    exact = fa.chart_for_profile(dict(RAHUL_PROFILE), main._resolve_birth_place)
+    assert no_time["precision"] == "date" and len(no_time["options"]) >= 2      # several Moons the day allows
+    assert exact["precision"] == "exact"
+    for chart in (no_time, exact):
+        doc = fa.moon_keys_doc(chart, "abcdef012345", "2026-10-11T00:00:00+00:00")
+        assert nested_arrays(doc) == [], doc
+        keys = fa.moon_keys(chart)
+        assert doc == {**keys, "options": [{"rashi": r, "nak": n} for r, n in keys["options"]],
+                       "sig": "abcdef012345", "atIso": "2026-10-11T00:00:00+00:00"}
+        assert doc["main"] == keys["main"] and all(type(v) is int for v in doc["main"])
+        assert all(type(o["rashi"]) is int and type(o["nak"]) is int for o in doc["options"])
+        assert fa.moon_keys_of(json.loads(json.dumps(doc))) == keys          # reads back as written
+    assert len(fa.moon_keys_doc(no_time, "s", "t")["options"]) == len(no_time["options"])
+    # The fake refuses what Firestore refuses, so the old shape can't pass a test again.
+    with pytest.raises(gexc.InvalidArgument):
+        FakeDb().write("users/x/feedState/moon", {**fa.moon_keys(no_time), "sig": "s"}, False)
+    # /astro/scores writes the map form for a no-time card with several Moons.
+    db = CountingDb(_member_docs("after1234", birth="1997-07-22", profile={"birthTime": ""}))
+    make_client(profile=dict(RAHUL_PROFILE), public=RAHUL_PUBLIC, user={}, db=db).post(
+        "/astro/scores", json={"uids": ["after1234"]}, headers=H)
+    stored = db.docs["users/after1234/feedState/moon"]
+    assert nested_arrays(stored) == [] and len(stored["options"]) >= 2
+    assert all(set(o) == {"rashi", "nak"} for o in stored["options"])
+    assert nested_arrays(db.docs[f"users/{ME}/feedState/moon"]) == []
+
+
+def test_the_moon_doc_reader_takes_maps_and_the_old_lists():
+    import fates_astro as fa
+    want = {"main": [8, 19, 1], "options": [[8, 19], [8, 20]], "exact": False, "manglik": "unknown"}
+    maps = {"main": [8, 19, 1], "options": [{"rashi": 8, "nak": 19}, {"rashi": 8, "nak": 20}], "exact": False,
+            "manglik": "unknown", "sig": "s", "atIso": "t"}
+    assert fa.moon_keys_of(maps) == want
+    assert fa.moon_keys_of({**maps, "options": [[8, 19], [8, 20]]}) == want                    # the old list form
+    assert fa.moon_keys_of({**maps, "options": [{"r": 8, "n": 19}, "8_20"]}) == want            # what guna.ts reads
+    assert fa.moon_keys_of({**maps, "options": [{"rashi": 8, "nak": 19}, [8, 20]]}) == want     # mixed
+    assert fa.moon_keys_of({**maps, "options": []})["options"] == [[8, 19]]                     # none: the main one
+    assert fa.moon_keys_of({k: v for k, v in maps.items() if k != "options"})["options"] == [[8, 19]]
+    assert fa.moon_keys_of({**maps, "exact": True, "manglik": "mild"})["manglik"] == "mild"
+    assert fa.moon_keys_of({**maps, "manglik": "weird"})["manglik"] == "unknown"
+    for bad in (None, [], {}, {**maps, "main": [8, 19]}, {**maps, "main": [8, 19, 2]}, {**maps, "main": [8, 19, True]},
+                {**maps, "main": [12, 0, 0]}, {**maps, "options": [{"rashi": 8, "nak": 27}]},
+                {**maps, "options": [{"rashi": "x", "nak": 1}]}, {**maps, "options": [{"moon": 1}]},
+                {**maps, "options": "8_19"}, {**maps, "options": [[8]]}):
+        assert fa.moon_keys_of(bad) is None, bad
+    assert fa.moon_option({"rashi": 3, "nak": 7}) == (3, 7) and fa.moon_option([3, 7]) == (3, 7)
+    assert fa.moon_option("3_7_1") == (3, 7) and fa.moon_option(" 3_7 ") == (3, 7)
+    assert fa.moon_option(None) is None and fa.moon_option("3-7") is None and fa.moon_option([3, 27]) is None
+
+
+def test_match_and_porutham_read_map_options_like_lists():
+    """A chart whose options come back from a stored Moon doc ({rashi, nak} maps) scores exactly as the list form."""
+    import fates_astro as fa
+    import porutham
+    a = fa.chart_for_profile({"birthDate": "1997-07-22"}, main._resolve_birth_place)
+    b = fa.chart_for_profile(dict(RAHUL_PROFILE), main._resolve_birth_place)
+    a_maps = {**a, "options": [{"rashi": r, "nak": n} for r, n in a["options"]]}
+    for ga, gb in (("female", "male"), ("", "")):
+        assert fa.match_charts(a_maps, b, ga, gb) == fa.match_charts(a, b, ga, gb)
+        assert fa.match_charts(b, a_maps, gb, ga) == fa.match_charts(b, a, gb, ga)
+        assert porutham.dasa_porutham(a_maps, b, ga, gb) == porutham.dasa_porutham(a, b, ga, gb)
+    assert fa.moon_keys(a_maps) == fa.moon_keys(a)
+
+
 # ------------------------------------------------------------------ tools: the guna table and the Moon-key backfill
 import importlib.util as _ilu  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
@@ -1021,11 +1115,11 @@ def test_backfill_moon_keys(capsys):
     tool = _tool("backfill_moon_keys")
     docs = {}
     docs.update(_member_docs("bride1234"))
-    docs.update(_member_docs("notime123", profile={"birthTime": ""}))
+    docs.update(_member_docs("notime123", birth="1997-07-22", profile={"birthTime": ""}))   # several Moons
     docs.update(_member_docs("kundli123", profile={"profileFor": "none"}))
     docs.update(_member_docs("nobirth12", birth=None))
     docs["publicProfiles/noprof123"] = {"firstName": "Ghost"}
-    db = CountingDb(docs)
+    db = CountingDb(docs)                    # refuses an array inside an array, like Firestore
     dry = tool.run(db, main._resolve_birth_place)
     assert db.moon_writes == [] and "DRY RUN" in capsys.readouterr().out
     assert (dry["cards"], dry["due"], dry["kundli_only"], dry["no_birth_date"], dry["no_profile"]) == (5, 2, 1, 1, 1)
@@ -1039,7 +1133,16 @@ def test_backfill_moon_keys(capsys):
     a, b = dict(db.docs["users/bride1234/feedState/moon"]), dict(db2.docs["users/bride1234/feedState/moon"])
     a.pop("atIso"), b.pop("atIso")
     assert a == b
-    assert len(db.docs["users/notime123/feedState/moon"]["options"]) >= 1
+    notime = db.docs["users/notime123/feedState/moon"]
+    assert len(notime["options"]) >= 2 and all(set(o) == {"rashi", "nak"} for o in notime["options"])
+    assert nested_arrays(notime) == [] and nested_arrays(db.docs["users/bride1234/feedState/moon"]) == []
     again = tool.run(db, main._resolve_birth_place, apply=True)
     assert again["up_to_date"] == 2 and again["written"] == 0 and len(db.moon_writes) == 2
+    # A doc with the right sig that can't be read back (cut short) is written again; an old list-form doc reads.
+    db.docs["users/bride1234/feedState/moon"] = {"sig": a["sig"], "main": [1, 2]}
+    old_form = [[o["rashi"], o["nak"]] for o in notime["options"]]
+    db.docs["users/notime123/feedState/moon"] = {**notime, "options": old_form}
+    fixed = tool.run(db, main._resolve_birth_place, apply=True)
+    assert (fixed["written"], fixed["up_to_date"]) == (1, 1) and db.moon_writes[-1] == "users/bride1234/feedState/moon"
+    assert db.docs["users/bride1234/feedState/moon"]["options"] == b["options"]
     assert "--apply" in tool.__doc__ and "dry run" in tool.__doc__.lower()
