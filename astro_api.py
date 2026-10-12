@@ -78,7 +78,11 @@ class Deps:
     load_user_docs: Callable[[str], Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]
     is_premium: Callable[[Dict[str, Any], Dict[str, Any], datetime], bool]
     complete: Callable[..., Tuple[str, str]]
+    # serverRate counters (uid, key, limit, per) -> bool. take_rate is the open one (main._take_rate: the kundli
+    # scores only). take_rate_strict fails CLOSED for the paid and AI work (main._take_rate_or_busy): False over the
+    # cap, HTTP 503 busy_try_again when the counter can't be written. None (older wiring, tests): take_rate.
     take_rate: Callable[[str, str, int, str], bool]
+    take_rate_strict: Optional[Callable[[str, str, int, str], bool]] = None
     # serverLeases (main._take_lease / main._release_lease): one AI call per uid and week for /forecast while
     # parallel requests wait for it. None (older wiring, tests): the forecast still works, without a lease.
     take_lease: Optional[Callable[[str, float], bool]] = None
@@ -98,6 +102,22 @@ def _d() -> Deps:
     if _deps is None:
         raise HTTPException(status_code=503, detail="not configured")
     return _deps
+
+
+def take_paid(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """One use of a paid or AI action's cap (the forecast text, /match/report, the biodata PDF), failing closed:
+    False over the cap; HTTP 503 busy_try_again when the counter can't be written (parallel requests, Firestore
+    down), so a burst of requests never skips the cap."""
+    d = _d()
+    return bool((d.take_rate_strict or d.take_rate)(uid, key, limit, per))
+
+
+def _take_paid_quietly(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """take_paid where the work is optional (the week's text): a busy counter is a "no", never an error."""
+    try:
+        return take_paid(uid, key, limit, per)
+    except HTTPException:
+        return False
 
 
 # ------------------------------------------------------------------ small per-instance limiter
@@ -607,7 +627,7 @@ def _forecast_complete(uid: str) -> Callable[..., Tuple[str, str]]:
 
     def complete(*args: Any, **kwargs: Any) -> Tuple[str, str]:
         if "ok" not in state:
-            state["ok"] = bool(_d().take_rate(uid, "forecast", FORECASTS_PER_DAY, "day"))
+            state["ok"] = _take_paid_quietly(uid, "forecast", FORECASTS_PER_DAY, "day")
         if not state["ok"]:
             raise _OverForecastCap()
         return _d().complete(*args, **kwargs)
@@ -660,7 +680,7 @@ def forecast(body: ForecastReq, authorization: Optional[str] = Header(default=No
             deps.db(), uid, week["periodKey"], facts, sig, _forecast_complete(uid),
             take_lease=deps.take_lease or (lambda name_, ttl: True),
             release_lease=deps.release_lease or (lambda name_: None),
-            take_rate=deps.take_rate)
+            take_rate=_take_paid_quietly)
     except Exception:
         logger.exception("forecast text failed")
         text = None   # the strip still shows
@@ -958,7 +978,7 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
     else:
         return _locked(credits)
     # The daily caps come before a credit is spent.
-    if not _report_slot(uid) or not _d().take_rate(uid, "astroReport", REPORTS_PER_DAY, "day"):
+    if not _report_slot(uid) or not take_paid(uid, "astroReport", REPORTS_PER_DAY, "day"):
         raise HTTPException(status_code=429, detail="daily_cap")
     if via == "credit":
         if db is None:
@@ -1298,6 +1318,7 @@ def scores(body: ScoresReq, authorization: Optional[str] = Header(default=None))
                 out[u] = hit[1]
             else:
                 todo.append(u)
+    # The open counter: no AI and no money per call, and a refused count only means no fresh scores this time.
     if todo and not _d().take_rate(uid, "astroScores", SCORES_PER_DAY, "day"):
         todo = []   # over today's cap: the scores already worked out still show
     fresh: Dict[str, Dict[str, Any]] = {}

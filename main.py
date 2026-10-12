@@ -1334,21 +1334,22 @@ def _own_gcs_photo(gcs_uri: str, uid: str) -> bool:
             and ".." not in m.group(2))
 
 
-def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:
-    """A counter in serverRate/{uid} (no client can read or write that collection), per day or per minute.
-    Fails open: a Firestore hiccup must not take a feature down. For AI cost caps use _take_rate_strict."""
-    return _rate_counter(uid, key, limit, per, fail_open=True)
+RATE_OK, RATE_OVER, RATE_BUSY, RATE_DOWN = "ok", "over", "busy", "down"
+BUSY_DETAIL = "busy_try_again"
 
 
-def _take_rate_strict(uid: str, key: str, limit: int, per: str = "day") -> bool:
-    """The same counter, but it fails closed: no Firestore or any error means "no". For every AI cost cap
-    (a Firestore outage must not turn into unlimited model calls)."""
-    return _rate_counter(uid, key, limit, per, fail_open=False)
+def _contention(e: BaseException) -> bool:
+    """Firestore gave up on a transaction: transactional() raises ValueError after its retries, and an ABORTED
+    begin or commit comes through as Conflict/Aborted. On one account's own docs that means parallel requests."""
+    return isinstance(e, (ValueError, google_exceptions.Conflict))
 
 
-def _rate_counter(uid: str, key: str, limit: int, per: str, fail_open: bool) -> bool:
+def _rate_state(uid: str, key: str, limit: int, per: str = "day") -> str:
+    """One use of a counter in serverRate/{uid} (no client can read or write that collection), per day or per
+    minute: RATE_OK (counted), RATE_OVER (the cap is reached), RATE_BUSY (the transaction gave up: parallel
+    requests contend for the doc) or RATE_DOWN (no Firestore, or another error)."""
     if firestore_client is None:
-        return fail_open
+        return RATE_DOWN
     now = datetime.now(timezone.utc)
     day = now.strftime("%Y-%m-%dT%H:%M") if per == "minute" else now.date().isoformat()
 
@@ -1362,10 +1363,36 @@ def _rate_counter(uid: str, key: str, limit: int, per: str, fail_open: bool) -> 
 
     try:
         ref = firestore_client.collection("serverRate").document(uid)
-        return _run_transaction(take)
-    except Exception:
-        logger.exception("rate counter failed (%s)", "open" if fail_open else "closed")
-        return fail_open
+        return RATE_OK if _run_transaction(take) else RATE_OVER
+    except Exception as e:
+        if _contention(e):
+            logger.warning("rate counter busy uid=%s key=%s", uid, key)
+            return RATE_BUSY
+        logger.exception("rate counter failed uid=%s key=%s", uid, key)
+        return RATE_DOWN
+
+
+def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """The open counter, only for work that costs no AI and no money per call (the kundli scores) and for the photo
+    check before an upload: it lets the call through when Firestore is down (a hiccup must not stop photo uploads
+    or blank the scores), but never under contention, which is parallel requests skipping the cap.
+    Paid or AI work uses _take_rate_strict / _take_rate_or_busy."""
+    return _rate_state(uid, key, limit, per) in (RATE_OK, RATE_DOWN)
+
+
+def _take_rate_strict(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """The same counter, failing closed: busy, no Firestore or any error means "no". For every AI cost cap
+    (neither an outage nor a burst of parallel requests may turn into unlimited model calls)."""
+    return _rate_state(uid, key, limit, per) == RATE_OK
+
+
+def _take_rate_or_busy(uid: str, key: str, limit: int, per: str = "day") -> bool:
+    """_take_rate_strict for an HTTP route of paid or heavy work (astro_api's Deps.take_rate_strict): False over the
+    cap (the route answers 429), and HTTP 503 busy_try_again when the counter can't be written."""
+    state = _rate_state(uid, key, limit, per)
+    if state in (RATE_BUSY, RATE_DOWN):
+        raise HTTPException(status_code=503, detail=BUSY_DETAIL)
+    return state == RATE_OK
 
 
 def _run_transaction(work):
@@ -1386,7 +1413,11 @@ def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header
         raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
     if not _own_gcs_photo(gcs_uri, uid):
         raise HTTPException(status_code=403, detail="not_your_photo")
-    if not _take_rate(uid, "photoChecks", PHOTO_CHECKS_PER_DAY):
+    # The open counter (_take_rate): a Firestore outage lets the check run, parallel requests never do.
+    rate = _rate_state(uid, "photoChecks", PHOTO_CHECKS_PER_DAY)
+    if rate == RATE_BUSY:
+        raise HTTPException(status_code=503, detail=BUSY_DETAIL)
+    if rate == RATE_OVER:
         raise HTTPException(status_code=429, detail="too_many_photo_checks")
 
     try:
@@ -1998,9 +2029,12 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
     if not user_text:
         raise HTTPException(status_code=400, detail="text required")
 
-    # A burst limit on top of the daily quota: a script (or a stuck retry loop) can't fire DeepSeek calls.
-    if not _take_rate(uid, "aiChatMinute", AI_CHAT_PER_MINUTE, per="minute"):
-        return AiChatResponse(reply_text=_parrot_quota_reply("busy"), blocked=True, reason="slow_down", thread_id=thread_id)
+    # A burst limit on top of the daily quota: a script (or a stuck retry loop) can't fire DeepSeek calls. It fails
+    # closed: a counter that can't be written (parallel requests, Firestore down) refuses this reply.
+    rate = _rate_state(uid, "aiChatMinute", AI_CHAT_PER_MINUTE, per="minute")
+    if rate != RATE_OK:
+        return AiChatResponse(reply_text=_parrot_quota_reply("busy"), blocked=True,
+                              reason="slow_down" if rate == RATE_OVER else "busy", thread_id=thread_id)
 
     if not _is_allowed_topic(user_text):
         reply = _topic_block_reply(user_text, locale)
@@ -2352,7 +2386,11 @@ def _take_lease(name: str, ttl_sec: float) -> bool:
 
     try:
         return take(firestore_client.transaction())
-    except Exception:
+    except Exception as e:
+        if _contention(e):
+            # Parallel requests for the same lease: another one is taking it, so this one waits for its work.
+            logger.warning("lease busy: %s", name)
+            return False
         logger.exception("lease failed: %s", name)
         return True
 
@@ -2462,7 +2500,7 @@ def _regenerate_daily_horoscope(uid: str, thread_id: str, day_key: str, tz: Zone
             if cur.get("text") and cur.get("birthSig") == sig:
                 return cur["text"], False
         return None
-    if not _take_rate(uid, "horoscope_regen", HOROSCOPE_REGENS_PER_DAY, "day"):
+    if not _take_rate_strict(uid, "horoscope_regen", HOROSCOPE_REGENS_PER_DAY, "day"):
         _release_lease(lease)
         return None
 
@@ -2876,8 +2914,10 @@ def _take_counter(uid: str, field: str, limit: int) -> bool:
     try:
         return take(firestore_client.transaction())
     except Exception:
+        # Each try costs Vision calls and the face model: a count that can't be written (parallel requests,
+        # Firestore down) refuses the try instead of skipping the cap.
         logger.exception("face counter failed")
-        return True
+        raise HTTPException(status_code=503, detail=BUSY_DETAIL)
 
 
 @app.post("/verify-face-start")
@@ -3080,18 +3120,25 @@ def _astro_deps_extra(deps_cls: Any) -> Dict[str, Any]:
     return {k: v for k, v in (("take_lease", _take_lease), ("release_lease", _release_lease)) if k in fields}
 
 
-astro_api.configure(astro_api.Deps(
-    db=lambda: firestore_client,
-    verify_uid=_verify_firebase_token_or_401,
-    resolve_place=_resolve_birth_place,
-    places_query=_places_query,
-    load_user_docs=_load_user_docs,
-    is_premium=_is_premium_like_client,
-    complete=lambda messages, max_tokens, temperature, kind: _deepseek_complete(
-        messages, max_tokens, temperature=temperature, kind=kind, timeout=FATES_AI_TIMEOUT_SEC + 6),
-    take_rate=_take_rate,
-    **_astro_deps_extra(astro_api.Deps),
-))
+def _astro_deps() -> "astro_api.Deps":
+    """astro_api's wiring. take_rate is the open counter (the kundli scores only); take_rate_strict fails closed and
+    caps the paid and AI work there: the week forecast and its rewrite, /match/report and the biodata PDF."""
+    return astro_api.Deps(
+        db=lambda: firestore_client,
+        verify_uid=_verify_firebase_token_or_401,
+        resolve_place=_resolve_birth_place,
+        places_query=_places_query,
+        load_user_docs=_load_user_docs,
+        is_premium=_is_premium_like_client,
+        complete=lambda messages, max_tokens, temperature, kind: _deepseek_complete(
+            messages, max_tokens, temperature=temperature, kind=kind, timeout=FATES_AI_TIMEOUT_SEC + 6),
+        take_rate=_take_rate,
+        take_rate_strict=_take_rate_or_busy,
+        **_astro_deps_extra(astro_api.Deps),
+    )
+
+
+astro_api.configure(_astro_deps())
 app.include_router(astro_api.router)
 
 import biodata_route  # noqa: E402  (POST /astro/biodata, on astro_api's sign-in check and Deps)

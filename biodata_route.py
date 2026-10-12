@@ -17,6 +17,7 @@ Refusals, in this order:
 - 422 missing_birth_data: no valid birth date (the age is printed);
 - 422 too_young: a groom under 21 or anyone under 18 (India time);
 - 429 daily_cap: 30 PDFs a day (429 slow_down is the shared per-minute limit);
+- 503 busy_try_again: the daily count couldn't be written (parallel requests, Firestore down): never let through;
 - 422 unsupported_text: a letter the PDF font can't print (Devanagari, for now).
 """
 from __future__ import annotations
@@ -96,7 +97,7 @@ def biodata(body: BiodataReq, authorization: Optional[str] = Header(default=None
     today = datetime.now(INDIA).date()
     if bp.age(born, today) < (21 if astro_api._gender(doc.get("gender")) == "male" else 18):
         raise _refuse(422, "too_young")
-    if not astro_api._d().take_rate(uid, "biodataPdf", DAILY_CAP, "day"):
+    if not astro_api.take_paid(uid, "biodataPdf", DAILY_CAP, "day"):     # 503 busy_try_again: can't count it
         raise _refuse(429, "daily_cap")
 
     contact = None

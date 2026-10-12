@@ -146,6 +146,7 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "_verify_firebase_token_or_401", lambda a: UID)
     monkeypatch.setattr(main, "_deepseek_complete", complete)
     monkeypatch.setattr(main, "_take_rate", take_rate)
+    monkeypatch.setattr(main, "_take_rate_strict", take_rate)
     monkeypatch.setattr(main, "_take_lease", take_lease)
     monkeypatch.setattr(main, "_release_lease", lambda name: leases.discard(name))
     monkeypatch.setattr(main, "_run_transaction", db.run)

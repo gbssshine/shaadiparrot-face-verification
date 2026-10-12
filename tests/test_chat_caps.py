@@ -127,6 +127,7 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "firestore_client", db)
     monkeypatch.setattr(main, "_verify_firebase_token_or_401", lambda a: UID)
     monkeypatch.setattr(main, "_take_rate", lambda *a, **k: True)
+    monkeypatch.setattr(main, "_rate_state", lambda *a, **k: main.RATE_OK)
     monkeypatch.setattr(main, "_reserve_parrot_reply", lambda *a, **k: None)
     monkeypatch.setattr(main, "_deepseek_complete", complete)
     # Today's festival comes from the real date (Republic Day, Diwali...): these tests pin a quiet day. The
@@ -316,7 +317,7 @@ def test_the_strict_counter_fails_closed(monkeypatch):
     monkeypatch.setattr(main, "firestore_client", Db())
     monkeypatch.setattr(main, "_run_transaction", aborted)
     assert main._take_rate_strict("u1", "mithuTake", 8) is False
-    assert main._take_rate("u1", "mithuTake", 8) is True
+    assert main._take_rate("u1", "mithuTake", 8) is False       # contention is parallel requests: never let through
     monkeypatch.setattr(main, "firestore_client", None)
     assert main._take_rate_strict("u1", "mithuTake", 8) is False
     assert main._take_rate("u1", "mithuTake", 8) is True
