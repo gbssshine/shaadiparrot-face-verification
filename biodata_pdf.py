@@ -18,6 +18,7 @@ Never on it: e-mail, uid, address, exact location, complexion, weight or a gende
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import re
@@ -649,18 +650,62 @@ def allowed_photo_url(url: str, uid: str) -> bool:
     return False
 
 
-def photo_url(profile: Mapping[str, Any], public: Mapping[str, Any], uid: str) -> Optional[str]:
-    """The main photo's 960 px variant to print, or None (nothing is fetched then).
-    Private photos (photoPrivacy "accepted"): the profile's own links, since the card only has blurs. Otherwise
-    the public card's, which is what was moderated. Candidates: photoMediumCdn[0], photoMedium[0], photos[0]."""
-    if not _own_source(profile or {}, public or {}):
-        return None
-    src = (profile or {}) if is_private(profile or {}) else (public or {})
-    for key in ("photoMediumCdn", "photoMedium", "photos"):
-        url = _first(src.get(key))
-        if url and allowed_photo_url(url, uid):
-            return url
+GS_RX = re.compile(r"^gs://([^/]+)/(.+)$")
+COPY_TAIL_RX = re.compile(r"\d+\.jpg")
+
+
+def _own_object(src: str, uid: str) -> Optional[str]:
+    """The Storage object path of the user's own photo src (users/{uid}/photos/..., the project's bucket): a download
+    link (face_live.own_photo_object), or a gs:// link as a private profile may keep them. None otherwise."""
+    obj = face_live.own_photo_object(src, uid)
+    if obj:
+        return obj
+    m = GS_RX.match(src or "")
+    if (m and m.group(1).lower() in face_live.photo_buckets() and m.group(2).startswith(f"users/{uid}/photos/")
+            and not any(seg in ("", ".", "..") for seg in m.group(2).split("/"))):
+        return m.group(2)
     return None
+
+
+def is_copy_of(url: str, src: str, uid: str) -> bool:
+    """url shows the photo src: src itself, or one of src's resized copies, users/{uid}/variants/{key}_{size}.jpg
+    where key is the sha1 of src's object path (media.ts variantPath), on the photo CDN (same path) or in Storage."""
+    if not url or not src:
+        return False
+    if url == src:
+        return True
+    obj = _own_object(src, uid)
+    if not obj:
+        return False
+    head = f"users/{uid}/variants/{hashlib.sha1(obj.encode('utf-8')).hexdigest()}_"
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    if (u.hostname or "").lower() == PHOTO_HOST:
+        path = unquote(u.path or "")
+        copy = path[1:] if path.startswith("/") else ""
+    else:
+        ref = face_live.storage_object(url)
+        copy = ref[1] if ref else ""
+    return copy.startswith(head) and COPY_TAIL_RX.fullmatch(copy[len(head):]) is not None
+
+
+def photo_url(profile: Mapping[str, Any], public: Mapping[str, Any], uid: str) -> Optional[str]:
+    """The photo to print, or None (nothing is fetched then): the main photo photos[0], which the "Photo verified"
+    pill stands for. Private photos (photoPrivacy "accepted"): the profile's own links, since the card only has
+    blurs. Otherwise the public card's, which is what was moderated. Its 960 px copy (photoMediumCdn[0], then
+    photoMedium[0]) is printed only when it is a copy of that very photo (is_copy_of); a copy of another photo (the
+    variant arrays not yet rewritten after a change) never is, and photos[0] itself is printed instead."""
+    src = _own_source(profile or {}, public or {})
+    if not src:
+        return None
+    doc = (profile or {}) if is_private(profile or {}) else (public or {})
+    for key in ("photoMediumCdn", "photoMedium"):
+        url = _first(doc.get(key))
+        if url and allowed_photo_url(url, uid) and is_copy_of(url, src, uid):
+            return url
+    return src if allowed_photo_url(src, uid) else None
 
 
 def fetch_photo(url: str) -> Optional[bytes]:
@@ -697,14 +742,18 @@ def fetch_photo(url: str) -> Optional[bytes]:
         return None
 
 
-def photo_verified(printed: bool, profile: Mapping[str, Any], public: Mapping[str, Any]) -> bool:
+def photo_verified(printed: bool, profile: Mapping[str, Any], public: Mapping[str, Any],
+                   url: Optional[str] = None, uid: str = "") -> bool:
     """The "Photo verified" pill: the photo is on the PDF, the public card says verified (the card flag is the one
-    cleared when photos change), and the photo it stands for is one the face check verified."""
+    cleared when photos change), the photo it stands for (photos[0]) is one the face check verified, and the file
+    printed (url, with the account's uid) is that photo or one of its own copies (is_copy_of)."""
     if not printed or (public or {}).get("isFaceVerified") is not True:
         return False
     src = _own_source(profile or {}, public or {})
     verified = (profile or {}).get("faceVerifiedPhotos") or []
-    return bool(src) and isinstance(verified, list) and src in [str(x) for x in verified]
+    if not (bool(src) and isinstance(verified, list) and src in [str(x) for x in verified]):
+        return False
+    return url is None or is_copy_of(url, src, uid)
 
 
 # ------------------------------------------------------------------ drawing

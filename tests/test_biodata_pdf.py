@@ -5,6 +5,7 @@ Auth phone and the photo fetch are replaced. Firestore is an in-memory fake for 
 """
 import base64
 import dataclasses
+import hashlib
 import io
 import json
 import re
@@ -29,8 +30,10 @@ ROOT = Path(__file__).resolve().parents[1]
 ME = "me123456"
 H = {"Authorization": "Bearer ok"}
 TODAY = datetime.now(biodata_route.INDIA).date()
-CDN = f"https://photos.shaadiparrot.com/users/{ME}/variants/p1_960.jpg"
 OWN = f"https://firebasestorage.googleapis.com/v0/b/shaadiparrot.appspot.com/o/users%2F{ME}%2Fphotos%2Fp1.jpg?alt=media"
+# A resized copy is named by the sha1 of its photo's object path (media.ts variantPath): this is OWN's 960 px copy.
+KEY = hashlib.sha1(f"users/{ME}/photos/p1.jpg".encode("utf-8")).hexdigest()
+CDN = f"https://photos.shaadiparrot.com/users/{ME}/variants/{KEY}_960.jpg"
 LINK = "https://www.shaadiparrot.com/kundli-match.html#with=1&m=10.22&g=f&n=Asha&s=p"
 EMAIL = "asha.patil@example.com"
 
@@ -518,6 +521,50 @@ def test_the_photo_verified_badge(env):
     assert body["photo"] is False and env.renders[-1].verified is False
     ok(env.post(photo=False))
     assert env.renders[-1].verified is False
+
+
+def copy_of(photo_path: str, size: int = 960, storage: bool = False) -> str:
+    key = hashlib.sha1(photo_path.encode("utf-8")).hexdigest()
+    if storage:
+        obj = f"users%2F{ME}%2Fvariants%2F{key}_{size}.jpg"
+        return f"https://firebasestorage.googleapis.com/v0/b/shaadiparrot.firebasestorage.app/o/{obj}?alt=media&token=t"
+    return f"https://photos.shaadiparrot.com/users/{ME}/variants/{key}_{size}.jpg"
+
+
+def test_the_pill_only_with_the_checked_main_photo_printed(env):
+    """The "Photo verified" pill stands for photos[0], the photo the face check verified. A 960 px copy is printed
+    only when it is a copy of that very photo (its name is the sha1 of photos[0]'s object path); a copy of another
+    photo (the variant arrays not yet rewritten after a change) is never printed for it: photos[0] itself is."""
+    stale = copy_of(f"users/{ME}/photos/old.jpg")
+    verified = {**PROFILE, "isFaceVerified": True, "faceVerified": True, "faceVerifiedPhotos": [OWN]}
+    env.make(public={**PUBLIC, "photos": [OWN], "photoMediumCdn": [stale], "photoMedium": [copy_of(
+        f"users/{ME}/photos/old.jpg", storage=True)], "isFaceVerified": True}, profile=verified)
+    body = ok(env.post())
+    assert env.fetched == [OWN] and body["photo"] is True and env.renders[-1].verified is True
+    # The right copy: printed, with the pill (the Storage copy too when there is no CDN copy).
+    env.make(public={**env.public, "photoMediumCdn": [CDN]})
+    ok(env.post())
+    assert env.fetched[-1] == CDN and env.renders[-1].verified is True
+    good_storage = copy_of(f"users/{ME}/photos/p1.jpg", storage=True)
+    env.make(public={**env.public, "photoMediumCdn": [""], "photoMedium": [good_storage]})
+    ok(env.post())
+    assert env.fetched[-1] == good_storage and env.renders[-1].verified is True
+
+
+def test_photo_verified_needs_the_printed_file_to_be_the_checked_photo():
+    profile = {"faceVerifiedPhotos": [OWN]}
+    public = {"isFaceVerified": True, "photos": [OWN]}
+    assert bp.photo_verified(True, profile, public, url=OWN, uid=ME)
+    assert bp.photo_verified(True, profile, public, url=CDN, uid=ME)
+    assert not bp.photo_verified(True, profile, public, url=copy_of(f"users/{ME}/photos/old.jpg"), uid=ME)
+    assert not bp.photo_verified(True, profile, public, url=CDN, uid="someone9")
+    assert bp.is_copy_of(CDN, OWN, ME) and bp.is_copy_of(copy_of(f"users/{ME}/photos/p1.jpg", 480, True), OWN, ME)
+    assert not bp.is_copy_of(f"https://photos.shaadiparrot.com/users/{ME}/variants/{KEY}_960.jpg.png", OWN, ME)
+    assert not bp.is_copy_of(f"https://photos.shaadiparrot.com/users/{ME}/blur/{KEY}_960.jpg", OWN, ME)
+    # A private profile may keep gs:// links: the copy is still matched to its object.
+    gs = f"gs://shaadiparrot.appspot.com/users/{ME}/photos/p1.jpg"
+    assert bp.is_copy_of(CDN, gs, ME)
+    assert bp.photo_url({"photoPrivacy": "accepted", "photos": [gs], "photoMediumCdn": [CDN]}, {}, ME) == CDN
 
 
 def test_photo_verified_in_private_mode_follows_the_private_photo():

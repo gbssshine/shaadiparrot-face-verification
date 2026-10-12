@@ -123,11 +123,11 @@ def biodata(body: BiodataReq, authorization: Optional[str] = Header(default=None
         raise _refuse(422, "unsupported_text")
 
     photo = None
-    if body.photo:
-        url = bp.photo_url(profile, public, uid)
-        if url:
-            photo = bp.fetch_photo(url)
-    verified = bp.photo_verified(photo is not None, profile, public)
+    url = bp.photo_url(profile, public, uid) if body.photo else None
+    if url:
+        photo = bp.fetch_photo(url)
+    # The pill only when the printed file is the checked main photo (or its own copy).
+    verified = bp.photo_verified(photo is not None, profile, public, url=url or "", uid=uid)
 
     try:
         pdf, pages, _ = bp.make(doc, chart, opts, contact, photo, verified, with_link=link, today=today)
