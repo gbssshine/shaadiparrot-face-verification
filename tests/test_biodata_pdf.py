@@ -382,6 +382,45 @@ def test_a_valid_with_link_becomes_the_footer_line(env):
     assert env.bio().link_text.startswith("Check your kundli match with Rahul, free")
 
 
+# The app's v1 link with two Moon groups and t=0 (birth time not known): chart data in the link itself.
+LINK_T0 = "https://www.shaadiparrot.com/kundli-match.html#with=1&m=10.22,11.23&g=f&n=Asha&t=0&s=p"
+
+
+def test_with_the_kundli_chip_on_the_line_keeps_the_moon_link(env):
+    body = ok(env.post(kundli=True, withLink=LINK_T0))
+    bio = env.bio()
+    assert bio.section("kundli") is not None
+    assert bio.link == LINK_T0 and bio.link_text == "Check your kundli match with Asha, free: shaadiparrot.com/kundli-match"
+    assert f"/URI ({LINK_T0})".encode() in base64.b64decode(body["pdf"])
+
+
+@pytest.mark.parametrize("manglik", [False, True])
+def test_with_the_kundli_chip_off_the_line_goes(env, manglik):
+    """feature-pdf.md: the Kundli chip ("Moon sign, nakshatra and Manglik") is how a family keeps the kundli off a
+    forwarded document. The link carries the Moon groups (m=) and t=0, so with the chip off the whole line goes: no
+    text, no link annotation. The plain tool text would promise a match "with Asha" the tool can't do without her
+    Moon; the footer is then feature-pdf.md's own (brand row and disclaimer). The Manglik chip alone keeps it off."""
+    body = ok(env.post(kundli=False, manglik=manglik, withLink=LINK_T0))
+    bio = env.bio()
+    assert bio.link is None and bio.link_text == "" and "kundli match" not in bio.text()
+    card = bio.section("kundli")
+    assert (card is None) if not manglik else [label for label, _ in card.rows] == ["Manglik"]
+    pdf = base64.b64decode(body["pdf"])
+    assert b"kundli-match" not in pdf and b"with=1&m=" not in pdf and b"/URI (https://www.shaadiparrot.com)" in pdf
+
+
+def test_the_footer_link_follows_the_kundli_chip():
+    chart = chart_of(PROFILE)
+    on = build(PROFILE, chart, with_link=LINK_T0)
+    assert on.link == LINK_T0 and on.link_text.startswith("Check your kundli match with Asha, free")
+    for opts in ({"kundli": False}, {"kundli": False, "manglik": True}, {"kundli": False, "birth": True}):
+        off = build(PROFILE, chart, with_link=LINK_T0, **opts)
+        assert off.link is None and off.link_text == "", opts
+    assert bp.footer_link(LINK_T0, bp.Options()) == LINK_T0
+    assert bp.footer_link(LINK_T0, bp.Options(kundli=False, manglik=True)) is None
+    assert bp.footer_link("https://evil.example/x", bp.Options()) is None
+
+
 @pytest.mark.parametrize("link", [
     "https://evil.example/kundli-match.html#with=1&m=1.3",
     "http://www.shaadiparrot.com/kundli-match.html#with=1&m=1.3",

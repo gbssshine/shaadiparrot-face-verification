@@ -2,8 +2,8 @@
 
 Plan §2 C9: the request carries the chips {photo, kundli, manglik, birth, caste, income, contact} (on/off) and
 withLink (the "Check your kundli match with {Name}, free" footer link, ignored unless it is a kundli-match "with"
-link of at most 160 characters). The answer is {ok, pdf (base64), pages, photo, contact}: photo and contact say
-whether they made it onto the PDF.
+link of at most 160 characters, and ignored with the kundli chip off, since the link carries the Moon). The answer
+is {ok, pdf (base64), pages, photo, contact}: photo and contact say whether they made it onto the PDF.
 
 It shares astro_api's sign-in check, per-minute limit and Deps (configured by main.py); this router only adds the
 route. The caller's own docs are read once (profiles, publicProfiles, users), through biodata_pdf.FIELDS only.
@@ -115,7 +115,7 @@ def biodata(body: BiodataReq, authorization: Optional[str] = Header(default=None
 
     opts = bp.Options(photo=body.photo, kundli=body.kundli, manglik=body.manglik, birth=body.birth,
                       caste=body.caste, income=body.income)
-    link = bp.valid_with_link(body.withLink)
+    link = bp.footer_link(body.withLink, opts)
     try:
         bp.build(doc, chart, opts, contact, with_link=link, today=today)
     except bp.UnsupportedText:

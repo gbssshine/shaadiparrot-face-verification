@@ -12,7 +12,8 @@ What goes on it is chosen with the C9 chips:
 - birth: date, time and place of birth, plus the pada and the Lagna (both give the birth time away);
 - caste: caste, sub-caste and gotra; income: the yearly band, only when its visibility is Everyone;
 - contact: the account's own sign-in phone, labelled "Me" or with the creator's relation (the route reads it);
-- withLink: a footer line "Check your kundli match with {Name}, free" that opens the kundli tool.
+- withLink: a footer line "Check your kundli match with {Name}, free" that opens the kundli tool; only with the
+  kundli chip on, since the link itself carries the Moon sign and nakshatra (footer_link).
 Never on it: e-mail, uid, address, exact location, complexion, weight or a gender line.
 """
 from __future__ import annotations
@@ -335,6 +336,15 @@ def valid_with_link(link: Any) -> Optional[str]:
     return t
 
 
+def footer_link(link: Any, opts: "Options") -> Optional[str]:
+    """The "Check your kundli match with {Name}, free" line's link, only with the Kundli chip on. The link carries
+    the Moon itself (m=<rashi>.<nakshatra> groups, t=0 when the birth time isn't known), and feature-pdf.md makes
+    the Kundli chip the way to keep "Moon sign, nakshatra and Manglik" off a forwarded document. With the chip off
+    the whole line goes: the plain tool text can't keep its "with {Name}" promise without that Moon, and the
+    footer is then exactly feature-pdf.md's own (the brand row with www.shaadiparrot.com, the disclaimer)."""
+    return valid_with_link(link) if opts.kundli else None
+
+
 def pick(public: Mapping[str, Any], user: Mapping[str, Any], profile: Mapping[str, Any]) -> Dict[str, Any]:
     """{**public, **user, **profile} (the private profile wins), read only through FIELDS."""
     out: Dict[str, Any] = {}
@@ -578,7 +588,7 @@ def build(doc: Mapping[str, Any], chart: Optional[Mapping[str, Any]], opts: Opti
         sections.append(Section("contact", "Contact", GLYPHS["Phone"], PALETTE["Leaf"], PALETTE["LeafSoft"],
                                 rows=[contact]))
 
-    link = valid_with_link(with_link)
+    link = footer_link(with_link, opts)
     link_text = ""
     if link:
         who = name if name else "this biodata"
