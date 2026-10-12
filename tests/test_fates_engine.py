@@ -46,15 +46,16 @@ def test_looking_for_values():
 
 
 def test_person_from_docs_reads_tests_and_private_fields():
+    own = storage_link("u1", "photos", "1.jpg")
     pub = {"firstName": "Anaya Rao", "gender": "Female", "lookingForGender": "Male", "isDiscoverable": True,
-           "photos": ["https://a/1.jpg", "not-a-url"], "tests_attachment_closeness_scorePercent": 61, "lat": 12.9, "lon": 77.6}
+           "photos": [own, "not-a-url"], "tests_attachment_closeness_scorePercent": 61, "lat": 12.9, "lon": 77.6}
     priv = {"settings_wantChildren": "Yes", "settings_ageMin": 24, "settings_ageMax": 32, "birthDate": "1999-05-02",
-            "fatesPrefs": {"stars": "lot", "useTests": True}, "faceVerifiedPhotos": ["https://a/1.jpg"]}
+            "fatesPrefs": {"stars": "lot", "useTests": True}, "faceVerifiedPhotos": [own]}
     usr = {"lastAppOpenAtUtcIso": "2026-09-30T08:00:00Z", "isFaceVerified": True}
     p = fe.person_from_docs("u1", pub, priv, usr)
     assert p.first_name == "Anaya"
     assert p.gender == "female" and p.looking_for == "male"
-    assert p.photos == ["https://a/1.jpg"]
+    assert p.photos == [own]
     assert p.tests == {"attachment_closeness": 61}
     assert p.age_min == 24 and p.age_max == 32
     assert p.face_verified and p.stars_pref == "lot"
@@ -346,20 +347,22 @@ def test_only_verified_people_are_brought():
 
 
 def test_the_apps_own_verification_copy_is_not_trusted():
-    pub = {"uid": "a", "gender": "Female", "isDiscoverable": True, "photos": ["https://x/a.jpg"]}
-    checked = {"faceVerifiedPhotos": ["https://x/a.jpg"]}
+    a = storage_link("a", "photos", "a.jpg")
+    pub = {"uid": "a", "gender": "Female", "isDiscoverable": True, "photos": [a]}
+    checked = {"faceVerifiedPhotos": [a]}
     assert fe.person_from_docs("a", pub, {"faceVerified": True, **checked}).face_verified
     assert fe.person_from_docs("a", pub, checked, {"isFaceVerified": True}).face_verified
     assert not fe.person_from_docs("a", pub, {"faceVerificationPassed": True, **checked}, {"faceVerificationPassed": True}).face_verified
 
 
 def test_a_new_photo_pauses_verification_until_the_server_rechecks():
-    checked = {"faceVerified": True, "faceVerifiedPhotos": ["https://x/a.jpg", "https://x/b.jpg"]}
+    a, b, new = (storage_link("a", "photos", n) for n in ("a.jpg", "b.jpg", "new.jpg"))
+    checked = {"faceVerified": True, "faceVerifiedPhotos": [a, b]}
     pub = {"uid": "a", "gender": "Female", "isDiscoverable": True}
-    assert fe.person_from_docs("a", {**pub, "photos": ["https://x/b.jpg", "https://x/a.jpg"]}, checked).face_verified  # reordered
-    assert fe.person_from_docs("a", {**pub, "photos": ["https://x/a.jpg"]}, checked).face_verified                    # one removed
-    assert not fe.person_from_docs("a", {**pub, "photos": ["https://x/a.jpg", "https://x/new.jpg"]}, checked).face_verified
-    assert not fe.person_from_docs("a", {**pub, "photos": ["https://x/a.jpg"]}, {"faceVerified": True}).face_verified  # never checked
+    assert fe.person_from_docs("a", {**pub, "photos": [b, a]}, checked).face_verified              # reordered
+    assert fe.person_from_docs("a", {**pub, "photos": [a]}, checked).face_verified                 # one removed
+    assert not fe.person_from_docs("a", {**pub, "photos": [a, new]}, checked).face_verified
+    assert not fe.person_from_docs("a", {**pub, "photos": [a]}, {"faceVerified": True}).face_verified  # never checked
 
 
 def test_a_boost_buys_reach_never_fit():
@@ -449,9 +452,27 @@ def test_a_blurred_card_brings_no_photos_and_a_private_viewer_stays_verified():
     # Private photos are checked against the real links, never a blur.
     assert not fe.person_from_docs("u1", pub, {**priv, "photos": blur, "faceVerifiedPhotos": blur}).face_verified
     assert not fe.person_from_docs("u1", pub, {**priv, "photos": real + [storage_link("u1", "photos", "new.jpg")]}).face_verified
-    # Public photos: the card's links for both, as before.
+    # Public photos: the card's links are shown, and checked by the face check's own rule.
     shown = fe.person_from_docs("u1", {**pub, "photos": real, "photoPrivacy": "all"}, priv)
     assert shown.photos == real and shown.face_verified
+
+
+def test_public_photos_are_checked_against_the_face_checks_own_list():
+    """A public card is checked like main._own_photos builds faceVerifiedPhotos: the first 6 http links, then only own
+    Storage photos. A resized variant, a CDN copy or someone else's blur on the card is shown but never pauses a
+    verified person; a new own photo among the first 6 still does."""
+    real = [storage_link("u1", "photos", f"{i}.jpg") for i in range(2)]
+    extras = [storage_link("u1", "variants", "0_960.jpg"), "https://photos.shaadiparrot.com/users/u1/photos/0.jpg",
+              storage_link("u2", "blur", "b.jpg")]
+    pub = {"gender": "Female", "isDiscoverable": True, "photoPrivacy": "all", "photos": real[:1] + extras + real[1:]}
+    checked = {"faceVerified": True, "faceVerifiedPhotos": real}
+    p = fe.person_from_docs("u1", pub, checked)
+    assert p.photos == pub["photos"] and p.face_verified
+    assert fe.own_private_photos("u1", pub) == real                   # what the face check saved
+    new = storage_link("u1", "photos", "new.jpg")
+    assert not fe.person_from_docs("u1", {**pub, "photos": pub["photos"] + [new]}, checked).face_verified
+    # Only a variant and a CDN copy: nothing the face check could have checked, so not verified.
+    assert not fe.person_from_docs("u1", {**pub, "photos": extras[:2]}, {**checked, "faceVerifiedPhotos": extras[:2]}).face_verified
 
 
 def test_someone_elses_blur_link_does_not_hide_a_card():

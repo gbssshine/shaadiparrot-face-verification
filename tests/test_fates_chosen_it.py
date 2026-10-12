@@ -18,6 +18,12 @@ os.environ.setdefault("GOOGLE_CLOUD_PROJECT", PROJECT)
 NOW = datetime.now(timezone.utc)
 
 
+def own_photo(uid: str, name: str = "p1.jpg") -> str:
+    """An own Storage photo link (face_live.own_photo_url): the only kind the face check verifies and Daily Fates
+    checks (fates_engine.own_private_photos), on a public card as on a private profile."""
+    return f"https://firebasestorage.googleapis.com/v0/b/{PROJECT}.appspot.com/o/users%2F{uid}%2Fphotos%2F{name}?alt=media"
+
+
 def _token(email_user: str):
     host = os.environ["FIREBASE_AUTH_EMULATOR_HOST"]
     body = {"email": f"{email_user}@test.dev", "password": "secret1", "returnSecureToken": True}
@@ -47,14 +53,14 @@ def env():
     def person(uid, **pub):
         base = {"uid": uid, "firstName": uid.title(), "age": 26, "gender": "Female", "lookingForGender": "Male",
                 "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True, "isFaceVerified": True,
-                "photos": [f"https://example.com/{uid}.jpg"], "relationshipIntent": "Serious long-term partner",
+                "photos": [own_photo(uid)], "relationshipIntent": "Serious long-term partner",
                 "religion": "Hindu", "community": "Kannada", "languages": ["Hindi", "English"],
                 "interests": ["Trekking", "Coffee"], "smoking": "Never", "drinking": "Socially"}
         base.update(pub)
         db.document(f"publicProfiles/{uid}").set(base)
         db.document(f"profiles/{uid}").set({"birthDate": "1999-05-02", "birthTime": "10:15", "birthCityName": "Bengaluru",
                                              "birthCountryIso2": "IN", "settings_wantChildren": "Yes", "faceVerified": True,
-                                             "faceVerifiedPhotos": [f"https://example.com/{uid}.jpg"]})
+                                             "faceVerifiedPhotos": [own_photo(uid)]})
         db.document(f"users/{uid}").set({"lastAppOpenAtUtcIso": active})
 
     def chose(uid, minutes_ago, note):
@@ -64,12 +70,12 @@ def env():
 
     db.document(f"publicProfiles/{viewer}").set({
         "uid": viewer, "firstName": "Dev", "age": 28, "gender": "Male", "lookingForGender": "Female", "cityName": "Bengaluru",
-        "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "photos": ["https://example.com/dev.jpg"],
+        "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "photos": [own_photo(viewer)],
         "relationshipIntent": "Serious long-term partner", "religion": "Hindu", "community": "Kannada",
         "languages": ["Hindi", "English"], "interests": ["Trekking"], "smoking": "Never", "drinking": "Socially"})
     db.document(f"profiles/{viewer}").set({"birthDate": "1996-11-20", "birthTime": "06:30", "birthCityName": "Bengaluru",
                                             "birthCountryIso2": "IN", "settings_wantChildren": "Yes", "crownsBalance": 1, "faceVerified": True,
-                                            "faceVerifiedPhotos": ["https://example.com/dev.jpg"]})
+                                            "faceVerifiedPhotos": [own_photo(viewer)]})
     db.document(f"users/{viewer}").set({"lastAppOpenAtUtcIso": active})
 
     for u in ("asha", "bela", "kavya", "tara"):
@@ -136,7 +142,7 @@ def test_an_unverified_viewer_is_asked_to_verify_first(env):
     active = (NOW - timedelta(hours=1)).isoformat()
     db.document(f"publicProfiles/{uid}").set({
         "uid": uid, "firstName": "Raj", "age": 27, "gender": "Male", "lookingForGender": "Female", "cityName": "Bengaluru",
-        "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "photos": ["https://example.com/raj.jpg"],
+        "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "photos": [own_photo(uid)],
         "relationshipIntent": "Serious long-term partner", "religion": "Hindu", "community": "Kannada"})
     db.document(f"profiles/{uid}").set({"birthDate": "1997-01-01", "faceVerificationPassed": True})   # the app's copy: not trusted
     db.document(f"users/{uid}").set({"lastAppOpenAtUtcIso": active})
@@ -147,12 +153,12 @@ def test_an_unverified_viewer_is_asked_to_verify_first(env):
     assert not db.document(f"dailyFates/{uid}__{body['dayKey']}").get().exists
     opened = env["client"].post("/fates/open", headers=h, json={"path": "heart"})
     assert opened.status_code == 403 and opened.json()["detail"] == "not_verified"
-    db.document(f"profiles/{uid}").set({"faceVerified": True, "faceVerifiedPhotos": ["https://example.com/raj.jpg"]}, merge=True)
+    db.document(f"profiles/{uid}").set({"faceVerified": True, "faceVerifiedPhotos": [own_photo(uid)]}, merge=True)
     after = env["client"].post("/fates/today", headers=h).json()                                     # the server verified them
     assert not after.get("needsVerification") and len(after["paths"]) >= 1
 
     # A new photo the server hasn't checked pauses it: the app is told to re-check.
-    db.document(f"publicProfiles/{uid}").set({"photos": ["https://example.com/raj.jpg", "https://example.com/new.jpg"]}, merge=True)
+    db.document(f"publicProfiles/{uid}").set({"photos": [own_photo(uid), own_photo(uid, "new.jpg")]}, merge=True)
     db.document(f"dailyFates/{uid}__{after['dayKey']}").delete()
     paused = env["client"].post("/fates/today", headers=h).json()
     assert paused["needsVerification"] is True and paused["verifyReason"] == "photos_changed"

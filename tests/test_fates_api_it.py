@@ -19,6 +19,12 @@ os.environ.setdefault("GOOGLE_CLOUD_PROJECT", PROJECT)
 NOW = datetime.now(timezone.utc)
 
 
+def own_photo(uid: str, name: str = "p1.jpg") -> str:
+    """An own Storage photo link (face_live.own_photo_url): the only kind the face check verifies and Daily Fates
+    checks (fates_engine.own_private_photos), on a public card as on a private profile."""
+    return f"https://firebasestorage.googleapis.com/v0/b/{PROJECT}.appspot.com/o/users%2F{uid}%2Fphotos%2F{name}?alt=media"
+
+
 def _token(uid: str) -> str:
     host = os.environ["FIREBASE_AUTH_EMULATOR_HOST"]
     r = requests.post(f"http://{host}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake",
@@ -68,24 +74,24 @@ def env():
     def person(uid, **pub):
         base = {"uid": uid, "firstName": uid.title(), "age": 26, "gender": "Female", "lookingForGender": "Male",
                 "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True, "isFaceVerified": True,
-                "photos": [f"https://example.com/{uid}.jpg"], "relationshipIntent": "Serious long-term partner",
+                "photos": [own_photo(uid)], "relationshipIntent": "Serious long-term partner",
                 "religion": "Hindu", "community": "Kannada", "languages": ["Hindi", "English"],
                 "interests": ["Trekking", "Coffee"], "smoking": "Never", "drinking": "Socially", "bio": f"I am {uid}."}
         base.update(pub)
         db.document(f"publicProfiles/{uid}").set(base)
         db.document(f"profiles/{uid}").set({"birthDate": "1999-05-02", "birthTime": "10:15", "birthCityName": "Bengaluru",
                                              "birthCountryIso2": "IN", "settings_wantChildren": "Yes", "faceVerified": True,
-                                             "faceVerifiedPhotos": [f"https://example.com/{uid}.jpg"]})
+                                             "faceVerifiedPhotos": [own_photo(uid)]})
         db.document(f"users/{uid}").set({"lastAppOpenAtUtcIso": active})
 
     db.document(f"publicProfiles/{viewer}").set({
         "uid": viewer, "firstName": "Arjun", "age": 28, "gender": "Male", "lookingForGender": "Female", "cityName": "Bengaluru",
-        "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "photos": ["https://example.com/arjun.jpg"],
+        "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "photos": [own_photo(viewer)],
         "relationshipIntent": "Serious long-term partner", "religion": "Hindu", "community": "Kannada",
         "languages": ["Hindi", "English"], "interests": ["Trekking", "Cricket"], "smoking": "Never", "drinking": "Socially"})
     db.document(f"profiles/{viewer}").set({"birthDate": "1996-11-20", "birthTime": "06:30", "birthCityName": "Bengaluru",
                                             "birthCountryIso2": "IN", "settings_wantChildren": "Yes", "crownsBalance": 1, "faceVerified": True,
-                                            "faceVerifiedPhotos": ["https://example.com/arjun.jpg"]})
+                                            "faceVerifiedPhotos": [own_photo(viewer)]})
     db.document(f"users/{viewer}").set({"lastAppOpenAtUtcIso": active})
 
     for u in ("anaya", "meera", "tanisha", "riya"):
@@ -106,7 +112,7 @@ def test_today_generates_three_distinct_anonymous_paths(env):
     body = r.json()
     assert body["ok"] and len(body["paths"]) >= 1
     txt = json.dumps(body)
-    for hidden in ("friendsonly", "sleepy", "\"man\"", "riya", "example.com", "Anaya", "Meera", "Tanisha"):
+    for hidden in ("friendsonly", "sleepy", "\"man\"", "riya", "firebasestorage", "Anaya", "Meera", "Tanisha"):
         assert hidden not in txt, hidden                      # closed paths stay anonymous
     assert all(p["blurThumb"] and not p["opened"] for p in body["paths"])
     assert body["opensLeft"] == 1
@@ -215,7 +221,7 @@ def rishta_env(env):
     active = (NOW - timedelta(hours=2)).isoformat()
 
     def seed(uid, birth, pub=None, priv=None):
-        photo = f"https://example.com/{uid}.jpg"
+        photo = own_photo(uid)
         card = {"uid": uid, "firstName": uid.title(), "age": 27, "gender": "Female", "lookingForGender": "Male",
                 "cityName": "Bengaluru", "lat": 12.97, "lon": 77.59, "isDiscoverable": True, "isFaceVerified": True,
                 "photos": [photo], "religion": "Hindu", "community": "Kannada", "maritalStatus": "Never married",
@@ -247,7 +253,7 @@ def rishta_env(env):
 
     def viewer(name, priv):
         token, uid = _token(name)
-        photo = f"https://example.com/{name}.jpg"
+        photo = own_photo(uid)
         db.document(f"publicProfiles/{uid}").set({
             "uid": uid, "firstName": name.title(), "age": 29, "gender": "Male", "lookingForGender": "Female",
             "cityName": "Bengaluru", "lat": 12.96, "lon": 77.64, "isDiscoverable": True, "isFaceVerified": True,

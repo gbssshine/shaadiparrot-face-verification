@@ -200,6 +200,22 @@ def test_a_non_own_link_among_the_first_6_is_dropped_not_replaced(monkeypatch, p
     assert fates_engine.verified_now(private_doc, {}, fates_engine.own_private_photos(uid, private_doc))
 
 
+def test_a_public_card_keeps_daily_fates_verified_with_a_variant_on_it(monkeypatch):
+    """The chain for public photos: the list main._own_photos hands the face check (saved as faceVerifiedPhotos) is
+    the list Daily Fates checks, so a resized variant or someone else's blur among the card's photos never pauses it."""
+    import fates_engine
+    uid = "u5"
+    own = [link(f"users/{uid}/photos/{i}.jpg") for i in range(3)]
+    photos = own[:1] + [link(f"users/{uid}/variants/0_960.jpg"), link(f"users/other/blur/{0:040d}.jpg")] + own[1:]
+    profile = {"photoPrivacy": "all", "photos": photos}
+    card = {"gender": "Female", "isDiscoverable": True, "photos": photos}
+    monkeypatch.setattr(main, "firestore_client", Db({f"profiles/{uid}": profile, f"publicProfiles/{uid}": card}))
+    got = main._own_photos(uid)
+    assert got == own
+    person = fates_engine.person_from_docs(uid, card, {**profile, "faceVerified": True, "faceVerifiedPhotos": got})
+    assert person.face_verified and person.photos == photos
+
+
 def test_no_profile_docs_means_no_photos(monkeypatch):
     monkeypatch.setattr(main, "firestore_client", Db({}))
     assert main._own_photos("nobody") == []
