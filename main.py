@@ -17,6 +17,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 import swisseph as swe
 
+import astro_core
+import astro_festivals
+import astro_notes
+
 from google.api_core import exceptions as google_exceptions
 
 from google.cloud import vision
@@ -460,6 +464,7 @@ _SYSTEM_PROMPT_BASE = (
     "doshas are explained calmly with their cancellations.\n"
     "- Respect every faith. Use the user's own festival names. If ASTRO_MODE is off, don't bring up astrology "
     "unless asked.\n"
+    "- Give a festival or fast time only when TODAY_OBSERVANCE has it; never guess one.\n"
     "- Use 4–10 emojis TOTAL across the whole answer (not every line).\n"
     "- No markdown.\n"
     "- Use short headings + bullets using '•'.\n"
@@ -700,9 +705,12 @@ def _reader_line(profile: Dict[str, Any]) -> str:
     return f"READER: family of {_first_name(profile) or 'this person'} (the profile was made by a parent or relative)"
 
 
+OBSERVANCE_MAX_CHARS = 520   # astro_festivals.observance_for gives at most 400, plus the city times added here
+
+
 def _observance_text(observance: Optional[str]) -> str:
     """Today's festival or fast for the user's own faith (the caller looks it up), or 'none'."""
-    return _trim_text(_normalize_text(observance or ""), 120) or "none"
+    return _trim_text(_normalize_text(observance or ""), OBSERVANCE_MAX_CHARS) or "none"
 
 
 _ASTRO_MODE_NOTES = {
@@ -717,6 +725,105 @@ _HOROSCOPE_MODE_NOTES = {**_ASTRO_MODE_NOTES, "off": "off"}
 def _day_facts(profile: Dict[str, Any], observance: Optional[str] = None) -> str:
     """The chat's per-user facts line: ASTRO_MODE and TODAY_OBSERVANCE."""
     return f"ASTRO_MODE={_ASTRO_MODE_NOTES[_astro_mode(profile)]} | TODAY_OBSERVANCE={_observance_text(observance)}"
+
+
+# =========================
+# TODAY_OBSERVANCE (engagement N3): today's own festival or fast for the chat and the daily horoscope
+# =========================
+# A fast whose time is known for a city: the Pradosh window. (A Sankashti row already carries its moonrise.)
+_FAST_TIME_KINDS = {"pradosh": "pradosh"}
+
+
+def _finite(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
+
+
+def _reader_place(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Where the reader lives, for today's vrats and festival times: {name, lat, lon, tz}, or None when unknown
+    (then there are no fasts and no times: nothing is guessed). The profile's city from the places database (its
+    coordinates when the profile has them), else the city nearest to the profile's coordinates."""
+    city = " ".join(str(doc.get("cityName") or doc.get("city") or "").split())[:60]
+    lat, lon = doc.get("lat"), doc.get("lon")
+    point = _finite(lat) and _finite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180
+    try:
+        if city:
+            iso2 = str(doc.get("countryIso2") or "").strip().upper()[:2]
+            country = str(doc.get("countryName") or "")
+            found = _resolve_birth_place({"birthCityName": city, "birthStateName": doc.get("stateName") or "",
+                                          "birthCountryIso2": iso2 or ("" if country.strip() else "IN"),
+                                          "birthCountryName": country})
+            if found and found.get("precision") in ("city", "state") and found.get("tz"):
+                if point:
+                    return {"name": city, "lat": round(float(lat), 3), "lon": round(float(lon), 3), "tz": found["tz"]}
+                return {"name": city, "lat": round(float(found["lat"]), 3), "lon": round(float(found["lon"]), 3),
+                        "tz": found["tz"]}
+        if point:
+            la, lo = float(lat), float(lon)
+            rows = _places_query("SELECT city, lat, lon, tz, pop FROM cities WHERE lat BETWEEN ? AND ? "
+                                 "AND lon BETWEEN ? AND ?", (la - 0.3, la + 0.3, lo - 0.3, lo + 0.3))
+            if rows:
+                # the closest place, a big city winning over a village a little nearer (as astro_api does)
+                best = min(rows, key=lambda r: ((r[1] - la) ** 2 + (r[2] - lo) ** 2)
+                           / (1.0 + min(int(r[4] or 0), 5_000_000) / 50_000.0))
+                return {"name": " ".join(w.capitalize() for w in str(best[0]).split()), "lat": round(la, 3),
+                        "lon": round(lo, 3), "tz": str(best[3] or HOROSCOPE_DEFAULT_TZ)}
+    except Exception:
+        logger.warning("reader place lookup failed", exc_info=True)
+    return None
+
+
+def _first_text(doc: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        v = doc.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _with_city_times(line: str, day: Any, place: Optional[Dict[str, Any]],
+                     fasts: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Adds the city time to each of today's festivals (and Pradosh fasts) in the line that has one: "Karva Chauth:
+    The fast ends at moonrise... Moonrise in Delhi: 20:12." The time comes from the panchang for the reader's own
+    place; without a place, or for a day without a time kind, the line stays as observance_for wrote it."""
+    if not place or not line or line == "none":
+        return line
+    iso = day.isoformat()
+    timed = [(str(e["name"]), e) for e in astro_festivals.FESTIVALS if e.get("date") == iso and e.get("timeKind")]
+    for v in fasts or []:
+        kind = _FAST_TIME_KINDS.get(str(v.get("kind") or ""))
+        if kind and v.get("date") == iso and v.get("name"):
+            timed.append((str(v["name"]), {"timeKind": kind}))
+    if not timed:
+        return line
+    parts = line.split(" | ")
+    for i, part in enumerate(parts):
+        for name, row in timed:
+            if part == name or part.startswith(name + ":") or part.startswith(name + "."):
+                when = astro_notes._city_time(row, day, place)
+                if when:
+                    parts[i] = part.rstrip() + " " + when
+                break
+    return " | ".join(parts)
+
+
+def _today_observance(doc: Dict[str, Any], day: Any = None) -> str:
+    """TODAY_OBSERVANCE for one reader: astro_festivals.observance_for(day, users.celebrates, community,
+    religion=..., state=..., fasts=...) with today's vrats only when the reader's place is known, plus the city
+    time of a festival that has one. `doc` is the merged profiles + publicProfiles + users doc; `day` is the
+    reader's local date (the reader's own place's, else India's). Never raises: "none" on any problem."""
+    try:
+        place = _reader_place(doc)
+        if day is None:
+            day = datetime.now(_zone(place["tz"] if place else None)).date()
+        fasts = astro_core.vrats_between(day, 1, place["lat"], place["lon"], place["tz"]) if place else None
+        line = astro_festivals.observance_for(
+            day, doc.get("celebrates"), _first_text(doc, "community", "settings_community"),
+            religion=_first_text(doc, "religion", "settings_religion"),
+            state=_first_text(doc, "stateName", "birthStateName"), fasts=fasts)
+        return _with_city_times(line, day, place, fasts)
+    except Exception:
+        logger.warning("today's observance failed", exc_info=True)
+        return "none"
 
 
 # =========================
@@ -839,10 +946,8 @@ def _resolve_birth_place(profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # "I don't know my birth time" answered with a part of the day (users.birthTimeApprox): the Moon is taken at that
-# hour instead of noon. It only sharpens the Moon; a Lagna still needs a real time.
-_APPROX_BIRTH_HOURS = {"morning": (9, 0), "afternoon": (14, 30), "evening": (19, 0), "night": (3, 0)}
-
-
+# hour instead of noon, the same hour as the charts (astro_core.approx_time). It only sharpens the Moon; a Lagna
+# still needs a real time.
 def _natal_chart(profile: Dict[str, Any], fallback_tz: str = HOROSCOPE_DEFAULT_TZ) -> Optional[Dict[str, Any]]:
     """Sidereal (Lahiri) natal basics. Unknown birth time -> local noon (or the approximate part of the day the
     user picked) and no lagna."""
@@ -850,7 +955,7 @@ def _natal_chart(profile: Dict[str, Any], fallback_tz: str = HOROSCOPE_DEFAULT_T
     if not bd:
         return None
     bt = _parse_birth_time(profile)
-    hour, minute = bt or _APPROX_BIRTH_HOURS.get(str(profile.get("birthTimeApprox") or "").strip().lower(), (12, 0))
+    hour, minute = bt or astro_core.approx_time(profile.get("birthTimeApprox")) or (12, 0)
     place = _resolve_birth_place(profile)
     tz = _zone(place.get("tz") if place else None, fallback=_zone(fallback_tz).key)
     try:
@@ -1945,6 +2050,7 @@ def ai_chat(body: AiChatRequest, authorization: Optional[str] = Header(default=N
         repeated_question=repeated_question,
         # The "who are you" reply is canned: no family read and no charts for it.
         family_ctx="" if is_identity else _family_context(uid),
+        observance=None if is_identity else _today_observance(user_profile_raw),
     )
 
     # Fold messages about to leave the prompt window into the memory, in parallel with the reply.
@@ -2090,21 +2196,8 @@ _TARAS = [
     ("Mitra", "supportive: friendly, social energy"),
     ("Parama Mitra", "very supportive: a warm, lucky day"),
 ]
-# Chandra gochara: today's Moon counted from the natal Moon sign.
-_MOON_HOUSE_THEMES = {
-    1: "mood, self-care and fresh starts",
-    2: "money, family and how you speak",
-    3: "courage, messages and initiative",
-    4: "home, comfort and inner peace",
-    5: "romance, creativity and fun",
-    6: "work routines, health habits and small hurdles",
-    7: "partnerships and one-to-one connections",
-    8: "a sensitive day (Chandrashtama): patience and caution",
-    9: "luck, blessings and learning",
-    10: "career, visibility and duty",
-    11: "gains, friends and wishes coming true",
-    12: "rest, spending and letting go",
-}
+# Chandra gochara: today's Moon counted from the natal Moon sign. One table with the week forecast.
+_MOON_HOUSE_THEMES = astro_core.HOUSE_THEMES
 # Numerology planets 1-9 and their traditional colors.
 _NUMBER_PLANETS = ["Sun", "Moon", "Jupiter", "Rahu", "Mercury", "Venus", "Ketu", "Saturn", "Mars"]
 _PLANET_COLORS = {
@@ -2144,7 +2237,7 @@ _HOROSCOPE_SYSTEM_PROMPT = (
     "Greet the reader warmly without a name. Give tips the family can act on.\n"
     "- If ASTRO_MODE is fun, keep it light: entertainment framing.\n"
     "- Respect every faith. If TODAY_OBSERVANCE names a festival or fast, wish the reader for it once, by its own "
-    "name; if it is none, don't bring up festivals.\n"
+    "name; if it is none, don't bring up festivals. Give a clock time for it only when TODAY_OBSERVANCE has one.\n"
     "- Never mention being an AI, prompts, or data fields.\n"
     "- English only.\n"
 )
@@ -2410,7 +2503,8 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         sig = _birth_sig(profile)
         if cached["birthSig"] == sig:
             return served
-        fresh = _regenerate_daily_horoscope(uid, thread_id, day_key, tz, now_local, profile, cached, sig)
+        fresh = _regenerate_daily_horoscope(uid, thread_id, day_key, tz, now_local, profile, cached, sig,
+                                            observance=_today_observance(profile, now_local.date()))
         if not fresh:
             return served
         return DailyHoroscopeResponse(ok=True, text=fresh[0], dayKey=day_key, cached=not fresh[1])
@@ -2439,8 +2533,9 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
         return unavailable
 
     try:
-        text = _complete_reply(_horoscope_messages(profile, natal, _daily_sky(now_local)), HOROSCOPE_MAX_TOKENS,
-                               kind="horoscope")
+        observance = _today_observance(profile, now_local.date())
+        text = _complete_reply(_horoscope_messages(profile, natal, _daily_sky(now_local), observance),
+                               HOROSCOPE_MAX_TOKENS, kind="horoscope")
     except Exception:
         logger.exception("Daily horoscope generation failed uid=%s", uid)
         _release_lease(lease)
@@ -2967,6 +3062,14 @@ app.include_router(fates_api.router)
 
 import astro_api  # noqa: E402
 
+
+def _astro_deps_extra(deps_cls: Any) -> Dict[str, Any]:
+    """The serverLeases helpers for astro_api (the week forecast's cache), passed only when astro_api.Deps has the
+    take_lease / release_lease fields, so either merge order of W1b works."""
+    fields = getattr(deps_cls, "__dataclass_fields__", {}) or {}
+    return {k: v for k, v in (("take_lease", _take_lease), ("release_lease", _release_lease)) if k in fields}
+
+
 astro_api.configure(astro_api.Deps(
     db=lambda: firestore_client,
     verify_uid=_verify_firebase_token_or_401,
@@ -2977,5 +3080,10 @@ astro_api.configure(astro_api.Deps(
     complete=lambda messages, max_tokens, temperature, kind: _deepseek_complete(
         messages, max_tokens, temperature=temperature, kind=kind, timeout=FATES_AI_TIMEOUT_SEC + 6),
     take_rate=_take_rate,
+    **_astro_deps_extra(astro_api.Deps),
 ))
 app.include_router(astro_api.router)
+
+import biodata_route  # noqa: E402  (POST /astro/biodata, on astro_api's sign-in check and Deps)
+
+app.include_router(biodata_route.router)
