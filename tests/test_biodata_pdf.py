@@ -487,13 +487,18 @@ def test_the_mascot_is_no_photo(env):
 
 
 def test_storage_links_need_the_own_folder_and_the_project_bucket(monkeypatch):
+    """Storage links only in the project's own buckets (face_live.photo_buckets): the project's always,
+    FIREBASE_STORAGE_BUCKET adds one, any other bucket never (also when nothing is configured)."""
+    for k in ("FIREBASE_STORAGE_BUCKET", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"):
+        monkeypatch.delenv(k, raising=False)
     url = f"https://firebasestorage.googleapis.com/v0/b/shaadiparrot.appspot.com/o/users%2F{ME}%2Fvariants%2Fp_960.jpg?alt=media&token=t"
+    other = url.replace("shaadiparrot.appspot.com", "other-bucket")
     assert bp.allowed_photo_url(url, ME) and bp.allowed_photo_url(CDN, ME)
-    monkeypatch.setenv("FIREBASE_STORAGE_BUCKET", "shaadiparrot.appspot.com")
-    assert bp.allowed_photo_url(url, ME)
+    assert not bp.allowed_photo_url(other, ME)
+    assert bp.photo_url({}, {"photos": [other], "photoMedium": [other]}, ME) is None
     monkeypatch.setenv("FIREBASE_STORAGE_BUCKET", "other-bucket")
-    assert not bp.allowed_photo_url(url, ME)
-    assert bp.photo_url({}, {"photos": [url], "photoMedium": [url]}, ME) is None
+    assert bp.allowed_photo_url(other, ME) and bp.allowed_photo_url(url, ME)
+    assert not bp.allowed_photo_url(url.replace("shaadiparrot.appspot.com", "third-bucket"), ME)
 
 
 def test_the_photo_verified_badge(env):

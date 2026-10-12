@@ -1326,9 +1326,11 @@ PHOTO_CHECKS_PER_DAY = int(os.getenv("PHOTO_CHECKS_PER_DAY") or "60")
 
 
 def _own_gcs_photo(gcs_uri: str, uid: str) -> bool:
-    """gs://{bucket}/users/{uid}/... only: a caller can't have someone else's (or any other) object read."""
-    m = re.match(r"^gs://[a-z0-9][a-z0-9._-]{1,220}/(.+)$", gcs_uri)
-    return bool(m) and m.group(1).startswith(f"users/{uid}/") and ".." not in m.group(1)
+    """gs://{bucket}/users/{uid}/... only, in one of the project's own buckets (face_live.photo_buckets): a caller
+    can't have someone else's (or any other bucket's) object read."""
+    m = re.match(r"^gs://([a-z0-9][a-z0-9._-]{1,220})/(.+)$", gcs_uri)
+    return (bool(m) and m.group(1) in face_live.photo_buckets() and m.group(2).startswith(f"users/{uid}/")
+            and ".." not in m.group(2))
 
 
 def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:

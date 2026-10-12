@@ -19,8 +19,15 @@ SIDE_MAX_PAN = 50.0      # still a face Vision can read
 MAX_ROLL_TILT = 30.0
 
 
+GOOGLE_STORAGE_HOSTS = ("firebasestorage.googleapis.com", "storage.googleapis.com")
+# The production project's own buckets (the app uploads to the first). Bucket names ending in .appspot.com or
+# .firebasestorage.app can only be made by the project they name, so no one else can hold a bucket called this.
+PROJECT_BUCKETS = ("shaadiparrot.firebasestorage.app", "shaadiparrot.appspot.com")
+MAX_OBJECT_PATH = 1024
+
+
 def storage_hosts() -> Tuple[str, ...]:
-    hosts = ["firebasestorage.googleapis.com", "storage.googleapis.com"]
+    hosts = list(GOOGLE_STORAGE_HOSTS)
     emu = (os.getenv("FIREBASE_STORAGE_EMULATOR_HOST") or "").strip()
     if emu:
         hosts.append(emu.split("//")[-1].split("/")[0].lower())
@@ -28,44 +35,88 @@ def storage_hosts() -> Tuple[str, ...]:
     return tuple(hosts)
 
 
-def selfie_url_ok(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> bool:
-    """Only the user's own verification uploads: https (or the local emulator) on a Storage host, and the
-    object under users/{uid}/verification/."""
+def photo_buckets() -> Tuple[str, ...]:
+    """The buckets a member's own upload (photo or selfie) may live in: the project's own (PROJECT_BUCKETS), the
+    ones FIREBASE_STORAGE_BUCKET names (comma-separated, gs:// allowed), and the default buckets of the project the
+    server runs as (GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT: the emulator tests' demo project). Never any other bucket,
+    so a link to users/{uid}/photos/ in someone else's bucket is not that user's photo."""
+    out = list(PROJECT_BUCKETS)
+    for b in (os.getenv("FIREBASE_STORAGE_BUCKET") or "").split(","):
+        b = b.strip().lower()
+        b = b[len("gs://"):] if b.startswith("gs://") else b
+        b = b.strip("/")
+        if b:
+            out.append(b)
+    for var in ("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"):
+        project = (os.getenv(var) or "").strip().lower()
+        if project:
+            out += [f"{project}.firebasestorage.app", f"{project}.appspot.com"]
+    return tuple(dict.fromkeys(out))
+
+
+def _safe_object(path: str) -> bool:
+    """media.ts safeObjectPath: 1..1024 characters, no control characters, no empty, '.' or '..' segment."""
+    return (0 < len(path) <= MAX_OBJECT_PATH and not any(ord(c) < 32 or ord(c) == 127 for c in path)
+            and not any(seg in ("", ".", "..") for seg in path.split("/")))
+
+
+def _storage_ref(url: str, hosts: Optional[Iterable[str]] = None) -> Optional[Tuple[str, str]]:
+    """(bucket, object path) of an http(s) link to an object in one of the project's buckets (photo_buckets), on a
+    Storage host (https only on Google's; http only for the local emulator). Two forms:
+      {host}/v0/b/{bucket}/o/{object, URL-encoded as one segment}    Firebase download links (media.ts storageRef)
+      storage.googleapis.com/{bucket}/{object}                       plain Cloud Storage links
+    None for anything else (another host, another bucket, an unsafe object path)."""
+    if not isinstance(url, str):
+        return None
     try:
         u = urlparse(url)
     except ValueError:
-        return False
+        return None
+    host = u.netloc.lower()
     allowed = tuple(h.lower() for h in (hosts or storage_hosts()))
-    if u.netloc.lower() not in allowed:
+    if host not in allowed or u.scheme not in ("https", "http"):
+        return None
+    if u.scheme == "http" and host in GOOGLE_STORAGE_HOSTS:
+        return None
+    parts = u.path.split("/")
+    if len(parts) >= 2 and parts[1] == "v0":
+        if len(parts) != 6 or parts[0] or parts[2] != "b" or parts[4] != "o":
+            return None
+        bucket, obj = unquote(parts[3]), unquote(parts[5])
+    elif host == "storage.googleapis.com" and len(parts) >= 3 and not parts[0]:
+        bucket, obj = unquote(parts[1]), unquote("/".join(parts[2:]))
+    else:
+        return None
+    bucket = bucket.lower()
+    if not bucket or bucket not in photo_buckets() or not _safe_object(obj):
+        return None
+    return bucket, obj
+
+
+def selfie_url_ok(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> bool:
+    """Only the user's own verification uploads: a Storage link (https, or the local emulator) to an object in the
+    project's own bucket under users/{uid}/verification/."""
+    if not uid or "/" in uid:
         return False
-    if u.scheme != "https" and not (u.scheme == "http" and u.netloc.lower() not in ("firebasestorage.googleapis.com", "storage.googleapis.com")):
-        return False
-    path = unquote(u.path)
-    return f"users/{uid}/verification/" in path and ".." not in path
+    ref = _storage_ref(url, hosts)
+    return ref is not None and ref[1].startswith(f"users/{uid}/verification/")
+
+
+def own_photo_object(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> Optional[str]:
+    """The object path of a profile photo the server may download, or None: a Storage link (https, or the local
+    emulator) to an object in the project's own bucket (photo_buckets) whose path starts with users/{uid}/photos/.
+    The rule of media.ts parsePhoto's 'own' kind, so the server-made blurs (users/{uid}/blur/), the resized variants
+    (users/{uid}/variants/), a file nested in someone else's folder and any other bucket or host never count."""
+    if not uid or "/" in uid:
+        return None
+    ref = _storage_ref(url, hosts)
+    return ref[1] if ref is not None and ref[1].startswith(f"users/{uid}/photos/") else None
 
 
 def own_photo_url(url: str, uid: str, hosts: Optional[Iterable[str]] = None) -> bool:
-    """A profile photo the server may download: on a Storage host and in the user's own photos folder,
-    users/{uid}/photos/ (no other hosts, ever). The server-made blurs (users/{uid}/blur/) and the resized
-    variants (users/{uid}/variants/) are never a profile photo, so they never reach a face check. The first
-    users/ folder in the object path must be that one, so a file nested inside someone else's folder doesn't count."""
-    try:
-        u = urlparse(url)
-    except ValueError:
-        return False
-    if not uid or "/" in uid:
-        return False
-    allowed = tuple(h.lower() for h in (hosts or storage_hosts()))
-    if u.netloc.lower() not in allowed or u.scheme not in ("https", "http"):
-        return False
-    if u.scheme == "http" and u.netloc.lower() in ("firebasestorage.googleapis.com", "storage.googleapis.com"):
-        return False
-    path = unquote(u.path)
-    if ".." in path:
-        return False
-    folder = f"/users/{uid}/photos/"
-    at = path.find(folder)
-    return at >= 0 and path.find("/users/") == at
+    """A profile photo the server may download (own_photo_object): on a Storage host, in the project's own bucket and
+    in the user's own photos folder, users/{uid}/photos/ (no other host or bucket, ever)."""
+    return own_photo_object(url, uid, hosts) is not None
 
 
 def storage_object(url: str) -> Optional[Tuple[str, str]]:

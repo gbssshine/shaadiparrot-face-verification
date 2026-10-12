@@ -432,7 +432,7 @@ TODAY = "2026-10-11"
 
 
 def storage_link(uid, folder, name):
-    return f"https://firebasestorage.googleapis.com/v0/b/app.appspot.com/o/{quote(f'users/{uid}/{folder}/{name}', safe='')}?alt=media&token=t"
+    return f"https://firebasestorage.googleapis.com/v0/b/shaadiparrot.firebasestorage.app/o/{quote(f'users/{uid}/{folder}/{name}', safe='')}?alt=media&token=t"
 
 
 # ---------------- photo privacy (features W1-S2)
@@ -523,12 +523,13 @@ def test_a_thumbnail_is_only_ever_fetched_from_storage(monkeypatch):
     for bad in ("https://imgur.example/model.jpg", "http://169.254.169.254/computeMetadata/v1/",
                 "http://firebasestorage.googleapis.com/v0/b/app.appspot.com/o/users%2Fu1%2Fphotos%2Fa.jpg",
                 "https://photos.shaadiparrot.com/users/u1/photos/a.jpg", "not a url"):
-        assert not fates_api.thumb_source_ok(bad)
-        assert fates_api.blur_thumbs(bad) == (None, None)
+        assert not fates_api.thumb_source_ok(bad, "u1")
+        assert fates_api.blur_thumbs(bad, "u1") == (None, None)
     assert calls == []
     own = storage_link("u1", "photos", "a.jpg")
-    assert fates_api.thumb_source_ok(own)
-    assert fates_api.blur_thumbs(own) == (None, None)               # the 302 is not followed
+    assert fates_api.thumb_source_ok(own, "u1")
+    assert not fates_api.thumb_source_ok(own, "u2")                 # someone else's photo is never fetched
+    assert fates_api.blur_thumbs(own, "u1") == (None, None)         # the 302 is not followed
     assert calls == [(own, {"timeout": 6, "allow_redirects": False})]
 
 

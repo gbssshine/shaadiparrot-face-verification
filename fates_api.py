@@ -26,7 +26,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -416,28 +415,19 @@ def _chooser_pair(db, viewer: fe.Person, uid: str, now_ms: int, memory: Dict[str
 # =========================
 # THUMBNAILS
 # =========================
-GOOGLE_STORAGE_HOSTS = ("firebasestorage.googleapis.com", "storage.googleapis.com")
+def thumb_source_ok(url: str, uid: str) -> bool:
+    """Only the person's own Storage photo is ever fetched for a thumbnail: face_live.own_photo_url (a Storage host,
+    https except on the local emulator, the project's own bucket, users/{uid}/photos/). The photos Daily Fates shows
+    are exactly those (fates_engine.own_private_photos), so this never drops a real one; it keeps the server from
+    fetching any other host, bucket or member's file should a foreign link ever reach it."""
+    return face_live.own_photo_url(url, uid)
 
 
-def thumb_source_ok(url: str) -> bool:
-    """Only a Storage link is ever fetched for a thumbnail: https on a Storage host (http only for the local
-    emulator). The photos Daily Fates shows are own Storage photos (fates_engine.own_private_photos), so this never
-    drops a real one; it keeps the server from fetching any other host should a foreign link ever reach it."""
-    try:
-        u = urlparse(url)
-    except ValueError:
-        return False
-    host = u.netloc.lower()
-    if host not in face_live.storage_hosts():
-        return False
-    return u.scheme == "https" or (u.scheme == "http" and host not in GOOGLE_STORAGE_HOSTS)
-
-
-def blur_thumbs(url: str) -> Tuple[Optional[str], Optional[str]]:
+def blur_thumbs(url: str, uid: str) -> Tuple[Optional[str], Optional[str]]:
     """Two tiny JPEGs (data URIs) for a closed card: a heavy blur, and a lighter "peek" that shows while
     the card is held. Both are 64 px wide, so neither can reveal who it is; the real photo only
-    arrives when the path is opened."""
-    if not thumb_source_ok(url):
+    arrives when the path is opened. uid: the person the photo belongs to."""
+    if not thumb_source_ok(url, uid):
         return None, None
     try:
         import cv2
@@ -536,7 +526,7 @@ def generate(db, viewer: fe.Person, memory: Dict[str, Any], key: str, now_ms: in
 
     paths: Dict[str, Any] = {}
     with ThreadPoolExecutor(max_workers=3) as ex:
-        thumbs = {path: ex.submit(blur_thumbs, p.cand.photos[0]) for path, p in chosen.items()}
+        thumbs = {path: ex.submit(blur_thumbs, p.cand.photos[0], p.cand.uid) for path, p in chosen.items()}
         for path, p in chosen.items():
             ai_item = ai.get(path) or {}
             # The AI's hook belongs to the person it picked; if resolve_paths had to take someone else,
@@ -1088,7 +1078,7 @@ def fates_chosen(authorization: Optional[str] = Header(default=None)):
     todo = [it for it in items if not it["revealed"] and it.get("_photo") and it["uid"] not in cache]
     if todo:
         with ThreadPoolExecutor(max_workers=4) as ex:
-            got = {it["uid"]: ex.submit(blur_thumbs, it["_photo"]) for it in todo}
+            got = {it["uid"]: ex.submit(blur_thumbs, it["_photo"], it["uid"]) for it in todo}
             for u, fut in got.items():
                 blur = fut.result()[0]
                 if blur:

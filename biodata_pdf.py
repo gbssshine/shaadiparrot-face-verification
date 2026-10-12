@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -34,6 +33,7 @@ from fontTools.ttLib import TTFont
 from fpdf import FPDF
 from PIL import Image, ImageOps
 
+import face_live
 import fates_astro
 import fates_astro_chart as fc
 
@@ -615,8 +615,9 @@ def _own_source(profile: Mapping[str, Any], public: Mapping[str, Any]) -> str:
 
 
 def allowed_photo_url(url: str, uid: str) -> bool:
-    """https only: the photo CDN in the user's own folder, or Firebase Storage in the user's own folder (in the
-    project bucket when FIREBASE_STORAGE_BUCKET is set). A blur link is never one, whoever's it is."""
+    """https only: the photo CDN in the user's own folder, or Firebase Storage in the user's own folder in one of the
+    project's own buckets (face_live.photo_buckets: never another bucket, whatever FIREBASE_STORAGE_BUCKET says).
+    A blur link is never one, whoever's it is."""
     if not isinstance(url, str) or not uid or "/" in uid or "%" in uid:
         return False
     try:
@@ -640,8 +641,7 @@ def allowed_photo_url(url: str, uid: str) -> bool:
         # /v0/b/{bucket}/o/{object}; the object's first folder must be users/{uid} (the uid compared exactly)
         if len(parts) < 6 or parts[1] != "v0" or parts[2] != "b" or parts[4] != "o" or not parts[3]:
             return False
-        bucket = os.getenv("FIREBASE_STORAGE_BUCKET") or ""
-        if bucket and parts[3] != bucket:
+        if unquote(parts[3]).lower() not in face_live.photo_buckets():
             return False
         m = re.match(r"users%2[fF]([^%/]+)%2[fF]", "/".join(parts[5:]))
         return bool(m) and m.group(1) == uid

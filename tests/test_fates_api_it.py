@@ -44,7 +44,7 @@ def env():
     from google.cloud import firestore
 
     requests.delete(f"http://{os.environ['FIRESTORE_EMULATOR_HOST']}/emulator/v1/projects/{PROJECT}/databases/(default)/documents")
-    fates_api.blur_thumbs = lambda url: ("data:image/jpeg;base64,QkxVUg==", "data:image/jpeg;base64,UEVFSw==")
+    fates_api.blur_thumbs = lambda url, uid: ("data:image/jpeg;base64,QkxVUg==", "data:image/jpeg;base64,UEVFSw==")
 
     calls = []
 
