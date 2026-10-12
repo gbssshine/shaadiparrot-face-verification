@@ -83,6 +83,9 @@ class Deps:
     # cap, HTTP 503 busy_try_again when the counter can't be written. None (older wiring, tests): take_rate.
     take_rate: Callable[[str, str, int, str], bool]
     take_rate_strict: Optional[Callable[[str, str, int, str], bool]] = None
+    # (uid, key, per): undoes one count taken by a request that then did no work (a reading refused with 402 after
+    # its slot was taken; main._give_back_rate). None (older wiring, tests): the slot stays used.
+    give_back_rate: Optional[Callable[[str, str, str], None]] = None
     # serverLeases (main._take_lease / main._release_lease): one AI call per uid and week for /forecast while
     # parallel requests wait for it. None (older wiring, tests): the forecast still works, without a lease.
     take_lease: Optional[Callable[[str, float], bool]] = None
@@ -837,6 +840,21 @@ def _report_slot(uid: str) -> bool:
     return True
 
 
+def _give_back_report_slots(uid: str, shared: bool = True) -> None:
+    """Undoes this request's daily slots (this instance's, and the shared counter's when shared): it did no work."""
+    day = datetime.now(timezone.utc).date().isoformat()
+    with _hits_lock:
+        last_day, n = _report_hits.get(uid, ("", 0))
+        if last_day == day and n > 0:
+            _report_hits[uid] = (day, n - 1)
+    give_back = _d().give_back_rate if shared else None
+    if give_back is not None:
+        try:
+            give_back(uid, "astroReport", "day")
+        except Exception:
+            logger.warning("report slot give-back failed", exc_info=True)
+
+
 # ------------------------------------------------------------------ reading credits (money §7 phase 1)
 UNLOCKS = "kundliUnlocks"
 
@@ -977,18 +995,31 @@ def match_report(body: MatchReq, authorization: Optional[str] = Header(default=N
         via = "credit"
     else:
         return _locked(credits)
-    # The daily caps come before a credit is spent.
-    if not _report_slot(uid) or not take_paid(uid, "astroReport", REPORTS_PER_DAY, "day"):
+    # The daily caps come only now that the reader may read (a 402 above never uses a slot), and before a credit is
+    # spent (a 429 never costs one). Slots taken by a request that then reads nothing are given back.
+    if not _report_slot(uid):
+        raise HTTPException(status_code=429, detail="daily_cap")
+    try:
+        counted = take_paid(uid, "astroReport", REPORTS_PER_DAY, "day")
+    except HTTPException:
+        _give_back_report_slots(uid, shared=False)     # 503 busy_try_again: the shared count wasn't taken
+        raise
+    if not counted:
+        _give_back_report_slots(uid, shared=False)
         raise HTTPException(status_code=429, detail="daily_cap")
     if via == "credit":
         if db is None:
+            _give_back_report_slots(uid)
             raise HTTPException(status_code=503, detail="temporarily_unavailable")
         try:
             left = _spend_credit(db, uid, pair)
         except Exception:
             logger.exception("credit spend failed")
+            _give_back_report_slots(uid)
             raise HTTPException(status_code=503, detail="temporarily_unavailable")
         if left is None:
+            # The last credit went meanwhile (another device): 402, and the slots go back.
+            _give_back_report_slots(uid)
             return _locked(0)
         credits = left
     elif via:

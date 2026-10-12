@@ -1372,6 +1372,27 @@ def _rate_state(uid: str, key: str, limit: int, per: str = "day") -> str:
         return RATE_DOWN
 
 
+def _give_back_rate(uid: str, key: str, per: str = "day") -> None:
+    """Undoes one _rate_state count taken by a request that then did no work (a reading refused with 402 after its
+    slot was taken). Best effort: when it can't be written the slot simply stays used (the safe side)."""
+    if firestore_client is None:
+        return
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y-%m-%dT%H:%M") if per == "minute" else now.date().isoformat()
+
+    def give(tx) -> None:
+        cur = (ref.get(transaction=tx).to_dict() or {}).get(key) or {}
+        n = int(cur.get("n") or 0) if cur.get("day") == day else 0
+        if n > 0:
+            tx.set(ref, {key: {"day": day, "n": n - 1}}, merge=True)
+
+    try:
+        ref = firestore_client.collection("serverRate").document(uid)
+        _run_transaction(give)
+    except Exception:
+        logger.warning("rate give-back failed uid=%s key=%s", uid, key, exc_info=True)
+
+
 def _take_rate(uid: str, key: str, limit: int, per: str = "day") -> bool:
     """The open counter, only for work that costs no AI and no money per call (the kundli scores) and for the photo
     check before an upload: it lets the call through when Firestore is down (a hiccup must not stop photo uploads
@@ -3134,6 +3155,7 @@ def _astro_deps() -> "astro_api.Deps":
             messages, max_tokens, temperature=temperature, kind=kind, timeout=FATES_AI_TIMEOUT_SEC + 6),
         take_rate=_take_rate,
         take_rate_strict=_take_rate_or_busy,
+        give_back_rate=_give_back_rate,
         **_astro_deps_extra(astro_api.Deps),
     )
 

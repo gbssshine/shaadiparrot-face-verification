@@ -242,3 +242,25 @@ def test_photo_checks_answer_busy_under_contention(busy, monkeypatch):
     r = TestClient(main.app).post("/verify-photo", json={
         "gcs_uri": f"gs://shaadiparrot.firebasestorage.app/users/{ME}/photos/pending/a.jpg"}, headers=H)
     assert r.status_code == 503 and r.json()["detail"] == "busy_try_again"
+
+
+# ------------------------------------------------------------------ giving a slot back (a 402 after the slot)
+def test_a_slot_given_back_is_counted_off(monkeypatch):
+    db = GiveUpDb()
+
+    class Tx:       # a transaction that commits: writes go straight to the docs
+        def set(self, ref, data, merge=False):
+            ref.set(data, merge=merge)
+
+    monkeypatch.setattr(main, "firestore_client", db)
+    monkeypatch.setattr(main, "_run_transaction", lambda work: work(Tx()))
+    assert [main._rate_state(ME, "astroReport", 2) for _ in range(3)] == ["ok", "ok", "over"]
+    main._give_back_rate(ME, "astroReport")
+    assert db.docs[f"serverRate/{ME}"]["astroReport"]["n"] == 1
+    assert main._rate_state(ME, "astroReport", 2) == "ok"
+    for _ in range(4):
+        main._give_back_rate(ME, "astroReport")
+    assert db.docs[f"serverRate/{ME}"]["astroReport"]["n"] == 0                  # never below 0
+    main._give_back_rate(ME, "nothingYet")
+    assert "nothingYet" not in db.docs[f"serverRate/{ME}"]
+    assert main._astro_deps().give_back_rate is main._give_back_rate

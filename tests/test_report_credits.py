@@ -256,6 +256,54 @@ def test_the_daily_cap_comes_before_a_credit_is_spent(monkeypatch):
     assert r.status_code == 429 and credits(db) == 2 and not unlocks(db)
 
 
+def test_a_402_never_uses_a_daily_slot(monkeypatch):
+    """The daily slots (this instance's and the shared serverRate counter) are taken only once the reader may read:
+    a locked reading never touches them, and a credit found gone inside the spend transaction (another device spent
+    the last one meanwhile) gives back the slots it took before answering 402. The cap still comes before a credit is
+    spent (test_the_daily_cap_comes_before_a_credit_is_spent)."""
+    import dataclasses
+    db = Db({f"users/{ME}": {"reportCredits": 1}})
+    counts, given_back = {}, []
+
+    def rate(uid, key, limit, per):
+        counts[key] = counts.get(key, 0) + 1
+        return counts[key] <= limit
+
+    def give_back(uid, key, per):
+        given_back.append((uid, key, per))
+        counts[key] -= 1
+
+    c = make_client(monkeypatch, db, rate=rate)
+    astro_api.configure(dataclasses.replace(astro_api._d(), give_back_rate=give_back))
+    assert read(c).status_code == 402 and "astroReport" not in counts          # locked: no slot looked at
+    real_spend = astro_api._spend_credit
+    monkeypatch.setattr(astro_api, "_spend_credit", lambda d, uid, pair: None)   # the credit went meanwhile
+    for i in range(astro_api.REPORTS_PER_DAY + 2):
+        r = read(c, b={**VIKRAM, "birthDate": f"1990-01-{i + 1:02d}"}, useCredit=True)
+        assert r.status_code == 402 and r.json()["credits"] == 0, (i, r.text)
+    assert counts["astroReport"] == 0 and given_back[-1] == (ME, "astroReport", "day")
+    assert astro_api._report_hits.get(ME, ("", 0))[1] == 0
+    # Every slot is still there: the reading the account can pay for now is served.
+    monkeypatch.setattr(astro_api, "_spend_credit", real_spend)
+    r = read(c, useCredit=True)
+    assert r.status_code == 200 and credits(db) == 0 and counts["astroReport"] == 1
+
+
+def test_a_busy_counter_gives_back_this_instances_slot(monkeypatch):
+    """The shared counter answering 503 busy_try_again (it couldn't be written) leaves this instance's slot unused."""
+    import dataclasses
+    db = Db({f"users/{ME}": {"premiumActive": True}})
+
+    def busy(uid, key, limit, per):
+        raise astro_api.HTTPException(status_code=503, detail="busy_try_again")
+
+    c = make_client(monkeypatch, db, premium=True, rate=lambda *a: True)
+    astro_api.configure(dataclasses.replace(astro_api._d(), take_rate_strict=busy))
+    for _ in range(astro_api.REPORTS_PER_DAY + 1):
+        assert read(c).status_code == 503
+    assert astro_api._report_hits.get(ME, ("", 0))[1] == 0 and not c.calls
+
+
 def test_a_kept_reading_is_never_charged_again(monkeypatch):
     db = Db({f"users/{ME}": {"reportCredits": 1}})
     c = make_client(monkeypatch, db)
