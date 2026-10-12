@@ -299,7 +299,7 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
     if lat == 0 and lon == 0:
         lat = lon = None
 
-    if card_blurred(uid, public):
+    if card_blurred(uid, public, private):
         # Private photos: the card holds server-made blurs. They are never a candidate's photos ('no_photos' then
         # keeps them out of everyone's Fates, so nothing is revealed), and the face check is held against the real
         # links on the private doc, so a private viewer keeps Daily Fates.
@@ -307,7 +307,7 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
         verify_photos = own_private_photos(uid, private)
     else:
         # Public photos: Daily Fates shows only what the face check checks, the list main._own_photos builds (the
-        # card's first 6 http links, then only own Storage photos). A resized variant, a CDN copy or a blur on the
+        # card's own Storage photos, deduped, the first 6). A resized variant, a CDN copy or a blur on the
         # card then never pauses a verified person, a new own photo still does, and a link that isn't the user's own
         # (another member's photo, any other host) is never shown with the badge, nor fetched for a thumbnail.
         photos = verify_photos = own_private_photos(uid, public)
@@ -373,22 +373,36 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
     )
 
 
-def card_blurred(uid: str, public: Dict[str, Any]) -> bool:
-    """The card shows blurs instead of the real photos: photoPrivacy is 'accepted', or a card photo lives in the
-    server's blur folder (users/{uid}/blur/, either URL kind)."""
-    if _s(public.get("photoPrivacy")) == "accepted":
+def card_blurred(uid: str, public: Dict[str, Any], private: Optional[Dict[str, Any]] = None) -> bool:
+    """The card shows blurs instead of the real photos: photoPrivacy is 'accepted' on the card or on the profile
+    (the source of truth: a card the private pass hasn't rewritten yet still holds real links), or a card photo lives
+    in the server's blur folder (users/{uid}/blur/, either URL kind)."""
+    if _s(public.get("photoPrivacy")) == "accepted" or _s((private or {}).get("photoPrivacy")) == "accepted":
         return True
     marker = f"users/{uid}/blur/"
     return any(marker in unquote(p) for p in _str_list(public.get("photos")))
 
 
+MAX_OWN_PHOTOS = 6               # media.ts MAX_PRIVATE_PHOTOS
+
+
 def own_private_photos(uid: str, private: Dict[str, Any]) -> List[str]:
     """The real photo links the face check uses (main._own_photos): `photos` of the doc that holds them (profiles
-    while the photos are private, else the card), the first 6 http links, then only the user's own Storage photos
-    (face_live.own_photo_url). Daily Fates checks verified_now against the same list in both modes, and with public
-    photos it is also the list Daily Fates shows."""
-    links = [p for p in _str_list(private.get("photos")) if p.startswith("http")][:6]
-    return [p for p in links if face_live.own_photo_url(p, uid)]
+    while the photos are private, else the card), deduped by the Storage object, only the user's own Storage photos
+    (face_live.own_photo_url: https, the project's bucket, users/{uid}/photos/), then the first 6. The rule of
+    firebase-functions media.ts ownLinks, so the server and the functions mean the same 6 photos. Daily Fates checks
+    verified_now against the same list in both modes, and with public photos it is also the list it shows."""
+    out: List[str] = []
+    seen = set()
+    for link in _str_list(private.get("photos")):
+        obj = face_live.own_photo_object(link, uid)
+        if obj is None or obj in seen:
+            continue
+        seen.add(obj)
+        out.append(link)
+        if len(out) >= MAX_OWN_PHOTOS:
+            break
+    return out
 
 
 # =========================

@@ -181,23 +181,42 @@ def test_only_my_own_storage_photos_reach_the_face_check(monkeypatch):
 
 
 @pytest.mark.parametrize("private", [True, False])
-def test_a_non_own_link_among_the_first_6_is_dropped_not_replaced(monkeypatch, private):
-    """First the 6 http links, then the own-photo filter (fates_engine.own_private_photos' order): a blur or a
-    foreign link among the first 6 leaves 5, and the 7th photo never moves up. Otherwise faceVerifiedPhotos would
-    hold the 7th while Daily Fates checks the first 6 against it."""
+def test_own_photos_are_deduped_own_only_then_the_first_6(monkeypatch, private):
+    """One photo rule with firebase-functions media.ts ownLinks: dedupe by the Storage object, keep only the user's
+    own Storage photos (face_live.own_photo_url), then the first 6. A blur, a foreign link or a second link to the
+    same object never takes one of the 6 places, so the face check (main._own_photos), Daily Fates and the functions
+    all mean the same 6 photos."""
     import fates_engine
     uid = "u4"
-    own = [link(f"users/{uid}/photos/{i}.jpg") for i in range(6)]
-    photos = own[:2] + [link(f"users/{uid}/blur/{0:040d}.jpg")] + own[2:]   # 7 links, the blur 3rd
+    own = [link(f"users/{uid}/photos/{i}.jpg") for i in range(7)]
+    photos = (own[:2] + [link(f"users/{uid}/blur/{0:040d}.jpg"), own[0].replace("token=t", "token=other"),
+                         "https://evil.example/a.jpg", link(f"users/other/photos/x.jpg"),
+                         f"https://firebasestorage.googleapis.com/v0/b/attacker.appspot.com/o/users%2F{uid}%2Fphotos%2Fz.jpg"]
+              + own[2:])
     profile = {"photoPrivacy": "accepted" if private else "all", "photos": photos if private else []}
     card = {"photos": [] if private else photos}
     monkeypatch.setattr(main, "firestore_client", Db({f"profiles/{uid}": profile, f"publicProfiles/{uid}": card}))
     got = main._own_photos(uid)
-    assert got == own[:5] and own[5] not in got
+    assert got == own[:6] and own[6] not in got
     assert got == fates_engine.own_private_photos(uid, {"photos": photos})
+    # The same object by its plain Cloud Storage link is the same photo too.
+    plain = f"https://storage.googleapis.com/{BUCKET}/users/{uid}/photos/1.jpg"
+    assert fates_engine.own_private_photos(uid, {"photos": [own[1], plain, own[2]]}) == [own[1], own[2]]
     # The faceVerifiedPhotos saved from this list cover what Daily Fates checks for a private profile.
     private_doc = {"isFaceVerified": True, "faceVerifiedPhotos": got, "photos": photos}
     assert fates_engine.verified_now(private_doc, {}, fates_engine.own_private_photos(uid, private_doc))
+
+
+def test_own_photos_mirror_the_functions_owner_links():
+    """media.ts ownLinks, case by case: the first 6 distinct own objects in list order, http(s) only."""
+    import fates_engine
+    uid = "u6"
+    a, b = link(f"users/{uid}/photos/a.jpg"), link(f"users/{uid}/photos/b.jpg")
+    assert fates_engine.own_private_photos(uid, {"photos": [a, a, b, a]}) == [a, b]
+    assert fates_engine.own_private_photos(uid, {"photos": [f"gs://{BUCKET}/users/{uid}/photos/a.jpg", b]}) == [b]
+    assert fates_engine.own_private_photos(uid, {"photos": [f" {a} ", b]}) == [a, b]       # trimmed, like String.trim
+    assert fates_engine.own_private_photos(uid, {"photos": "not a list"}) == []
+    assert fates_engine.own_private_photos(uid, {}) == []
 
 
 def test_a_public_card_keeps_daily_fates_verified_with_a_variant_on_it(monkeypatch):

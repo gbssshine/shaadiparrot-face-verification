@@ -2765,10 +2765,10 @@ PHOTOS_PRIVATE = "accepted"     # profiles.photoPrivacy: real photos only after 
 
 def _own_photos(uid: str) -> List[str]:
     """The user's real profile photos, which the face check compares with. While the photos are private the card
-    holds only blurs, so the links come from the profile; otherwise from the card. The first 6 http links, THEN
-    only the user's own Storage photos (face_live.own_photo_url: never a blur, a variant or another host): the
-    one rule fates_engine.own_private_photos applies too, so the faceVerifiedPhotos saved from this list always
-    cover the photos Daily Fates checks against them (a 7th own photo never stands in for a non-own link)."""
+    holds only blurs, so the links come from the profile; otherwise from the card. fates_engine.own_private_photos
+    (media.ts ownLinks' rule): deduped by object, only the user's own Storage photos (face_live.own_photo_url:
+    never a blur, a variant, another bucket or host), then the first 6. Daily Fates applies the same rule, so the
+    faceVerifiedPhotos saved from this list always cover the photos it checks against them."""
     if firestore_client is None:
         return []
     refs = [firestore_client.collection(name).document(uid) for name in ("profiles", "publicProfiles")]

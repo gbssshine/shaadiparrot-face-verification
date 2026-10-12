@@ -476,6 +476,23 @@ def test_public_photos_are_checked_against_the_face_checks_own_list():
     assert only_copies.photos == [] and not only_copies.face_verified
 
 
+def test_private_photos_on_the_profile_blur_the_card_even_before_the_card_says_so():
+    """Defence in depth: profiles.photoPrivacy == 'accepted' is the source of truth. A card the private pass hasn't
+    rewritten yet (real links, no photoPrivacy, no blur links) is still treated as blurred: its photos are never shown
+    in Daily Fates (nothing revealed, 'no_photos'), and the face check is held against the profile's real links."""
+    real = [storage_link("u1", "photos", "a.jpg"), storage_link("u1", "photos", "b.jpg")]
+    pub = {"gender": "Female", "isDiscoverable": True, "photos": real}
+    priv = {"photoPrivacy": "accepted", "photos": real, "faceVerified": True, "faceVerifiedPhotos": real}
+    assert fe.card_blurred("u1", pub, priv)
+    p = fe.person_from_docs("u1", pub, priv)
+    assert p.photos == [] and p.face_verified
+    assert fe.hard_filter(viewer(), p, NOW) == "no_photos"
+    # Public on the profile: the card's own photos are shown as before.
+    assert not fe.card_blurred("u1", pub, {**priv, "photoPrivacy": "all"})
+    assert fe.person_from_docs("u1", pub, {**priv, "photoPrivacy": "all"}).photos == real
+    assert not fe.card_blurred("u1", pub)                           # no private doc: the card alone decides
+
+
 def test_someone_elses_blur_link_does_not_hide_a_card():
     """Another member's blur on the card is not this card's blur: the card is still read as public (not blurred), and
     the foreign link is simply never shown."""
