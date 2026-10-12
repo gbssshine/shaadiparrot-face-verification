@@ -12,6 +12,10 @@ The must-have rule (W1-S-FATES deviation 2, which TS and C# have to adopt, or th
 - their side: only the parts their family marked "Must have" (pref_strict); never the defaults and never the four
   that have no toggle;
 - an unknown, unstated or private value never hides anyone.
+
+PREF_GATE_VECTORS is a verbatim copy of the TS PREF_GATE_VECTORS (APP firebase-tests/tests/rishtas.functions.test.mjs,
+same names, keys and order): edit both together. EDUCATION_RANK pins RishtaMatch.EducationRank / educationRank /
+education_rank, including the curly apostrophe a phone keyboard types.
 """
 import json
 import os
@@ -164,6 +168,55 @@ GATE = [
      "expect": "pref_religions"},
 ]
 
+# The TS shape: prefGate(mine, me, theirs, them) -> null | 'pref_<part>' | 'their_pref_<part>'. mine / theirs:
+# profiles/{uid} preference fields; me / them: public-card facts. Each side is person_from_docs(uid, public=<facts>,
+# private=<prefs>), then _pref_gate(me, them).
+PREF_GATE_VECTORS = [
+    {"name": "nothing set", "mine": {}, "me": {"religion": "Hindu"}, "theirs": {}, "them": {"religion": "Muslim"}, "want": None},
+    {"name": "religion: a must-have by default", "mine": {"pref_religions": ["Hindu"]}, "me": {}, "theirs": {}, "them": {"religion": "Muslim"}, "want": "pref_religions"},
+    {"name": "religion unstated never hides", "mine": {"pref_religions": ["Hindu"]}, "me": {}, "theirs": {}, "them": {"religion": "Prefer not to say"}, "want": None},
+    {"name": "religion ignoring case", "mine": {"pref_religions": ["Hindu"]}, "me": {}, "theirs": {}, "them": {"religion": "hindu"}, "want": None},
+    {"name": "marital status: a must-have by default", "mine": {"pref_maritalStatuses": ["Never married"]}, "me": {}, "theirs": {}, "them": {"maritalStatus": "Divorced"}, "want": "pref_maritalStatuses"},
+    {"name": "mother tongue only ranks", "mine": {"pref_communities": ["Marathi"]}, "me": {}, "theirs": {}, "them": {"community": "Gujarati"}, "want": None},
+    {"name": "mother tongue marked", "mine": {"pref_communities": ["Marathi"], "pref_strict": ["communities"]}, "me": {}, "theirs": {}, "them": {"community": "Gujarati"}, "want": "pref_communities"},
+    {"name": "marks replace the default", "mine": {"pref_religions": ["Hindu"], "pref_strict": ["diets"]}, "me": {}, "theirs": {}, "them": {"religion": "Muslim"}, "want": None},
+    {"name": "food marked", "mine": {"pref_diets": ["Vegetarian"], "pref_strict": ["diets"]}, "me": {}, "theirs": {}, "them": {"diet": "Non-vegetarian"}, "want": "pref_diets"},
+    {"name": "education marked", "mine": {"pref_educationMin": 4, "pref_strict": ["education"]}, "me": {}, "theirs": {}, "them": {"education": "Bachelor's"}, "want": "pref_education"},
+    {"name": "education marked, unknown", "mine": {"pref_educationMin": 4, "pref_strict": ["education"]}, "me": {}, "theirs": {}, "them": {"education": ""}, "want": None},
+    {"name": "education only ranks", "mine": {"pref_educationMin": 4}, "me": {}, "theirs": {}, "them": {"education": "Bachelor's"}, "want": None},
+    {"name": "education marked, a curly apostrophe", "mine": {"pref_educationMin": 4, "pref_strict": ["education"]}, "me": {}, "theirs": {}, "them": {"education": "Bachelor’s"}, "want": "pref_education"},
+    {"name": "caste: a listed community under its umbrella", "mine": {"pref_castes": ["Brahmin"]}, "me": {}, "theirs": {}, "them": {"caste": "Brahmin - Iyer"}, "want": None},
+    {"name": "caste: another caste", "mine": {"pref_castes": ["Brahmin"]}, "me": {}, "theirs": {}, "them": {"caste": "Rajput"}, "want": "pref_castes"},
+    {"name": "caste: a typed \"X - Y\" under a wanted umbrella", "mine": {"pref_castes": ["Brahmin"]}, "me": {}, "theirs": {}, "them": {"caste": "Brahmin - Vadama"}, "want": None},
+    {"name": "caste: never the other way", "mine": {"pref_castes": ["Brahmin - Iyer"]}, "me": {}, "theirs": {}, "them": {"caste": "Brahmin"}, "want": "pref_castes"},
+    {"name": "caste: inter-caste passes", "mine": {"pref_castes": ["Brahmin"]}, "me": {}, "theirs": {}, "them": {"caste": "Inter-caste / Mixed"}, "want": None},
+    {"name": "caste: unstated passes", "mine": {"pref_castes": ["Brahmin"]}, "me": {}, "theirs": {}, "them": {"caste": "Prefer not to say"}, "want": None},
+    {"name": "caste is a must-have even when marks were saved", "mine": {"pref_castes": ["Brahmin"], "pref_strict": []}, "me": {}, "theirs": {}, "them": {"caste": "Bhumihar"}, "want": "pref_castes"},
+    {"name": "Manglik must match: Yes vs No", "mine": {"pref_manglik": "match"}, "me": {"manglik": "Yes"}, "theirs": {}, "them": {"manglik": "No"}, "want": "pref_manglik"},
+    {"name": "Manglik must match: partial fits", "mine": {"pref_manglik": "match"}, "me": {"manglik": "Yes"}, "theirs": {}, "them": {"manglik": "Partial (Anshik)"}, "want": None},
+    {"name": "Manglik must match: mine unknown", "mine": {"pref_manglik": "match"}, "me": {"manglik": ""}, "theirs": {}, "them": {"manglik": "No"}, "want": None},
+    {"name": "Manglik: doesn't matter", "mine": {}, "me": {"manglik": "Yes"}, "theirs": {}, "them": {"manglik": "No"}, "want": None},
+    {"name": "income minimum (12 → 10 lakh)", "mine": {"pref_incomeMinLakh": 12}, "me": {}, "theirs": {}, "them": {"annualIncome": "7-10L"}, "want": "pref_income"},
+    {"name": "income at the minimum", "mine": {"pref_incomeMinLakh": 12}, "me": {}, "theirs": {}, "them": {"annualIncome": "10-15L"}, "want": None},
+    {"name": "income private or unknown", "mine": {"pref_incomeMinLakh": 12}, "me": {}, "theirs": {}, "them": {"annualIncome": "prefer_not"}, "want": None},
+    {"name": "prefer no children", "mine": {"pref_childrenOk": "none"}, "me": {}, "theirs": {}, "them": {"children": "Yes, living together"}, "want": "pref_children"},
+    {"name": "prefer no children: none", "mine": {"pref_childrenOk": "none"}, "me": {}, "theirs": {}, "them": {"children": "No children"}, "want": None},
+    {"name": "work only ranks, even marked", "mine": {"pref_professions": ["Doctor"], "pref_strict": ["professions"]}, "me": {}, "theirs": {}, "them": {"profession": "Engineer"}, "want": None},
+    {"name": "their wish without marks never hides me", "mine": {}, "me": {"religion": "Hindu"}, "theirs": {"pref_religions": ["Jain"]}, "them": {}, "want": None},
+    {"name": "their marks saved empty", "mine": {}, "me": {"religion": "Hindu"}, "theirs": {"pref_religions": ["Jain"], "pref_strict": []}, "them": {}, "want": None},
+    {"name": "their marked religion", "mine": {}, "me": {"religion": "Hindu"}, "theirs": {"pref_religions": ["Jain"], "pref_strict": ["religions"]}, "them": {}, "want": "their_pref_religions"},
+    {"name": "their marked food", "mine": {}, "me": {"diet": "Non-vegetarian"}, "theirs": {"pref_diets": ["Vegetarian"], "pref_strict": ["diets"]}, "them": {}, "want": "their_pref_diets"},
+    {"name": "their caste, Manglik, income and children wishes never hide me", "mine": {}, "me": {"caste": "Bhumihar", "manglik": "Yes", "annualIncome": "0-2L", "children": "Yes, living together"}, "theirs": {"pref_castes": ["Brahmin"], "pref_manglik": "match", "pref_incomeMinLakh": 20, "pref_childrenOk": "none", "pref_strict": ["castes", "manglik", "income", "children"]}, "them": {"manglik": "No"}, "want": None},
+    {"name": "my must-haves come first", "mine": {"pref_religions": ["Jain"], "pref_childrenOk": "none"}, "me": {}, "theirs": {}, "them": {"religion": "Hindu", "children": "Yes, living together"}, "want": "pref_religions"},
+]
+
+# [education as typed, rank]: RishtaMatch.EducationRank / rishtas.ts educationRank (the curly apostrophe reads as ').
+EDUCATION_RANK = [
+    ["High school", 1], ["Diploma", 2], ["Bachelor's", 3], ["Bachelor’s", 3], ["BACHELOR’S", 3],
+    ["  Bachelor’s ", 3], ["Law (LLB)", 3], ["Master's", 4], ["Master’s", 4], ["MBA", 4], ["CA / CS", 4],
+    ["MBBS / Medical", 4], ["Doctorate", 5], ["PhD", 0], ["Bachelors", 0], ["Bachelor‘s", 0], ["", 0], [None, 0],
+]
+
 
 # ------------------------------------------------------------------ the shared caste list
 @pytest.fixture(scope="module", autouse=True)
@@ -244,9 +297,39 @@ def test_pref_gate(v):
     assert fe._pref_gate(me, them) == v["expect"]
 
 
+@pytest.mark.parametrize("v", PREF_GATE_VECTORS, ids=[v["name"] for v in PREF_GATE_VECTORS])
+def test_the_shared_ts_vectors(v):
+    me = fe.person_from_docs("me", dict(v["me"]), dict(v["mine"]))
+    them = fe.person_from_docs("them", dict(v["them"]), dict(v["theirs"]))
+    assert fe._pref_gate(me, them) == v["want"]
+
+
+def test_the_shared_ts_vectors_are_well_formed():
+    names = [v["name"] for v in PREF_GATE_VECTORS]
+    assert len(names) == len(set(names)) == 36
+    for v in PREF_GATE_VECTORS:
+        assert list(v) == ["name", "mine", "me", "theirs", "them", "want"], v["name"]
+
+
+@pytest.mark.parametrize("typed, rank", EDUCATION_RANK)
+def test_education_rank(typed, rank):
+    assert fe.education_rank(typed) == rank
+
+
+def test_a_curly_apostrophe_education_is_a_must_have_like_the_straight_one():
+    """“Bachelor’s” typed on a phone is rank 3, so a marked Master's minimum hides it (an unknown rank never would)."""
+    me = fe.person_from_docs("me", {}, {"pref_educationMin": 4, "pref_strict": ["education"]})
+    for typed in ("Bachelor's", "Bachelor’s"):
+        assert fe._pref_gate(me, fe.person_from_docs("them", {"education": typed})) == "pref_education", typed
+        assert "education" in fe.pref_misses(me.prefs, fe.person_from_docs("them", {"education": typed}), "")
+
+
 def test_the_vectors_are_plain_json():
     """So C# and TS can copy them as they are."""
     blob = json.dumps({"prefFits": PREF_FITS, "casteFits": CASTE_FITS, "manglikFits": MANGLIK_FITS,
                        "incomeAtLeast": INCOME_AT_LEAST, "normalMinLakh": NORMAL_MIN_LAKH,
-                       "childrenFit": CHILDREN_FIT, "gate": GATE})
-    assert json.loads(blob)["gate"][0]["case"] == "nothing set"
+                       "childrenFit": CHILDREN_FIT, "gate": GATE, "prefGateVectors": PREF_GATE_VECTORS,
+                       "educationRank": EDUCATION_RANK}, ensure_ascii=False)
+    back = json.loads(blob)
+    assert back["gate"][0]["case"] == "nothing set"
+    assert back["prefGateVectors"] == PREF_GATE_VECTORS and back["educationRank"] == EDUCATION_RANK

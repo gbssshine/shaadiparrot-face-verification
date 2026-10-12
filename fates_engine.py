@@ -497,7 +497,9 @@ def normal_min_lakh(v: int) -> int:
 
 
 def education_rank(v: Any) -> int:
-    return EDUCATION_RANKS.get(_norm(v), 0)
+    """RishtaMatch.EducationRank / rishtas.ts educationRank: the curly apostrophe a phone keyboard types reads as the
+    straight one ("Bachelor’s" is "Bachelor's", rank 3)."""
+    return EDUCATION_RANKS.get(_norm(v).replace("’", "'"), 0)
 
 
 def prefs_from_doc(d: Optional[Dict[str, Any]]) -> Dict[str, Any]:
