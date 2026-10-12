@@ -180,6 +180,26 @@ def test_only_my_own_storage_photos_reach_the_face_check(monkeypatch):
     assert main._own_photos("u3") == [mine]
 
 
+@pytest.mark.parametrize("private", [True, False])
+def test_a_non_own_link_among_the_first_6_is_dropped_not_replaced(monkeypatch, private):
+    """First the 6 http links, then the own-photo filter (fates_engine.own_private_photos' order): a blur or a
+    foreign link among the first 6 leaves 5, and the 7th photo never moves up. Otherwise faceVerifiedPhotos would
+    hold the 7th while Daily Fates checks the first 6 against it."""
+    import fates_engine
+    uid = "u4"
+    own = [link(f"users/{uid}/photos/{i}.jpg") for i in range(6)]
+    photos = own[:2] + [link(f"users/{uid}/blur/{0:040d}.jpg")] + own[2:]   # 7 links, the blur 3rd
+    profile = {"photoPrivacy": "accepted" if private else "all", "photos": photos if private else []}
+    card = {"photos": [] if private else photos}
+    monkeypatch.setattr(main, "firestore_client", Db({f"profiles/{uid}": profile, f"publicProfiles/{uid}": card}))
+    got = main._own_photos(uid)
+    assert got == own[:5] and own[5] not in got
+    assert got == fates_engine.own_private_photos(uid, {"photos": photos})
+    # The faceVerifiedPhotos saved from this list cover what Daily Fates checks for a private profile.
+    private_doc = {"isFaceVerified": True, "faceVerifiedPhotos": got, "photos": photos}
+    assert fates_engine.verified_now(private_doc, {}, fates_engine.own_private_photos(uid, private_doc))
+
+
 def test_no_profile_docs_means_no_photos(monkeypatch):
     monkeypatch.setattr(main, "firestore_client", Db({}))
     assert main._own_photos("nobody") == []

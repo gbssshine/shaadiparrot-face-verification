@@ -2558,6 +2558,7 @@ def daily_horoscope(body: Optional[DailyHoroscopeRequest] = None, authorization:
 # Three paths a day (Stars, Heart, Home): picking, kundli matching and the AI verdict live in fates_*.py.
 import face_live  # noqa: E402
 import face_match  # noqa: E402
+import fates_engine  # noqa: E402  (own_private_photos: the face check's photo list, one rule for both)
 
 FACE_VERIFY_DAILY_ATTEMPTS = int(os.getenv("FACE_VERIFY_DAILY_ATTEMPTS") or "6")
 
@@ -2717,17 +2718,18 @@ PHOTOS_PRIVATE = "accepted"     # profiles.photoPrivacy: real photos only after 
 
 
 def _own_photos(uid: str) -> List[str]:
-    """The user's real profile photos, which the face check compares with (first 6). While the photos are private
-    the card holds only blurs, so the links come from the profile; otherwise from the card. own_photo_url keeps
-    only the user's own Storage photos (never a blur, a variant or another host)."""
+    """The user's real profile photos, which the face check compares with. While the photos are private the card
+    holds only blurs, so the links come from the profile; otherwise from the card. The first 6 http links, THEN
+    only the user's own Storage photos (face_live.own_photo_url: never a blur, a variant or another host): the
+    one rule fates_engine.own_private_photos applies too, so the faceVerifiedPhotos saved from this list always
+    cover the photos Daily Fates checks against them (a 7th own photo never stands in for a non-own link)."""
     if firestore_client is None:
         return []
     refs = [firestore_client.collection(name).document(uid) for name in ("profiles", "publicProfiles")]
     by_path = {snap.reference.path: (snap.to_dict() or {}) for snap in firestore_client.get_all(refs) if snap.exists}
     profile, card = (by_path.get(ref.path, {}) for ref in refs)
     source = profile if str(profile.get("photoPrivacy") or "").strip() == PHOTOS_PRIVATE else card
-    links = [p.strip() for p in (source.get("photos") or []) if isinstance(p, str) and p.strip()]
-    return [p for p in links if face_live.own_photo_url(p, uid)][:6]
+    return fates_engine.own_private_photos(uid, source)
 
 
 def _photo_faces(urls: List[str]) -> List[List[Any]]:
