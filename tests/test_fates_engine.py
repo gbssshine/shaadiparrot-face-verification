@@ -459,25 +459,77 @@ def test_a_blurred_card_brings_no_photos_and_a_private_viewer_stays_verified():
 
 def test_public_photos_are_checked_against_the_face_checks_own_list():
     """A public card is checked like main._own_photos builds faceVerifiedPhotos: the first 6 http links, then only own
-    Storage photos. A resized variant, a CDN copy or someone else's blur on the card is shown but never pauses a
-    verified person; a new own photo among the first 6 still does."""
+    Storage photos, and Daily Fates shows that same list. A resized variant, a CDN copy or someone else's blur on the
+    card is neither shown nor able to pause a verified person; a new own photo among the first 6 still pauses it."""
     real = [storage_link("u1", "photos", f"{i}.jpg") for i in range(2)]
     extras = [storage_link("u1", "variants", "0_960.jpg"), "https://photos.shaadiparrot.com/users/u1/photos/0.jpg",
               storage_link("u2", "blur", "b.jpg")]
     pub = {"gender": "Female", "isDiscoverable": True, "photoPrivacy": "all", "photos": real[:1] + extras + real[1:]}
     checked = {"faceVerified": True, "faceVerifiedPhotos": real}
     p = fe.person_from_docs("u1", pub, checked)
-    assert p.photos == pub["photos"] and p.face_verified
+    assert p.photos == real and p.face_verified
     assert fe.own_private_photos("u1", pub) == real                   # what the face check saved
     new = storage_link("u1", "photos", "new.jpg")
     assert not fe.person_from_docs("u1", {**pub, "photos": pub["photos"] + [new]}, checked).face_verified
-    # Only a variant and a CDN copy: nothing the face check could have checked, so not verified.
-    assert not fe.person_from_docs("u1", {**pub, "photos": extras[:2]}, {**checked, "faceVerifiedPhotos": extras[:2]}).face_verified
+    # Only a variant and a CDN copy: nothing the face check could have checked, so nothing shown and not verified.
+    only_copies = fe.person_from_docs("u1", {**pub, "photos": extras[:2]}, {**checked, "faceVerifiedPhotos": extras[:2]})
+    assert only_copies.photos == [] and not only_copies.face_verified
 
 
 def test_someone_elses_blur_link_does_not_hide_a_card():
-    pub = {"gender": "Female", "isDiscoverable": True, "photos": ["https://x/a.jpg", storage_link("u2", "blur", "b.jpg")]}
-    assert fe.person_from_docs("u1", pub).photos == pub["photos"]
+    """Another member's blur on the card is not this card's blur: the card is still read as public (not blurred), and
+    the foreign link is simply never shown."""
+    own = storage_link("u1", "photos", "a.jpg")
+    pub = {"gender": "Female", "isDiscoverable": True, "photos": [own, storage_link("u2", "blur", "b.jpg")]}
+    assert not fe.card_blurred("u1", pub)
+    assert fe.person_from_docs("u1", pub).photos == [own]
+
+
+def test_a_verified_card_never_shows_another_members_photo_or_a_foreign_host():
+    """A fake account that passed the face check with its own face puts another member's Storage photo and an image
+    from any host in front of its own photo. Daily Fates shows only the own photo with the badge: the other member's
+    link is never in person.photos, in report()'s photos, or fetched for a thumbnail."""
+    victim = storage_link("victim", "photos", "real.jpg")
+    foreign = "https://imgur.example/model.jpg"
+    own = storage_link("fake", "photos", "me.jpg")
+    pub = {"gender": "Female", "isDiscoverable": True, "photoPrivacy": "all", "photos": [victim, foreign, own]}
+    p = fe.person_from_docs("fake", pub, {"faceVerified": True, "faceVerifiedPhotos": [own]})
+    assert p.photos == [own] and p.face_verified
+    shown = fe.report(viewer(), "home", fe.evaluate_pair(viewer(), p, NOW))["person"]
+    assert shown["photos"] == [own] and shown["verified"]
+    assert victim not in shown["photos"] and foreign not in shown["photos"]
+    # Only foreign links: nothing to show, so the card is never a candidate ('no_photos'), badge or not.
+    bare = fe.person_from_docs("fake", {**pub, "photos": [victim, foreign]},
+                               {"faceVerified": True, "faceVerifiedPhotos": [victim, foreign]})
+    assert bare.photos == [] and not bare.face_verified
+    assert fe.hard_filter(viewer(), bare, NOW) == "no_photos"
+
+
+def test_a_thumbnail_is_only_ever_fetched_from_storage(monkeypatch):
+    """blur_thumbs (closed cards, the chooser list) fetches only https Storage links and never follows a redirect,
+    so a foreign link that ever reached a candidate's photos could not make the server fetch another host."""
+    import fates_api
+    calls = []
+
+    class Resp:
+        status_code = 302
+        content = b""
+
+    def fake_get(url, **kw):
+        calls.append((url, kw))
+        return Resp()
+
+    monkeypatch.setattr(fates_api.requests, "get", fake_get)
+    for bad in ("https://imgur.example/model.jpg", "http://169.254.169.254/computeMetadata/v1/",
+                "http://firebasestorage.googleapis.com/v0/b/app.appspot.com/o/users%2Fu1%2Fphotos%2Fa.jpg",
+                "https://photos.shaadiparrot.com/users/u1/photos/a.jpg", "not a url"):
+        assert not fates_api.thumb_source_ok(bad)
+        assert fates_api.blur_thumbs(bad) == (None, None)
+    assert calls == []
+    own = storage_link("u1", "photos", "a.jpg")
+    assert fates_api.thumb_source_ok(own)
+    assert fates_api.blur_thumbs(own) == (None, None)               # the 302 is not followed
+    assert calls == [(own, {"timeout": 6, "allow_redirects": False})]
 
 
 # ---------------- pools: the truth table shared with feed.ts poolsOf

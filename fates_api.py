@@ -26,12 +26,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import BaseModel
 
+import face_live
 import fates_ai
 import fates_astro
 import fates_engine as fe
@@ -414,14 +416,33 @@ def _chooser_pair(db, viewer: fe.Person, uid: str, now_ms: int, memory: Dict[str
 # =========================
 # THUMBNAILS
 # =========================
+GOOGLE_STORAGE_HOSTS = ("firebasestorage.googleapis.com", "storage.googleapis.com")
+
+
+def thumb_source_ok(url: str) -> bool:
+    """Only a Storage link is ever fetched for a thumbnail: https on a Storage host (http only for the local
+    emulator). The photos Daily Fates shows are own Storage photos (fates_engine.own_private_photos), so this never
+    drops a real one; it keeps the server from fetching any other host should a foreign link ever reach it."""
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    host = u.netloc.lower()
+    if host not in face_live.storage_hosts():
+        return False
+    return u.scheme == "https" or (u.scheme == "http" and host not in GOOGLE_STORAGE_HOSTS)
+
+
 def blur_thumbs(url: str) -> Tuple[Optional[str], Optional[str]]:
     """Two tiny JPEGs (data URIs) for a closed card: a heavy blur, and a lighter "peek" that shows while
     the card is held. Both are 64 px wide, so neither can reveal who it is; the real photo only
     arrives when the path is opened."""
+    if not thumb_source_ok(url):
+        return None, None
     try:
         import cv2
         import numpy as np
-        r = requests.get(url, timeout=6)
+        r = requests.get(url, timeout=6, allow_redirects=False)
         if r.status_code != 200 or len(r.content) > 12 * 1024 * 1024:
             return None, None
         img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)

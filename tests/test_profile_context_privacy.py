@@ -202,7 +202,8 @@ def test_a_non_own_link_among_the_first_6_is_dropped_not_replaced(monkeypatch, p
 
 def test_a_public_card_keeps_daily_fates_verified_with_a_variant_on_it(monkeypatch):
     """The chain for public photos: the list main._own_photos hands the face check (saved as faceVerifiedPhotos) is
-    the list Daily Fates checks, so a resized variant or someone else's blur among the card's photos never pauses it."""
+    the list Daily Fates checks and shows, so a resized variant or someone else's blur among the card's photos never
+    pauses it and is never shown."""
     import fates_engine
     uid = "u5"
     own = [link(f"users/{uid}/photos/{i}.jpg") for i in range(3)]
@@ -213,7 +214,7 @@ def test_a_public_card_keeps_daily_fates_verified_with_a_variant_on_it(monkeypat
     got = main._own_photos(uid)
     assert got == own
     person = fates_engine.person_from_docs(uid, card, {**profile, "faceVerified": True, "faceVerifiedPhotos": got})
-    assert person.face_verified and person.photos == photos
+    assert person.face_verified and person.photos == own
 
 
 def test_no_profile_docs_means_no_photos(monkeypatch):

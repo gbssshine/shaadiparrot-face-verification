@@ -299,7 +299,6 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
     if lat == 0 and lon == 0:
         lat = lon = None
 
-    card_photos = [p for p in _str_list(public.get("photos")) if p.startswith("http")]
     if card_blurred(uid, public):
         # Private photos: the card holds server-made blurs. They are never a candidate's photos ('no_photos' then
         # keeps them out of everyone's Fates, so nothing is revealed), and the face check is held against the real
@@ -307,11 +306,11 @@ def person_from_docs(uid: str, public: Dict[str, Any], private: Optional[Dict[st
         photos: List[str] = []
         verify_photos = own_private_photos(uid, private)
     else:
-        # Public photos: the card shows them all, and the face check is held against the same list main._own_photos
-        # checks (the card's first 6 http links, then only own Storage photos), so a resized variant, a CDN copy or
-        # a blur among them never pauses a verified person, and a new own photo still does.
-        photos = card_photos
-        verify_photos = own_private_photos(uid, public)
+        # Public photos: Daily Fates shows only what the face check checks, the list main._own_photos builds (the
+        # card's first 6 http links, then only own Storage photos). A resized variant, a CDN copy or a blur on the
+        # card then never pauses a verified person, a new own photo still does, and a link that isn't the user's own
+        # (another member's photo, any other host) is never shown with the badge, nor fetched for a thumbnail.
+        photos = verify_photos = own_private_photos(uid, public)
     fates_prefs = private.get("fatesPrefs") if isinstance(private.get("fatesPrefs"), dict) else {}
 
     def fact(*keys: str) -> str:
@@ -386,7 +385,8 @@ def card_blurred(uid: str, public: Dict[str, Any]) -> bool:
 def own_private_photos(uid: str, private: Dict[str, Any]) -> List[str]:
     """The real photo links the face check uses (main._own_photos): `photos` of the doc that holds them (profiles
     while the photos are private, else the card), the first 6 http links, then only the user's own Storage photos
-    (face_live.own_photo_url). Daily Fates checks verified_now against the same list in both modes."""
+    (face_live.own_photo_url). Daily Fates checks verified_now against the same list in both modes, and with public
+    photos it is also the list Daily Fates shows."""
     links = [p for p in _str_list(private.get("photos")) if p.startswith("http")][:6]
     return [p for p in links if face_live.own_photo_url(p, uid)]
 
