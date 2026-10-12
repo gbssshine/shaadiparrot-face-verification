@@ -506,20 +506,24 @@ def test_a_verified_card_never_shows_another_members_photo_or_a_foreign_host():
 
 
 def test_a_thumbnail_is_only_ever_fetched_from_storage(monkeypatch):
-    """blur_thumbs (closed cards, the chooser list) fetches only https Storage links and never follows a redirect,
-    so a foreign link that ever reached a candidate's photos could not make the server fetch another host."""
+    """blur_thumbs (closed cards, the chooser list) fetches only the person's own Storage photos and never follows a
+    redirect, so a foreign link that ever reached a candidate's photos could not make the server fetch another host."""
     import fates_api
+    import photo_fetch
     calls = []
 
     class Resp:
         status_code = 302
-        content = b""
+        headers = {"Location": "https://evil.example/x.jpg"}
+
+        def close(self):
+            pass
 
     def fake_get(url, **kw):
         calls.append((url, kw))
         return Resp()
 
-    monkeypatch.setattr(fates_api.requests, "get", fake_get)
+    monkeypatch.setattr(photo_fetch.requests, "get", fake_get)
     for bad in ("https://imgur.example/model.jpg", "http://169.254.169.254/computeMetadata/v1/",
                 "http://firebasestorage.googleapis.com/v0/b/app.appspot.com/o/users%2Fu1%2Fphotos%2Fa.jpg",
                 "https://photos.shaadiparrot.com/users/u1/photos/a.jpg", "not a url"):
@@ -530,7 +534,7 @@ def test_a_thumbnail_is_only_ever_fetched_from_storage(monkeypatch):
     assert fates_api.thumb_source_ok(own, "u1")
     assert not fates_api.thumb_source_ok(own, "u2")                 # someone else's photo is never fetched
     assert fates_api.blur_thumbs(own, "u1") == (None, None)         # the 302 is not followed
-    assert calls == [(own, {"timeout": 6, "allow_redirects": False})]
+    assert calls == [(own, {"timeout": photo_fetch.TIMEOUT, "allow_redirects": False, "stream": True})]
 
 
 # ---------------- pools: the truth table shared with feed.ts poolsOf

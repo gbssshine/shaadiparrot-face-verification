@@ -20,6 +20,7 @@ import swisseph as swe
 import astro_core
 import astro_festivals
 import astro_notes
+import photo_fetch
 
 from google.api_core import exceptions as google_exceptions
 
@@ -1426,22 +1427,27 @@ def verify_photo(body: VerifyPhotoRequest, authorization: Optional[str] = Header
     return {"ok": True, "reason": "ok", "adult": adult, "racy": racy, "violence": violence, "faces": faces}
 
 
-def _download_image_bytes(url: str, max_mb: int = 10) -> bytes:
-    headers = {"User-Agent": "shaadiparrot-face-verification/1.0"}
-    r = _HTTP.get(url, headers=headers, timeout=(5, 20), stream=True, allow_redirects=True)
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {r.status_code}")
+FACE_FETCH_SEC = 20.0      # one selfie or profile photo download for the face checks, in all
 
-    max_bytes = max_mb * 1024 * 1024
-    data = b""
-    for chunk in r.iter_content(chunk_size=1024 * 256):
-        if not chunk:
-            continue
-        data += chunk
-        if len(data) > max_bytes:
+
+def _download_image_bytes(url: str, max_mb: int = 10) -> bytes:
+    """A selfie or profile photo for the face checks, bounded (photo_fetch): no redirects (the links are the
+    user's own Storage objects, which never redirect), at most max_mb (12 at most) MB within FACE_FETCH_SEC in all,
+    and refused when its header says more than 40 megapixels, before anything decodes it."""
+    headers = {"User-Agent": "shaadiparrot-face-verification/1.0"}
+    try:
+        data = photo_fetch.fetch(url, max_bytes=max_mb * 1024 * 1024, total_sec=FACE_FETCH_SEC, timeout=(5, 10),
+                                 session=_HTTP, headers=headers)
+    except photo_fetch.FetchError as e:
+        if e.reason == "too_large":
             raise HTTPException(status_code=413, detail=f"Image too large (>{max_mb}MB)")
+        if e.reason == "status":
+            raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {e.status}")
+        raise HTTPException(status_code=400, detail=f"Failed to download image: {e.reason}")
     if len(data) < 2000:
         raise HTTPException(status_code=400, detail="Downloaded file is too small / invalid")
+    if photo_fetch.too_many_pixels(data):
+        raise HTTPException(status_code=413, detail="Image too large (pixels)")
     return data
 
 

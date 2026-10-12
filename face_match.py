@@ -24,6 +24,8 @@ import os
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import photo_fetch
+
 SAME_PERSON = float(os.getenv("FACE_SAME_PERSON") or "0.363")       # SFace's published threshold
 MAIN_PHOTO = float(os.getenv("FACE_MAIN_PHOTO") or "0.45")          # the main photo must be clearly you
 SELFIES_SAME = float(os.getenv("FACE_SELFIES_SAME") or "0.30")      # a turned head scores lower than a straight one
@@ -60,9 +62,10 @@ def available() -> bool:
 
 
 def decode(data: bytes):
+    """The image for the face model, at most MAX_SIDE on its long side; None when it can't be read. Never decoded
+    when its header says more than 40 megapixels or names no image Pillow knows (photo_fetch.decode_cv2)."""
     import cv2
-    import numpy as np
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    img = photo_fetch.decode_cv2(data) if data else None
     if img is None:
         return None
     h, w = img.shape[:2]

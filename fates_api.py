@@ -28,11 +28,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-import requests
 from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import BaseModel
 
 import face_live
+import photo_fetch
 import fates_ai
 import fates_astro
 import fates_engine as fe
@@ -415,6 +415,9 @@ def _chooser_pair(db, viewer: fe.Person, uid: str, now_ms: int, memory: Dict[str
 # =========================
 # THUMBNAILS
 # =========================
+THUMB_FETCH_SEC = 8.0      # the whole photo download for one thumbnail (the paths wait for it)
+
+
 def thumb_source_ok(url: str, uid: str) -> bool:
     """Only the person's own Storage photo is ever fetched for a thumbnail: face_live.own_photo_url (a Storage host,
     https except on the local emulator, the project's own bucket, users/{uid}/photos/). The photos Daily Fates shows
@@ -431,11 +434,10 @@ def blur_thumbs(url: str, uid: str) -> Tuple[Optional[str], Optional[str]]:
         return None, None
     try:
         import cv2
-        import numpy as np
-        r = requests.get(url, timeout=6, allow_redirects=False)
-        if r.status_code != 200 or len(r.content) > 12 * 1024 * 1024:
-            return None, None
-        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+        # Bounded (photo_fetch): no redirects, 12 MB and THUMB_FETCH_SEC in all, never decoded above 40 megapixels,
+        # and decoded at a fraction of its size when that is still wide enough for a 64 px blur.
+        data = photo_fetch.fetch(url, total_sec=THUMB_FETCH_SEC)
+        img = photo_fetch.decode_cv2(data, min_width=256)
         if img is None:
             return None, None
         h, w = img.shape[:2]
@@ -448,6 +450,9 @@ def blur_thumbs(url: str, uid: str) -> Tuple[Optional[str], Optional[str]]:
             return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
 
         return enc(4.5), enc(2.2)
+    except photo_fetch.FetchError as e:
+        logger.warning("fates blur: photo not fetched (%s)", e.reason)
+        return None, None
     except Exception:
         logger.exception("fates blur failed")
         return None, None

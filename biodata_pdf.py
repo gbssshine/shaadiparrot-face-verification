@@ -28,12 +28,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-import requests
 from fontTools.ttLib import TTFont
 from fpdf import FPDF
 from PIL import Image, ImageOps
 
 import face_live
+import photo_fetch
 import fates_astro
 import fates_astro_chart as fc
 
@@ -80,6 +80,7 @@ STORAGE_HOST = "firebasestorage.googleapis.com"
 MASCOT_RX = re.compile(r"(?:^|/|%2F)mascot\.png$", re.I)     # the app's placeholder when there is no photo
 PHOTO_MAX_BYTES = 4 * 1024 * 1024
 PHOTO_MAX_PIXELS = 40_000_000
+PHOTO_FETCH_SEC = 12.0      # the whole photo download (the PDF waits for it)
 PHOTO_SIZE = (600, 750)
 
 ABOUT_MAX, FAMILY_MAX, VALUE_MAX, NAME_MAX = 500, 300, 60, 40
@@ -664,22 +665,17 @@ def photo_url(profile: Mapping[str, Any], public: Mapping[str, Any], uid: str) -
 
 def fetch_photo(url: str) -> Optional[bytes]:
     """The photo as a 600x750 JPEG (EXIF turned, 4:5 crop a little above the centre, no metadata), or None on any
-    problem. Redirects are not followed; at most 4 MB is read."""
-    resp = None
+    problem. Bounded (photo_fetch): redirects are not followed, at most 4 MB within PHOTO_FETCH_SEC in all, and the
+    size is read from the header before anything is decoded (above 40 megapixels: None)."""
     try:
-        resp = requests.get(url, timeout=(3, 8), allow_redirects=False, stream=True)
-        if resp.status_code != 200:
+        data = photo_fetch.fetch(url, max_bytes=PHOTO_MAX_BYTES, total_sec=PHOTO_FETCH_SEC, timeout=(3, 8))
+    except photo_fetch.FetchError as e:
+        logger.warning("biodata photo not fetched (%s)", e.reason)
+        return None
+    try:
+        if not photo_fetch.pixels_ok(data, PHOTO_MAX_PIXELS):
             return None
-        if int(resp.headers.get("Content-Length") or 0) > PHOTO_MAX_BYTES:
-            return None
-        buf = bytearray()
-        for chunk in resp.iter_content(64 * 1024):
-            buf += chunk
-            if len(buf) > PHOTO_MAX_BYTES:
-                return None
-        img = Image.open(io.BytesIO(bytes(buf)))
-        if img.size[0] * img.size[1] > PHOTO_MAX_PIXELS:
-            return None
+        img = Image.open(io.BytesIO(data))
         img.draft("RGB", (PHOTO_SIZE[0] * 2, PHOTO_SIZE[1] * 2))
         img = ImageOps.exif_transpose(img).convert("RGB")
         w, h = img.size
@@ -699,12 +695,6 @@ def fetch_photo(url: str) -> Optional[bytes]:
     except Exception:
         logger.warning("biodata photo fetch failed", exc_info=False)
         return None
-    finally:
-        if resp is not None:
-            try:
-                resp.close()
-            except Exception:
-                pass
 
 
 def photo_verified(printed: bool, profile: Mapping[str, Any], public: Mapping[str, Any]) -> bool:

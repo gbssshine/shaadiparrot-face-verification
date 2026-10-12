@@ -546,7 +546,7 @@ def test_fetch_photo(monkeypatch):
         calls.append((url, kw))
         return resp
 
-    monkeypatch.setattr(bp.requests, "get", get)
+    monkeypatch.setattr(bp.photo_fetch.requests, "get", get)
     resp = FakeResp(200, jpeg(1200, 900))
     out = bp.fetch_photo(CDN)
     assert calls[0] == (CDN, {"timeout": (3, 8), "allow_redirects": False, "stream": True}) and resp.closed
@@ -562,7 +562,7 @@ def test_fetch_photo(monkeypatch):
     def boom(url, **kw):
         raise OSError("down")
 
-    monkeypatch.setattr(bp.requests, "get", boom)
+    monkeypatch.setattr(bp.photo_fetch.requests, "get", boom)
     assert bp.fetch_photo(CDN) is None
 
 
